@@ -4,6 +4,8 @@
 
 Seamlessly integrate terminal UIs into your Bevy applications. Display ratatui widgets on 2D sprites, 3D meshes, or UI elements with full GPU acceleration.
 
+https://github.com/user-attachments/assets/57c2fb98-04a6-4ecf-8c72-58808a9f499f
+
 ## Features
 
 - **GPU-Accelerated Terminal Rendering** - Render ratatui terminal UIs as GPU textures using WGPU
