@@ -89,7 +89,7 @@ fn setup_terminal(
     // Load font
     let font_data = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/assets/fonts/NotoSansMonoCJKjp-Regular.ttf"
+        "/assets/fonts/Mplus1Code-Regular.ttf"
     ));
 
     let font = TerminalFont::new(font_data).expect("Failed to load font");
