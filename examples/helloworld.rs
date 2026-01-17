@@ -67,6 +67,8 @@ fn setup(
     render_queue: Res<RenderQueue>,
     mut images: ResMut<Assets<Image>>,
 ) {
+    // Spawn camera
+    // commands.spawn(Camera2d);
     // Load font
     let font_data = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),

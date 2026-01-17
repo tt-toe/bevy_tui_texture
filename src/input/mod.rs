@@ -3,6 +3,9 @@
 //! Bevy input systems → `TerminalEvent` messages → User systems → Terminal updates
 
 use bevy::prelude::*;
+use tracing::debug;
+//use bevy::log::debug;
+//use log::debug;
 
 // Ray casting for 3D mouse input
 #[cfg(feature = "mouse_input")]

@@ -1,7 +1,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
-use std::time::Instant;
+use web_time::{Duration, Instant};
 
 use crate::RandomState;
 use crate::backend::TextBgVertexMember;
@@ -369,7 +368,7 @@ impl BevyTerminalBackend {
         let height = self.fonts.height_px();
         let font_id = self.fonts.last_resort_id();
 
-        log::info!(
+        tracing::info!(
             "Pre-populating {} programmatic glyphs ({}x{} px)...",
             all_programmatic_glyphs().count(),
             width,
@@ -411,7 +410,7 @@ impl BevyTerminalBackend {
         // Flush all uploads to GPU immediately
         self.flush_cache_updates(queue);
 
-        log::info!(
+        tracing::info!(
             "Successfully pre-populated {} programmatic glyphs ({} skipped - not yet implemented)",
             populated_count,
             skipped_count
@@ -907,7 +906,7 @@ impl ratatui::backend::Backend for BevyTerminalBackend {
                             let bitmap = pixmap_to_rgba8(pixmap);
                             self.pending_cache_updates.push((*cached, bitmap, false));
                         } else {
-                            log::warn!(
+                            tracing::warn!(
                                 "Failed to render programmatic glyph '{}' (U+{:04X})",
                                 ch,
                                 ch as u32

@@ -10,6 +10,10 @@
 // - Keyboard and mouse controls
 
 use std::sync::Arc;
+use std::time::Duration;
+
+use rand::Rng as _;
+use tracing::info;
 
 use bevy::pbr::StandardMaterial;
 use bevy::prelude::*;
@@ -57,6 +61,7 @@ struct WidgetCatalogState {
     selected_button: Option<usize>,
     gauge_value: u16,
     sparkline_data: Vec<u64>,
+    sparkline_timer: Timer,
     counter: usize,
     mouse_position: Option<(u16, u16)>,
 
@@ -134,6 +139,7 @@ fn setup_terminal(
         selected_button: None,
         gauge_value: 60,
         sparkline_data: vec![2, 5, 3, 8, 6, 9, 4, 7, 5, 8, 6, 10, 8, 6, 9, 11],
+        sparkline_timer: Timer::new(Duration::from_millis(100), TimerMode::Repeating),
         counter: 0,
         mouse_position: None,
         button_rects: Vec::new(),
@@ -312,6 +318,16 @@ fn update_terminal_content(
     marker_query: Query<&MeshMaterial3d<StandardMaterial>, With<RotatingPlane>>,
     time: Res<Time>,
 ) {
+    // Update sparkline data with random values
+    ui_state.sparkline_timer.tick(time.delta());
+    if ui_state.sparkline_timer.just_finished() {
+        let new_value = rand::thread_rng().gen_range(1..=15);
+        ui_state.sparkline_data.push(new_value);
+        if ui_state.sparkline_data.len() > 32 {
+            ui_state.sparkline_data.remove(0);
+        }
+    }
+
     let selected_tab = ui_state.selected_tab;
     let selected_button = ui_state.selected_button;
     let gauge_value = ui_state.gauge_value;
@@ -482,7 +498,7 @@ fn draw_buttons_tab(
         ])
         .split(horizontal_area);
 
-    let h_labels = ["Button 1", "ボタン 2", "按钮 3", "кнопка 4", "κουμπί 5"];
+    let h_labels = ["Button 1", "ボタン 2", "按鈕 3", "botón 4", "düğme 5"];
     for (i, label) in h_labels.iter().enumerate() {
         let is_selected = selected_button == Some(i + 3);
         let style = if is_selected {

@@ -1,0 +1,19 @@
+[target.wasm32-unknown-unknown]
+runner = 'wasm-server-runner'
+rustflags = ["-C", "strip=symbols"]
+
+[alias]
+wasm = "run -p xtask -- wasm"
+
+# Optimization for wasm builds
+[profile.wasm-release]
+inherits = "release"
+opt-level = "z"        # Optimize for size (critical for browser downloads)
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
+
+[profile.dev.package."*"]
+opt-level = "z"          # Fast dependency compilation

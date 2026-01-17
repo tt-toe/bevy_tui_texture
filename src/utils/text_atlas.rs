@@ -2,7 +2,7 @@ use std::num::NonZeroUsize;
 use std::ops::Deref;
 
 use evictor::Lru;
-use log::debug;
+use tracing::debug;
 use ratatui::style::Modifier;
 
 use crate::Fonts;

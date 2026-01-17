@@ -23,6 +23,7 @@ use ratatui::prelude::*;
 use ratatui::style::Color as RatatuiColor;
 use ratatui::widgets::*;
 use std::sync::Arc;
+use tracing::info;
 
 use bevy_tui_texture::Font as TerminalFont;
 use bevy_tui_texture::prelude::*;

@@ -3,7 +3,9 @@
 
 use bevy::prelude::*;
 use bevy::render::renderer::{RenderDevice, RenderQueue};
+use bevy::sprite_render::{ColorMaterial, MeshMaterial2d};
 use ratatui::Terminal;
+use tracing::info;
 use wgpu;
 
 use crate::BevyTerminalBackend;

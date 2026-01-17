@@ -1,0 +1,36 @@
+<!DOCTYPE html><html lang="en"><head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>bevy_tui_texture - Browser Demo</title>
+    <script type="module">import init from '/wasm_demo.js';init('/wasm_demo_bg.wasm');</script>
+
+<link rel="preload" href="/wasm_demo_bg.wasm" as="fetch" type="application/wasm" crossorigin="">
+<link rel="modulepreload" href="/wasm_demo.js"></head>
+<link data-trunk rel="rust" href="Cargo.toml" data-wasm-opt="4" data-wasm-opt-params="--enable-bulk-memory" />
+<body>
+    <div style="font-family: system-ui; max-width: 800px; margin: 50px auto; padding: 20px;">
+        <h1>bevy_tui_texture - WASM Demo</h1>
+        <p>Bevy + ratatui running in your browser via WebAssembly!</p>
+
+        <div id="canvas-container" style="margin: 20px auto; width: 800px; height: 600px;">
+            <canvas id="bevy" width="800" height="600" style="display: block; border: 1px solid #ccc;"></canvas>
+        </div>
+
+        <div style="background: #f5f5f5; padding: 15px; border-radius: 5px; margin-top: 20px;">
+            <h2>About This Demo</h2>
+            <p>This demonstrates bevy_tui_texture with SimpleTerminal3D running in the browser using WebAssembly and WebGL2.</p>
+            <ul>
+                <li><strong>Bevy 0.17</strong> - Game engine running in browser</li>
+                <li><strong>WGPU 26</strong> - GPU acceleration via WebGL2</li>
+                <li><strong>ratatui</strong> - Terminal UI rendering</li>
+                <li><strong>SimpleTerminal3D</strong> - 3D terminal demonstration</li>
+            </ul>
+        </div>
+
+        <div style="margin-top: 30px; padding-top: 20px; border-top: 1px solid #ddd; font-size: 14px; color: #666;">
+            <p>Built with <a href="https://bevyengine.org">Bevy</a> + <a href="https://ratatui.rs">ratatui</a> + <a href="https://wgpu.rs">WGPU</a></p>
+        </div>
+    </div>
+
+
+</body></html>

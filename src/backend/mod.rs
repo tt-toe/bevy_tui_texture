@@ -289,7 +289,7 @@ pub(crate) fn build_text_fg_compositor(
 
 use std::num::NonZeroU32;
 
-use log::error;
+use tracing::error;
 use ratatui::style::Color;
 use wgpu::Adapter;
 use wgpu::BindGroup;

@@ -132,48 +132,68 @@
 //! See `examples/benchmark.rs` for performance metrics.
 
 // Public modules
+#[cfg(feature = "ratatui_backend")]
 pub mod backend;
+#[cfg(feature = "ratatui_backend")]
 pub mod bevy_plugin;
+#[cfg(feature = "ratatui_backend")]
 pub(crate) mod colors;
+#[cfg(feature = "ratatui_backend")]
 pub mod fonts;
+#[cfg(feature = "ratatui_backend")]
 pub mod input;
+#[cfg(feature = "ratatui_backend")]
 pub mod setup;
+#[cfg(feature = "ratatui_backend")]
 pub(crate) mod utils;
 
 // Re-export external crates
+#[cfg(feature = "ratatui_backend")]
 pub use ratatui;
 pub use wgpu;
 
 // Re-export commonly used types from backend
+#[cfg(feature = "ratatui_backend")]
 pub use backend::bevy_backend::{BevyTerminalBackend, TerminalBuilder};
+#[cfg(feature = "ratatui_backend")]
 pub use backend::{Dimensions, Viewport};
 
 // Re-export font types
+#[cfg(feature = "ratatui_backend")]
 pub use fonts::{Font, Fonts};
 
 // Re-export bevy plugin types
+#[cfg(feature = "ratatui_backend")]
 pub use bevy_plugin::{TerminalComponent, TerminalDimensions, TerminalPlugin, TerminalResource};
 
 // Error types
-use thiserror::Error;
 
 /// Represents the various errors that can occur during operation.
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub enum Error {
     /// Backend creation failed because the device request failed.
-    #[error("{0}")]
     DeviceRequestFailed(wgpu::RequestDeviceError),
     /// Backend creation failed because creating the surface failed.
-    #[error("{0}")]
     SurfaceCreationFailed(wgpu::CreateSurfaceError),
     /// Backend creation failed because wgpu didn't provide an
     /// [`Adapter`](wgpu::Adapter)
-    #[error("{0}")]
     AdapterRequestFailed(wgpu::RequestAdapterError),
     /// Backend creation failed because the default surface configuration
     /// couldn't be loaded.
-    #[error("Failed to get default Surface configuration from wgpu.")]
     SurfaceConfigurationRequestFailed,
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::DeviceRequestFailed(e) => write!(f, "{}", e),
+            Error::SurfaceCreationFailed(e) => write!(f, "{}", e),
+            Error::AdapterRequestFailed(e) => write!(f, "{}", e),
+            Error::SurfaceConfigurationRequestFailed => {
+                write!(f, "Failed to get default Surface configuration from wgpu.")
+            }
+        }
+    }
 }
 
 pub type Result<T> = ::std::result::Result<T, Error>;
@@ -181,6 +201,7 @@ pub type Result<T> = ::std::result::Result<T, Error>;
 type RandomState = std::hash::RandomState;
 
 // Convenience prelude for common imports
+#[cfg(feature = "ratatui_backend")]
 pub mod prelude {
     // Plugin and components
     pub use crate::bevy_plugin::{

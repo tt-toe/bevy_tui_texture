@@ -1,52 +1,24 @@
-//! # Widget Catalog - Comprehensive 2D Example
+//! WASM Browser Demo - Widget Catalog 3D in Browser
 //!
-//! **Interactive showcase of ratatui widgets** demonstrating full input handling capabilities.
+//! This example demonstrates running Bevy + ratatui widget catalog in the browser with WebAssembly.
 //!
-//! ## What This Example Shows
-//!
-//! - **Tab Navigation** - Click tabs or use number keys (1-4) to switch pages
-//! - **Interactive Buttons** - Click handlers with visual feedback
-//! - **Scrollable Lists** - Keyboard and mouse selection
-//! - **Charts** - Bar charts and sparklines with live data
-//! - **Gauges** - Interactive progress indicators
-//! - **Full Input System** - Combined keyboard + mouse input handling
-//!
-//! ## Running
+//! ## Build & Run
 //!
 //! ```bash
-//! cargo run --example widget_catalog_2d
+//! # Build WASM
+//! cargo wasm
+//!
+//! # Serve with custom web server
+//! cargo run --example web_server
+//! # Then open http://127.0.0.1:8080
 //! ```
-//!
-//! ## Controls
-//!
-//! ### Keyboard
-//! - **1-4** - Switch between tabs (Controls, Lists, Charts, Gauges)
-//! - **Up/Down Arrows** - Navigate lists
-//! - **Space** - Toggle list selection
-//! - **ESC** - Quit application
-//!
-//! ### Mouse
-//! - **Click Tabs** - Switch pages
-//! - **Click Buttons** - Trigger actions
-//! - **Click List Items** - Select items
-//! - **Click Gauges** - Adjust values
-//!
-//! ## Architecture Highlights
-//!
-//! - Uses `TerminalEvent` system for unified input handling
-//! - Demonstrates proper state management with `Resource`
-//! - Shows coordinate mapping from pixels to terminal cells
-//! - Illustrates proper system ordering with `TerminalSystemSet`
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use tracing::info;
-use rand::Rng as _;
-
+use bevy::pbr::StandardMaterial;
 use bevy::prelude::*;
 use bevy::render::renderer::{RenderDevice, RenderQueue};
-use bevy::window::WindowResolution;
 use ratatui::prelude::*;
 use ratatui::style::Color as RatatuiColor;
 use ratatui::widgets::*;
@@ -55,29 +27,66 @@ use unicode_width::UnicodeWidthStr;
 use bevy_tui_texture::Font as TerminalFont;
 use bevy_tui_texture::prelude::*;
 
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::prelude::*;
+
+#[cfg(target_arch = "wasm32")]
+macro_rules! console_log {
+    ($($t:tt)*) => (web_sys::console::log_1(&format!($($t)*).into()))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+macro_rules! console_log {
+    ($($t:tt)*) => (println!($($t)*))
+}
+
+// Terminal dimensions
+const COLS: u16 = 100;
+const ROWS: u16 = 30;
+
+// WASM entry point
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen(start)]
+pub fn wasm_main() {
+    console_error_panic_hook::set_once();
+    console_log!("WASM main started, calling main()...");
+    main();
+}
+
 fn main() {
-    App::new()
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "Ratatui Widget Catalog".to_string(),
-                resolution: WindowResolution::new(1024, 768),
-                ..default()
-            }),
+    console_log!("main() called");
+    let mut app = App::new();
+    console_log!("App created");
+
+    app.add_plugins(DefaultPlugins.set(WindowPlugin {
+        primary_window: Some(Window {
+            title: "bevy_tui_texture - Widget Catalog 3D (WASM)".to_string(),
+            canvas: Some("#bevy".to_string()),
+            fit_canvas_to_parent: true,
+            prevent_default_event_handling: false,
             ..default()
-        }))
-        .add_plugins(TerminalPlugin::default())
-        .add_systems(Startup, setup_terminal)
+        }),
+        ..default()
+    }))
+    .add_plugins(TerminalPlugin::default());
+    console_log!("Plugins added");
+
+    app.add_systems(Startup, setup_terminal)
         .add_systems(
             Update,
             handle_terminal_events.in_set(TerminalSystemSet::UserUpdate),
         )
-        .add_systems(Update, render_terminal.in_set(TerminalSystemSet::Render))
-        .run();
+        .add_systems(Update, (update_terminal_content, rotate_plane));
+    console_log!("Systems added, calling app.run()...");
+
+    app.run();
+    console_log!("app.run() returned (should not see this in WASM)");
 }
 
+/// UI state for tracking interactions
 #[derive(Resource)]
 struct WidgetCatalogState {
-    terminal: SimpleTerminal2D,
+    terminal: SimpleTerminal3D,
 
     selected_tab: usize,
     list_state: ListState,
@@ -95,49 +104,70 @@ struct WidgetCatalogState {
     gauge_inner_rect: Option<ratatui::layout::Rect>,
 }
 
+/// Marker component for the rotating plane
+#[derive(Component)]
+struct RotatingPlane;
+
 fn setup_terminal(
     mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
     mut images: ResMut<Assets<Image>>,
 ) {
-    info!("Setting up widget catalog terminal with easy setup API...");
+    console_log!("Setting up 3D widget catalog terminal...");
 
+    // Load font
     let font_data = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/assets/fonts/Mplus1Code-Regular.ttf"
     ));
+    console_log!("Font data loaded: {} bytes", font_data.len());
+
     let font = TerminalFont::new(font_data).expect("Failed to load font");
     let fonts = Arc::new(Fonts::new(font, 16));
+    console_log!("Fonts created");
 
-    const COLS: u16 = 100;
-    const ROWS: u16 = 30;
+    // Spawn 3D camera
+    commands.spawn((
+        Camera3d::default(),
+        Transform::from_xyz(0.0, 0.0, 800.0).looking_at(Vec3::ZERO, Vec3::Y),
+    ));
+    console_log!("Camera spawned");
 
-    // Spawn camera
-    commands.spawn(Camera2d);
+    // Add ambient light
+    commands.insert_resource(AmbientLight {
+        color: bevy::color::Color::WHITE,
+        brightness: 1.0,
+        affects_lightmapped_meshes: true,
+    });
+    console_log!("Ambient light added");
 
-    // Create terminal with easy setup API
-    let terminal = SimpleTerminal2D::create_and_spawn(
+    // Create 3D terminal with easy setup API
+    console_log!("Creating 3D terminal...");
+    let terminal = SimpleTerminal3D::create_and_spawn(
         COLS,
         ROWS,
         fonts,
-        (0.0, 0.0), // Position at origin
-        true,       // Enable programmatic glyphs
-        true,       // Enable keyboard
-        true,       // Enable mouse
+        Vec3::ZERO,                                          // Position at origin
+        Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2), // Face camera
+        Vec3::ONE,                                           // Normal scale
+        RotatingPlane,                                       // Marker component
+        true,                                                // Enable programmatic glyphs
+        true,                                                // Enable keyboard
+        true,                                                // Enable mouse
         &mut commands,
+        &mut meshes,
+        &mut materials,
         &render_device,
         &render_queue,
         &mut images,
     )
-    .expect("Failed to create terminal");
+    .expect("Failed to create 3D terminal");
+    console_log!("3D terminal created successfully!");
 
     let terminal_entity = terminal.entity();
-
-    // Set focus on this terminal
-    commands.insert_resource(TerminalFocus {
-        focused: Some(terminal_entity),
-    });
 
     // Create state with terminal and initial values
     commands.insert_resource(WidgetCatalogState {
@@ -156,15 +186,18 @@ fn setup_terminal(
         gauge_inner_rect: None,
     });
 
-    info!("Widget catalog terminal setup complete!");
+    console_log!(
+        "3D widget catalog setup complete! Terminal entity: {:?}",
+        terminal_entity
+    );
 }
 
+/// Handle terminal input events (mouse clicks, hover, etc.)
 fn handle_terminal_events(
     mut events: MessageReader<TerminalEvent>,
-    mut state: ResMut<WidgetCatalogState>,
-    query: Query<Entity, With<TerminalComponent>>,
+    mut ui_state: ResMut<WidgetCatalogState>,
+    query: Query<Entity, With<RotatingPlane>>,
 ) {
-    // Get the terminal entity - only process events for this terminal
     let terminal_entity = match query.single() {
         Ok(entity) => entity,
         Err(_) => return,
@@ -173,26 +206,21 @@ fn handle_terminal_events(
     for event in events.read().filter(|e| e.target == terminal_entity) {
         match &event.event {
             TerminalEventType::MouseMove { position } => {
-                state.mouse_position = Some(*position);
+                ui_state.mouse_position = Some(*position);
             }
+
             TerminalEventType::MousePress { position, .. } => {
-                state.mouse_position = Some(*position);
                 let (col, row) = *position;
                 let pos = ratatui::layout::Position { x: col, y: row };
 
-                info!(
-                    "2D Mouse Press: col={}, row={}, target={:?}",
-                    col, row, event.target
+                console_log!(
+                    "3D Mouse Press: col={}, row={}, target={:?}",
+                    col,
+                    row,
+                    event.target
                 );
 
-                // Tab detection (still needs manual calculation as tabs are not stored)
-                let area = ratatui::layout::Rect {
-                    x: 0,
-                    y: 0,
-                    width: 100,
-                    height: 30,
-                };
-
+                // Tab detection (manual calculation as tabs are not stored)
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
@@ -200,148 +228,142 @@ fn handle_terminal_events(
                         Constraint::Length(3),
                         Constraint::Min(0),
                     ])
-                    .split(area);
+                    .split(ratatui::layout::Rect {
+                        x: 0,
+                        y: 0,
+                        width: COLS,
+                        height: ROWS,
+                    });
 
                 if row >= chunks[1].y && row < chunks[1].y + chunks[1].height {
-                    // Calculate tab positions using unicode_width for correct display width
-                    // User measured: "Buttons" [2-8], "Lists" [12-16], "Charts" [20-25], "Interactive" [29-39]
-                    // Pattern: start at col 2, each tab is label width, then " . " (3 chars) separator
-
                     let tab_labels = ["Buttons", "Lists", "Charts", "Interactive", "Glyphs"];
-                    let mut col_pos = 2; // Start after border
+                    let mut col_pos = 2;
 
                     for (i, label) in tab_labels.iter().enumerate() {
-                        let label_width = label.width(); // Use unicode_width for correct display width
+                        let label_width = label.width();
                         let start = col_pos;
-                        let end = col_pos + label_width - 1; // Inclusive end
+                        let end = col_pos + label_width - 1;
 
                         if col >= start as u16 && col <= end as u16 {
-                            state.selected_tab = i;
+                            ui_state.selected_tab = i;
                             break;
                         }
 
-                        // Move to next tab: label + " . " (space + divider + space)
                         col_pos = col_pos + label_width + 3;
                     }
                 }
 
-                if state.selected_tab == 0 {
-                    info!(
-                        "Checking buttons tab - button_rects.len()={}, h_button_rects.len()={}",
-                        state.button_rects.len(),
-                        state.h_button_rects.len()
-                    );
-
-                    // Vertical buttons - use stored rectangles
-                    for (i, rect) in state.button_rects.iter().enumerate() {
-                        info!(
-                            "  V-Button[{}]: rect=(x:{}, y:{}, w:{}, h:{}) contains({},{})={}",
-                            i,
-                            rect.x,
-                            rect.y,
-                            rect.width,
-                            rect.height,
-                            col,
-                            row,
-                            rect.contains(pos)
-                        );
+                // Buttons tab (0)
+                if ui_state.selected_tab == 0 {
+                    // Vertical buttons
+                    for (i, rect) in ui_state.button_rects.iter().enumerate() {
                         if rect.contains(pos) {
-                            state.selected_button = Some(i);
+                            ui_state.selected_button = Some(i);
                             match i {
-                                0 => state.counter += 1,
-                                1 => state.gauge_value = (state.gauge_value + 10).min(100),
-                                2 => state.gauge_value = state.gauge_value.saturating_sub(10),
+                                0 => ui_state.counter += 1,
+                                1 => ui_state.gauge_value = (ui_state.gauge_value + 10).min(100),
+                                2 => ui_state.gauge_value = ui_state.gauge_value.saturating_sub(10),
                                 _ => {}
                             }
                             break;
                         }
                     }
 
-                    // Horizontal buttons - use stored rectangles
-                    for (i, rect) in state.h_button_rects.iter().enumerate() {
+                    // Horizontal buttons
+                    for (i, rect) in ui_state.h_button_rects.iter().enumerate() {
                         if rect.contains(pos) {
-                            state.selected_button = Some(i + 3);
-                            state.counter += 1;
+                            ui_state.selected_button = Some(i + 3);
+                            ui_state.counter += 1;
                             break;
                         }
                     }
                 }
 
-                if state.selected_tab == 1 {
-                    // List - use stored rectangle
-                    if let Some(inner) = state.list_inner_rect
-                        && inner.contains(pos) {
-                            let index = (row - inner.y) as usize;
-                            state.list_state.select(Some(index.min(9)));
-                        }
+                // Lists tab (1)
+                if ui_state.selected_tab == 1
+                    && let Some(inner) = ui_state.list_inner_rect
+                    && inner.contains(pos)
+                {
+                    let index = (row - inner.y) as usize;
+                    ui_state.list_state.select(Some(index.min(9)));
                 }
 
-                if state.selected_tab == 3 {
-                    // Gauge - use stored rectangle
-                    if let Some(inner) = state.gauge_inner_rect
-                        && inner.contains(pos) {
-                            let percentage =
-                                ((col - inner.x) as f32 / inner.width as f32 * 100.0) as u16;
-                            state.gauge_value = percentage.min(100);
-                        }
+                // Interactive tab (3)
+                if ui_state.selected_tab == 3
+                    && let Some(inner) = ui_state.gauge_inner_rect
+                    && inner.contains(pos)
+                {
+                    let percentage =
+                        ((col - inner.x) as f32 / inner.width as f32 * 100.0) as u16;
+                    ui_state.gauge_value = percentage.min(100);
                 }
             }
+
             TerminalEventType::KeyPress { key, .. } => {
                 use KeyCode::*;
                 match key {
                     Tab => {
-                        state.selected_tab = (state.selected_tab + 1) % 5;
+                        ui_state.selected_tab = (ui_state.selected_tab + 1) % 5;
                     }
                     ArrowUp => {
-                        if state.selected_tab == 1 {
-                            let i = state.list_state.selected().unwrap_or(0);
-                            state.list_state.select(Some(i.saturating_sub(1)));
+                        if ui_state.selected_tab == 1 {
+                            let i = ui_state.list_state.selected().unwrap_or(0);
+                            ui_state.list_state.select(Some(i.saturating_sub(1)));
                         }
                     }
                     ArrowDown => {
-                        if state.selected_tab == 1 {
-                            let i = state.list_state.selected().unwrap_or(0);
-                            state.list_state.select(Some((i + 1).min(9)));
+                        if ui_state.selected_tab == 1 {
+                            let i = ui_state.list_state.selected().unwrap_or(0);
+                            ui_state.list_state.select(Some((i + 1).min(9)));
                         }
                     }
                     ArrowLeft => {
-                        state.gauge_value = state.gauge_value.saturating_sub(5);
+                        ui_state.gauge_value = ui_state.gauge_value.saturating_sub(5);
                     }
                     ArrowRight => {
-                        state.gauge_value = (state.gauge_value + 5).min(100);
+                        ui_state.gauge_value = (ui_state.gauge_value + 5).min(100);
                     }
                     _ => {}
                 }
             }
+
             _ => {}
         }
     }
 }
 
-fn render_terminal(
-    mut state: ResMut<WidgetCatalogState>,
+/// Update terminal content and render to 3D mesh
+fn update_terminal_content(
+    mut ui_state: ResMut<WidgetCatalogState>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
     mut images: ResMut<Assets<Image>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    marker_query: Query<&MeshMaterial3d<StandardMaterial>, With<RotatingPlane>>,
     time: Res<Time>,
 ) {
-    // Update sparkline data with random values
-    state.sparkline_timer.tick(time.delta());
-    if state.sparkline_timer.just_finished() {
-        let new_value = rand::thread_rng().gen_range(1..=15);
-        state.sparkline_data.push(new_value);
-        if state.sparkline_data.len() > 32 {
-            state.sparkline_data.remove(0);
+    // Update sparkline data with time-based pseudo-random values
+    ui_state.sparkline_timer.tick(time.delta());
+    if ui_state.sparkline_timer.just_finished() {
+        // Use multiple sine waves at different frequencies for pseudo-random effect
+        let t = time.elapsed_secs();
+        let new_value = ((t * 3.7).sin() * 4.0
+            + (t * 7.3).sin() * 3.0
+            + (t * 11.1).sin() * 2.0
+            + 10.0) as u64;
+        ui_state.sparkline_data.push(new_value.clamp(1, 15));
+        if ui_state.sparkline_data.len() > 32 {
+            ui_state.sparkline_data.remove(0);
         }
     }
 
-    let selected_tab = state.selected_tab;
-    let selected_button = state.selected_button;
-    let gauge_value = state.gauge_value;
-    let counter = state.counter;
-    let sparkline_data = state.sparkline_data.clone();
-    let mut list_state = state.list_state.clone();
-    let mouse_position = state.mouse_position;
+    let selected_tab = ui_state.selected_tab;
+    let selected_button = ui_state.selected_button;
+    let gauge_value = ui_state.gauge_value;
+    let counter = ui_state.counter;
+    let sparkline_data = ui_state.sparkline_data.clone();
+    let mut list_state = ui_state.list_state.clone();
+    let mouse_position = ui_state.mouse_position;
 
     // Variables to capture layout rectangles
     let mut button_rects = Vec::new();
@@ -349,14 +371,21 @@ fn render_terminal(
     let mut list_inner_rect = None;
     let mut gauge_inner_rect = None;
 
-    state
-        .terminal
-        .draw_and_render(&render_device, &render_queue, &mut images, |frame| {
+    let rotation_angle = (time.elapsed_secs() * 0.8).sin() * 45.0;
+
+    ui_state.terminal.draw_and_render(
+        &render_device,
+        &render_queue,
+        &mut images,
+        &mut materials,
+        &marker_query,
+        |frame| {
             let area = frame.area();
 
             let tabs = Tabs::new(vec!["Buttons", "Lists", "Charts", "Interactive", "Glyphs"])
                 .block(
-                    Block::bordered().title(format!("Widget Catalog")),
+                    Block::bordered()
+                        .title(format!("WASM Widget Catalog | Rot: {:.1}deg", rotation_angle)),
                 )
                 .style(Style::default().fg(RatatuiColor::White))
                 .highlight_style(Style::default().fg(RatatuiColor::Yellow).bold())
@@ -372,7 +401,6 @@ fn render_terminal(
                 ])
                 .split(area);
 
-            // Debug: Column ruler
             let ruler = (0..100)
                 .map(|i| {
                     if i % 10 == 0 {
@@ -416,7 +444,7 @@ fn render_terminal(
             };
 
             let status = Paragraph::new(format!(
-                " Counter: {} | Gauge: {}% | Tab: {} |{} | Use mouse or Tab/Arrow keys",
+                " Counter: {} | Gauge: {}% | Tab: {} |{} | WASM 3D Rotating!",
                 counter,
                 gauge_value,
                 selected_tab + 1,
@@ -435,14 +463,15 @@ fn render_terminal(
                 height: 1,
             };
             frame.render_widget(status, status_area);
-        });
+        },
+    );
 
     // Store captured layout rectangles for hit testing
-    state.button_rects = button_rects;
-    state.h_button_rects = h_button_rects;
-    state.list_inner_rect = list_inner_rect;
-    state.gauge_inner_rect = gauge_inner_rect;
-    state.list_state = list_state;
+    ui_state.button_rects = button_rects;
+    ui_state.h_button_rects = h_button_rects;
+    ui_state.list_inner_rect = list_inner_rect;
+    ui_state.gauge_inner_rect = gauge_inner_rect;
+    ui_state.list_state = list_state;
 }
 
 fn draw_buttons_tab(
@@ -486,7 +515,6 @@ fn draw_buttons_tab(
         frame.render_widget(button, chunks[i]);
     }
 
-    // Add horizontal buttons for testing
     let horizontal_area = chunks[3];
     let h_chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -533,8 +561,9 @@ fn draw_buttons_tab(
 
     let info = Paragraph::new(vec![
         Line::from(""),
-        Line::from("Click buttons with mouse!").style(Style::default().fg(RatatuiColor::Cyan)),
-        Line::from(format!("Current カウンター: {}", counter)),
+        Line::from("Click buttons with mouse on rotating 3D plane!")
+            .style(Style::default().fg(RatatuiColor::Cyan)),
+        Line::from(format!("Current counter: {}", counter)),
         Line::from(format!("Current gauge: {}%", gauge_value)),
         Line::from(selected_info).style(Style::default().fg(RatatuiColor::Yellow)),
     ])
@@ -542,7 +571,7 @@ fn draw_buttons_tab(
 
     frame.render_widget(info, chunks[4]);
 
-    // Return the button rectangles for hit testing
+    // Return button rectangles for hit testing
     let button_rects = chunks.iter().take(3).cloned().collect();
     let h_button_rects = h_chunks.to_vec();
 
@@ -595,26 +624,36 @@ fn draw_charts_tab(
         .margin(1)
         .split(area);
 
-    let bar_data = BarGroup::default().bars(&[
-        Bar::default()
-            .value(gauge_value as u64)
-            .label("Gauge".into()),
-        Bar::default().value(counter as u64).label("Counter".into()),
-        Bar::default().value(50).label("Static".into()),
-    ]);
+    let data = [
+        ("Counter", counter as u64),
+        ("Gauge", gauge_value as u64),
+        ("Items", 10),
+        ("Tabs", 4),
+    ];
 
     let barchart = BarChart::default()
         .block(Block::bordered().title("Bar Chart"))
-        .data(bar_data)
+        .data(
+            BarGroup::default().bars(
+                &data
+                    .iter()
+                    .map(|(label, value)| Bar::default().value(*value).label((*label).into()))
+                    .collect::<Vec<_>>(),
+            ),
+        )
         .bar_width(9)
         .bar_gap(2)
-        .value_style(Style::default().fg(RatatuiColor::Yellow))
-        .label_style(Style::default().fg(RatatuiColor::White));
+        .bar_style(Style::default().fg(RatatuiColor::Yellow))
+        .value_style(
+            Style::default()
+                .fg(RatatuiColor::Black)
+                .bg(RatatuiColor::Yellow),
+        );
 
     frame.render_widget(barchart, chunks[0]);
 
     let sparkline = Sparkline::default()
-        .block(Block::bordered().title("Sparkline"))
+        .block(Block::bordered().title("Sparkline (Auto-scrolling)"))
         .data(sparkline_data)
         .style(Style::default().fg(RatatuiColor::Green));
 
@@ -657,16 +696,17 @@ fn draw_interactive_tab(
 
     let instructions = Paragraph::new(vec![
         Line::from(""),
-        Line::from("Mouse Controls:").style(Style::default().fg(RatatuiColor::Yellow).bold()),
-        Line::from("  • Click tabs to switch"),
-        Line::from("  • Click gauge bar to set value"),
-        Line::from("  • Click buttons to interact"),
-        Line::from("  • Click list items to select"),
+        Line::from("Mouse Controls (3D Ray Casting):")
+            .style(Style::default().fg(RatatuiColor::Yellow).bold()),
+        Line::from("  - Click tabs to switch"),
+        Line::from("  - Click gauge bar to set value"),
+        Line::from("  - Click buttons to interact"),
+        Line::from("  - Click list items to select"),
         Line::from(""),
         Line::from("Keyboard Controls:").style(Style::default().fg(RatatuiColor::Yellow).bold()),
-        Line::from("  • Tab: Switch tabs"),
-        Line::from("  • ←/→: Adjust gauge"),
-        Line::from("  • ↑/↓: Navigate list (in Lists tab)"),
+        Line::from("  - Tab: Switch tabs"),
+        Line::from("  - Left/Right: Adjust gauge"),
+        Line::from("  - Up/Down: Navigate list (in Lists tab)"),
     ])
     .block(Block::bordered().title("Help"));
 
@@ -755,8 +795,18 @@ fn draw_glyphs_tab(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
         Line::from("using tiny-skia and pre-baked into the texture atlas."),
         Line::from(""),
         Line::from("This provides pixel-perfect rendering with zero"),
-        Line::from("runtime overhead."),
+        Line::from("runtime overhead. Running in WebAssembly!"),
     ])
     .block(Block::bordered().title("Info"));
     frame.render_widget(info, chunks[4]);
+}
+
+/// System that rotates the plane in seesaw motion for always-visible interaction
+fn rotate_plane(time: Res<Time>, mut query: Query<&mut Transform, With<RotatingPlane>>) {
+    for mut transform in &mut query {
+        // Seesaw rotation: oscillate +/-45 degrees around Z axis
+        let angle = (time.elapsed_secs() * 0.8).sin() * std::f32::consts::FRAC_PI_4;
+        transform.rotation =
+            Quat::from_rotation_x(std::f32::consts::FRAC_PI_2) * Quat::from_rotation_z(angle);
+    }
 }

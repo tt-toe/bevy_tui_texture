@@ -42,7 +42,7 @@ use std::hash::BuildHasher;
 use std::hash::Hasher;
 use std::hash::RandomState;
 
-use log::warn;
+use tracing::warn;
 use ratatui::buffer::Cell;
 use rustybuzz::Face;
 
