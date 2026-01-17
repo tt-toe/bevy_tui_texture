@@ -23,7 +23,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-bevy_tui_texture = "0.1.1"
+bevy_tui_texture = "0.1.2"
 ```
 
 ### Hello World Example
@@ -140,7 +140,7 @@ Configure features in your `Cargo.toml`:
 
 ```toml
 [dependencies.bevy_tui_texture]
-version = "0.1.1"
+version = "0.1.2"
 default-features = false
 features = ["keyboard_input", "mouse_input", "ratatui_backend"]
 ```
