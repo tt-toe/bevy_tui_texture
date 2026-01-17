@@ -28,32 +28,24 @@ bevy_tui_texture = "0.1.0"
 
 ```rust
 use std::sync::Arc;
-
 use bevy::prelude::*;
 use bevy::render::renderer::{RenderDevice, RenderQueue};
-use bevy::app::AppExit;
-
 use ratatui::prelude::*;
-use ratatui::style::Color as RatatuiColor;
 use ratatui::widgets::*;
-
+use ratatui::style::Color as RatatuiColor;
 use bevy_tui_texture::prelude::*;
-use bevy_tui_texture::setup::SimpleTerminal2D;
 use bevy_tui_texture::Font as TerminalFont;
+
+#[derive(Resource)]
+struct Terminal(SimpleTerminal2D);
 
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
         .add_plugins(TerminalPlugin::default())
         .add_systems(Startup, setup)
-        .add_systems(Update, handle_input.in_set(TerminalSystemSet::UserUpdate))
         .add_systems(Update, render_terminal.in_set(TerminalSystemSet::Render))
         .run();
-}
-
-#[derive(Resource)]
-struct MyTerminal {
-    terminal: SimpleTerminal2D,
 }
 
 fn setup(
@@ -70,48 +62,25 @@ fn setup(
     let font = TerminalFont::new(font_data).expect("Failed to load font");
     let fonts = Arc::new(Fonts::new(font, 16));
 
-    // Create terminal with SimpleTerminal2D - one line!
+    // Create terminal
     let terminal = SimpleTerminal2D::create_and_spawn(
-        80,              // 80 columns
-        25,              // 25 rows
-        fonts,           // Font configuration
-        (0.0, 0.0),      // Position at top-left
-        true,            // Enable programmatic glyphs
-        true,            // Enable keyboard input
-        false,           // Disable mouse input
-        &mut commands,
-        &render_device,
-        &render_queue,
-        &mut images,
+        80, 25, fonts, (0.0, 0.0), true, false, false,
+        &mut commands, &render_device, &render_queue, &mut images,
     ).expect("Failed to create terminal");
 
     // Spawn camera
     commands.spawn(Camera2d);
 
-    // Store terminal in resource
-    commands.insert_resource(MyTerminal { terminal });
-}
-
-fn handle_input(
-    keys: Res<ButtonInput<KeyCode>>,
-    mut app_exit: MessageWriter<AppExit>,
-) {
-    if keys.just_pressed(KeyCode::Escape) {
-        app_exit.write(AppExit::Success);
-    }
+    commands.insert_resource(Terminal(terminal));
 }
 
 fn render_terminal(
-    mut terminal_res: ResMut<MyTerminal>,
+    mut terminal: ResMut<Terminal>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
     mut images: ResMut<Assets<Image>>,
 ) {
-    terminal_res.terminal.draw_and_render(
-        &render_device,
-        &render_queue,
-        &mut images,
-        |frame| {
+    terminal.0.draw_and_render(&render_device, &render_queue, &mut images, |frame| {
             let area = frame.area();
 
             // Simple "Hello, World!" paragraph
@@ -121,8 +90,7 @@ fn render_terminal(
                 .block(Block::bordered().title("Minimal Example"));
 
             frame.render_widget(text, area);
-        },
-    );
+        });
 }
 ```
 
@@ -138,11 +106,11 @@ The `examples/` directory contains comprehensive demonstrations:
 
 - **`widget_catalog_2d.rs`** - Interactive showcase of ratatui widgets in 2D UI
 - **`widget_catalog_3d.rs`** - Interactive showcase of ratatui widgets on rotating 3D mesh
-- **`shader.rs`** - Custom shader effects with terminal textures
 
 ### Advanced Examples
 
 - **`multiple_terminals.rs`** - Managing multiple independent terminals
+- **`shader.rs`** - Custom shader effects with terminal textures
 - **`benchmark.rs`** - Performance benchmarking and optimization
 
 ### WebAssembly
@@ -178,15 +146,16 @@ Configure features in your `Cargo.toml`:
 
 ```toml
 [dependencies.bevy_tui_texture]
-version = "0.1.0"
+version = "0.1.1"
 default-features = false
-features = ["keyboard_input", "mouse_input"]
+features = ["keyboard_input", "mouse_input", "ratatui_backend"]
 ```
 
 Available features:
 
 - **`keyboard_input`** (default) - Enable keyboard event handling
 - **`mouse_input`** (default) - Enable mouse event handling for both 2D UI and 3D mesh terminals
+- **`ratatui_backend`** (default) - Enable ratatui
 
 ## Performance
 
@@ -255,8 +224,6 @@ cargo install wasm-bindgen-cli
 
 #### Build WASM
 
-Use the `cargo wasm` command which runs the full optimization pipeline:
-
 ```bash
 cargo wasm
 ```
@@ -279,29 +246,6 @@ cargo run --example web_server
 ```
 
 The web server serves the WASM demo with proper CORS headers for WebAssembly.
-
-### WASM Demo Features
-
-The `wasm_demo` binary showcases the full widget catalog on a rotating 3D plane:
-
-- **5 Interactive Tabs**: Buttons, Lists, Charts, Interactive, Glyphs
-- **Mouse Interaction**: Click tabs, buttons, list items, and gauges via 3D ray casting
-- **Keyboard Controls**: Tab to switch pages, arrows to navigate
-- **Auto-scrolling Sparkline**: Real-time animated chart
-- **Programmatic Glyphs**: Box-drawing, block elements, Braille patterns
-
-### Deployment
-
-The built WASM files in `examples/web/` can be deployed to any static hosting:
-
-```
-examples/web/
-├── index.html          # Entry point
-├── wasm_demo.js        # JS loader (generated by wasm-bindgen)
-└── wasm_demo_bg.wasm   # WebAssembly binary (~3-5MB optimized)
-```
-
-Deploy to GitHub Pages, Netlify, Vercel, or any static file server.
 
 ## Contributing
 

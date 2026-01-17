@@ -1,6 +1,15 @@
 use std::env;
 use std::process::{Command, ExitCode};
 
+/// Check if a command is available on the system
+fn check_command_available(command: &str) -> bool {
+    Command::new(command)
+        .arg("--version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
 
@@ -20,6 +29,16 @@ fn main() -> ExitCode {
 }
 
 fn wasm() -> ExitCode {
+    // Check if required WASM tools are available
+    let required_tools = ["wasm-bindgen", "wasm-opt", "wasm-strip"];
+    for tool in &required_tools {
+        if !check_command_available(tool) {
+            eprintln!("Error: {} is not installed or not available in PATH", tool);
+            eprintln!("Please install {} and try again", tool);
+            return ExitCode::FAILURE;
+        }
+    }
+
     // Step 1: Build WASM
     println!("Building WASM...");
     let status = Command::new("cargo")
