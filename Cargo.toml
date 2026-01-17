@@ -2,6 +2,7 @@
 name = "bevy_tui_texture"
 version = "0.1.1"
 edition = "2024"
+authors = ["TTT"]
 autoexamples = false
 license-file = "LICENSE"
 keywords = ["gamedev", "bevy", "ratatui", "terminal", "tui"]
@@ -65,6 +66,7 @@ tracing = "0.1.44"
 wasm-bindgen = "0.2"
 web-sys = { version = "0.3", features = ["Window", "Document", "HtmlCanvasElement", "console"] }
 console_error_panic_hook = "0.1"
+getrandom = { version = "0.2", features = ["js"] }
 
 [dev-dependencies]
 winit = "0.30.12"
@@ -82,11 +84,6 @@ wasm-bindgen-test = "0.3"
 [lints.clippy]
 type_complexity = "allow"
 
-[[bin]]
-name = "wasm_demo"
-path = "examples/wasm_demo.rs"
-required-features = []
-
 [[example]]
 name = "widget_catalog_2d"
 path = "examples/widget_catalog_2d.rs"
@@ -103,11 +100,12 @@ path = "examples/helloworld.rs"
 name = "benchmark"
 path = "examples/benchmark.rs"
 [[example]]
-name = "web_server"
-path = "examples/web_server.rs"
-[[example]]
 name = "shader"
 path = "examples/shader.rs"
+[[example]]
+name = "wasm_demo"
+path = "examples/wasm_demo.rs"
+[[example]]
+name = "wasm_serve"
+path = "examples/wasm_serve.rs"
 
-[workspace]
-members = ["xtask"]

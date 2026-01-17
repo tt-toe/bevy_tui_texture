@@ -2,16 +2,6 @@
 //!
 //! This example demonstrates running Bevy + ratatui widget catalog in the browser with WebAssembly.
 //!
-//! ## Build & Run
-//!
-//! ```bash
-//! # Build WASM
-//! cargo wasm
-//!
-//! # Serve with custom web server
-//! cargo run --example web_server
-//! # Then open http://127.0.0.1:8080
-//! ```
 
 use std::sync::Arc;
 use std::time::Duration;

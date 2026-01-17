@@ -23,7 +23,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-bevy_tui_texture = "0.1.0"
+bevy_tui_texture = "0.1.1"
 ```
 
 ### Hello World Example
@@ -56,7 +56,6 @@ fn setup(
     render_queue: Res<RenderQueue>,
     mut images: ResMut<Assets<Image>>,
 ) {
-    // Load font
     let font_data = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/assets/fonts/Mplus1Code-Regular.ttf"
@@ -64,15 +63,12 @@ fn setup(
     let font = TerminalFont::new(font_data).expect("Failed to load font");
     let fonts = Arc::new(Fonts::new(font, 16));
 
-    // Create terminal
     let terminal = SimpleTerminal2D::create_and_spawn(
         80, 25, fonts, (0.0, 0.0), true, false, false,
         &mut commands, &render_device, &render_queue, &mut images,
     ).expect("Failed to create terminal");
 
-    // Spawn camera
     commands.spawn(Camera2d);
-
     commands.insert_resource(Terminal(terminal));
 }
 
@@ -83,16 +79,12 @@ fn render_terminal(
     mut images: ResMut<Assets<Image>>,
 ) {
     terminal.0.draw_and_render(&render_device, &render_queue, &mut images, |frame| {
-            let area = frame.area();
-
-            // Simple "Hello, World!" paragraph
-            let text = Paragraph::new("Hello, World!")
-                .style(Style::default().fg(RatatuiColor::Green).bold())
-                .alignment(Alignment::Center)
-                .block(Block::bordered().title("Minimal Example"));
-
-            frame.render_widget(text, area);
-        });
+        let text = Paragraph::new("Hello, World!")
+            .style(Style::default().fg(RatatuiColor::Green).bold())
+            .alignment(Alignment::Center)
+            .block(Block::bordered().title("Minimal Example"));
+        frame.render_widget(text, frame.area());
+    });
 }
 ```
 
@@ -118,7 +110,7 @@ The `examples/` directory contains comprehensive demonstrations:
 ### WebAssembly
 
 - **`wasm_demo.rs`** - Full widget catalog running in browser (see [WebAssembly Support](#webassembly-support))
-- **`web_server.rs`** - Local development server for WASM demo
+- **`wasm_serve.rs`** - One-command WASM build & serve (recommended)
 
 Run any example with:
 
@@ -127,7 +119,7 @@ cargo run --example helloworld
 cargo run --example widget_catalog_3d
 
 # For WASM demo
-cargo wasm && cargo run --example web_server
+cargo run --example wasm_serve
 ```
 
 ## Architecture
@@ -188,11 +180,7 @@ See `examples/benchmark.rs` for performance metrics.
 
 ## WebAssembly Support
 
-### Status
-
-**✅ Fully Functional** - bevy_tui_texture works in browsers via WebAssembly!
-
-The library renders ratatui terminal UIs as GPU textures, which works perfectly in WebGL2 environments. The WASM demo showcases a complete interactive widget catalog running on a rotating 3D plane in your browser.
+The library renders ratatui terminal UIs as GPU textures, which works in WebGL2 environments. The WASM demo showcases a interactive widget catalog running on a rotating 3D plane in your browser.
 
 ### What Works
 
@@ -224,30 +212,13 @@ cargo install wasm-bindgen-cli
 # Ubuntu: apt install wabt
 ```
 
-#### Build WASM
+#### Build & Serve WASM
 
 ```bash
-cargo wasm
+cargo run --example wasm_serve
 ```
-
-This executes:
-1. `cargo build --target wasm32-unknown-unknown --profile wasm-release --bin wasm_demo`
-2. `wasm-bindgen` - Generate JS bindings
-3. `wasm-opt` - Optimize for size (-Oz)
-4. `wasm-strip` - Strip debug symbols
 
 Output files are placed in `examples/web/`.
-
-#### Serve Locally
-
-```bash
-# Start the web server
-cargo run --example web_server
-
-# Open browser to http://127.0.0.1:8080
-```
-
-The web server serves the WASM demo with proper CORS headers for WebAssembly.
 
 ## Contributing
 
@@ -255,7 +226,7 @@ Contributions are welcome! Please feel free to submit issues or pull requests.
 
 ## License
 
-- MIT License ([LICENSE](LICENSE) or http://opensource.org/licenses/MIT)
+- See [LICENSE](LICENSE)
 
 ## Acknowledgments
 
@@ -273,6 +244,3 @@ This library builds on the excellent work of:
 - [bevy_ui](https://github.com/bevyengine/bevy/tree/main/crates/bevy_ui) - Native Bevy UI
 - [tui-rs](https://github.com/fdehau/tui-rs) - Original terminal UI library
 
----
-
-Made with Bevy and ratatui
