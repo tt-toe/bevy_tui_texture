@@ -25,7 +25,7 @@ Add to your `Cargo.toml`:
 [dependencies]
 bevy = "0.17"
 font-kit = "0.14"
-bevy_tui_texture = "0.1.2"
+bevy_tui_texture = "0.1.3"
 ```
 
 ### Hello World Example
@@ -151,7 +151,7 @@ Configure features in your `Cargo.toml`:
 
 ```toml
 [dependencies.bevy_tui_texture]
-version = "0.1.2"
+version = "0.1.3"
 default-features = false
 features = ["keyboard_input", "mouse_input", "ratatui_backend"]
 ```
