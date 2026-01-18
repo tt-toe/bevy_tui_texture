@@ -6,6 +6,9 @@ use ratatui::widgets::*;
 use ratatui::style::Color as RatatuiColor;
 use bevy_tui_texture::prelude::*;
 use bevy_tui_texture::Font as TerminalFont;
+use font_kit::source::SystemSource;
+use font_kit::family_name::FamilyName;
+use font_kit::properties::Properties;
 
 #[derive(Resource)]
 struct Terminal(SimpleTerminal2D);
@@ -25,12 +28,18 @@ fn setup(
     render_queue: Res<RenderQueue>,
     mut images: ResMut<Assets<Image>>,
 ) {
-    // Load font
-    let font_data = include_bytes!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/assets/fonts/Mplus1Code-Regular.ttf"
-    ));
-    let font = TerminalFont::new(font_data).expect("Failed to load font");
+    // Load system monospace font
+    let font_handle = SystemSource::new()
+        .select_best_match(&[FamilyName::Monospace], &Properties::new())
+        .expect("No monospace font found on system");
+    let font_data = font_handle
+        .load()
+        .expect("Failed to load font")
+        .copy_font_data()
+        .expect("Failed to copy font data");
+    // Leak the font data to get a 'static reference (fine for app-lifetime fonts)
+    let font_data: &'static [u8] = Box::leak(font_data.to_vec().into_boxed_slice());
+    let font = TerminalFont::new(font_data).expect("Failed to parse font");
     let fonts = Arc::new(Fonts::new(font, 16));
 
     // Create terminal
