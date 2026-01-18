@@ -235,7 +235,7 @@ This library builds on the excellent work of:
 - **[Bevy](https://bevyengine.org/)** - A refreshingly simple data-driven game engine
 - **[ratatui](https://ratatui.rs/)** - A Rust library for cooking up terminal user interfaces
 - **[WGPU](https://wgpu.rs/)** - Safe and portable GPU abstraction in Rust
-- **[ratatui-wgpu](https://github.com/joshka/ratatui-wgpu)** - The original ratatui WGPU backend that inspired this work
+- **[ratatui-wgpu](https://github.com/Jesterhearts/ratatui-wgpu)** - Ratatui WGPU backend that inspired this work
 - **[rio](https://rioterm.com/)** - Beautiful glyph rendering
 
 ## Related Projects
