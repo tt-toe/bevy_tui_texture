@@ -241,6 +241,7 @@ This library builds on the excellent work of:
 ## Related Projects
 
 - [bevy_egui](https://github.com/mvlabat/bevy_egui) - Egui integration for Bevy
+- [egui_ratatui](https://github.com/gold-silver-copper/egui_ratatui) - Egui widget + ratatui backend
 - [bevy_ui](https://github.com/bevyengine/bevy/tree/main/crates/bevy_ui) - Native Bevy UI
 - [tui-rs](https://github.com/fdehau/tui-rs) - Original terminal UI library
 
