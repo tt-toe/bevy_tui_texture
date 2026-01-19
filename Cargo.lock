@@ -1333,6 +1333,7 @@ dependencies = [
  "tiny_http",
  "tokio",
  "tracing",
+ "unicode-properties",
  "unicode-width",
  "wasm-bindgen",
  "wasm-bindgen-test",

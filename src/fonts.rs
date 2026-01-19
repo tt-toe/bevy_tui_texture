@@ -273,16 +273,45 @@ impl Fonts {
     }
 
     pub(crate) fn font_for_cell(&self, cell: &Cell) -> (&Font, bool, bool) {
+        let is_bold = cell.modifier.contains(ratatui::style::Modifier::BOLD);
+        let is_italic = cell.modifier.contains(ratatui::style::Modifier::ITALIC);
+
+
+        // Build priority-ordered list of fonts to try
+        let mut fonts_to_try = Vec::new();
+
+        if is_bold && is_italic {
+            // Bold + Italic: try bold_italic first, then fall back with fake styling
+            fonts_to_try.extend(self.bold_italic.iter().map(|f| (f, false, false)));
+            fonts_to_try.extend(self.bold.iter().map(|f| (f, false, true)));
+            fonts_to_try.extend(self.italic.iter().map(|f| (f, true, false)));
+            fonts_to_try.extend(self.regular.iter().map(|f| (f, true, true)));
+        } else if is_bold {
+            // Bold only: try bold, then fake bold on regular
+            fonts_to_try.extend(self.bold.iter().map(|f| (f, false, false)));
+            fonts_to_try.extend(self.regular.iter().map(|f| (f, true, false)));
+            fonts_to_try.extend(self.italic.iter().map(|f| (f, true, false)));
+            fonts_to_try.extend(self.bold_italic.iter().map(|f| (f, false, false)));
+        } else if is_italic {
+            // Italic only: try italic, then fake italic on regular
+            fonts_to_try.extend(self.italic.iter().map(|f| (f, false, false)));
+            fonts_to_try.extend(self.regular.iter().map(|f| (f, false, true)));
+            fonts_to_try.extend(self.bold.iter().map(|f| (f, false, true)));
+            fonts_to_try.extend(self.bold_italic.iter().map(|f| (f, false, false)));
+        } else {
+            // Regular: try regular, then any other
+            fonts_to_try.extend(self.regular.iter().map(|f| (f, false, false)));
+            fonts_to_try.extend(self.bold.iter().map(|f| (f, false, false)));
+            fonts_to_try.extend(self.italic.iter().map(|f| (f, false, false)));
+            fonts_to_try.extend(self.bold_italic.iter().map(|f| (f, false, false)));
+        }
+
+        // Select font with fake styling as last resort
         self.select_font(
             cell.symbol(),
-            self.regular
-                .iter()
-                .chain(self.bold.iter())
-                .chain(self.italic.iter())
-                .chain(self.bold_italic.iter())
-                .map(|f| (f, false, false)),
-            false,
-            false,
+            fonts_to_try,
+            is_bold,   // Use fake bold if no real bold font found
+            is_italic, // Use fake italic if no real italic font found
         )
     }
 

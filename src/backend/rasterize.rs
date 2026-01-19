@@ -148,14 +148,24 @@ pub(super) fn rasterize_glyph(
         );
 
         if fake_bold {
+            // Use thicker stroke for better bold effect
             target.stroke(
                 &path,
                 &raqote::Source::Solid(SolidSource::from_unpremultiplied_argb(255, 255, 255, 255)),
                 &StrokeStyle {
-                    width: 1.5,
+                    width: 4.0,  // Increased stroke width for more visible bold effect
                     ..Default::default()
                 },
                 &DrawOptions::new(),
+            );
+
+            // Additional technique: render the glyph slightly offset to create thickness
+            let bold_transform = Transform::new(1.0, 0.0, 0.0, 1.0, 0.5, 0.0);
+            let transformed_path = path.clone().transform(&bold_transform);
+            target.fill(
+                &transformed_path,
+                &raqote::Source::Solid(SolidSource::from_unpremultiplied_argb(128, 255, 255, 255)),
+                &DrawOptions::default(),
             );
         }
 

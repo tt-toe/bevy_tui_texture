@@ -2,26 +2,26 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use web_time::{Duration, Instant};
 
-use crate::RandomState;
+use crate::backend::rasterize::rasterize_glyph;
 use crate::backend::TextBgVertexMember;
 use crate::backend::TextCacheBgPipeline;
 use crate::backend::TextCacheFgPipeline;
 use crate::backend::TextVertexMember;
 use crate::backend::Viewport;
 use crate::backend::WgpuState;
-use crate::backend::rasterize::rasterize_glyph;
 use crate::colors::Rgb;
 use crate::fonts::Fonts;
 use crate::utils::plan_cache::PlanCache;
 use crate::utils::text_atlas::Atlas;
 use crate::utils::text_atlas::CacheRect;
 use crate::utils::text_atlas::Key;
+use crate::RandomState;
 use bitvec::vec::BitVec;
 use indexmap::IndexMap;
 use ratatui::buffer::Cell;
 use ratatui::text::Line;
-use rustybuzz::UnicodeBuffer;
 use rustybuzz::ttf_parser::GlyphId;
+use rustybuzz::UnicodeBuffer;
 use wgpu::Buffer;
 use wgpu::Device;
 use wgpu::Queue;
@@ -179,8 +179,8 @@ impl TerminalBuilder {
     /// Device and Queue are borrowed, not owned.
     pub fn build(self, device: &Device, _queue: &Queue) -> Result<BevyTerminalBackend, String> {
         use crate::backend::{
-            CACHE_HEIGHT, CACHE_WIDTH, build_text_bg_compositor, build_text_fg_compositor,
-            build_wgpu_state,
+            build_text_bg_compositor, build_text_fg_compositor, build_wgpu_state, CACHE_HEIGHT,
+            CACHE_WIDTH,
         };
         use std::mem::size_of;
         use wgpu::util::BufferInitDescriptor;
@@ -838,7 +838,14 @@ impl ratatui::backend::Backend for BevyTerminalBackend {
             }
 
             // For now, use font_for_cell on the first cell
+            #[cfg(feature = "bold_italic_fonts")]
             let (font, _fake_bold, _fake_italic) = self.fonts.font_for_cell(&row_cells[0]);
+
+            #[cfg(not(feature = "bold_italic_fonts"))]
+            let (font, fake_bold, fake_italic) = {
+                let (f, _, _) = self.fonts.font_for_cell(&row_cells[0]);
+                (f, false, false) // Disable fake styling when feature is off
+            };
 
             let glyph_buffer =
                 shape_with_plan(font.font(), self.plan_cache.get(font, &mut buffer), buffer);
@@ -864,11 +871,33 @@ impl ratatui::backend::Backend for BevyTerminalBackend {
                 let cell = &row_cells[cell_idx];
                 let _glyph_id = GlyphId(info.glyph_id as u16);
 
+                // Use per-cell font selection for proper styling
+                #[cfg(feature = "bold_italic_fonts")]
+                let (cell_font, cell_fake_bold, cell_fake_italic) = self.fonts.font_for_cell(cell);
+
+                #[cfg(not(feature = "bold_italic_fonts"))]
+                let (cell_font, cell_fake_bold, cell_fake_italic) = (font, fake_bold, fake_italic);
+
                 // Calculate character width using unicode-width for precise glyph width
                 use unicode_width::UnicodeWidthChar;
                 let ch = cell.symbol().chars().next().unwrap_or(' ');
                 let ch_width = ch.width().unwrap_or(1).max(1) as u32;
                 let glyph_width_px = ch_width * self.fonts.min_width_px();
+
+                // Check if this character is an emoji
+                #[cfg(feature = "emoji_support")]
+                fn is_emoji(ch: char) -> bool {
+                    use unicode_properties::UnicodeEmoji;
+                    // Simplify emoji detection - just check if it's an emoji character
+                    ch.is_emoji_char()
+                }
+
+                #[cfg(not(feature = "emoji_support"))]
+                fn is_emoji(_ch: char) -> bool {
+                    false
+                }
+
+                let is_emoji = is_emoji(ch);
 
                 // Check if this is a programmatic glyph that was pre-rendered
                 use crate::backend::programmatic_glyphs::is_programmatic_glyph;
@@ -877,17 +906,25 @@ impl ratatui::backend::Backend for BevyTerminalBackend {
                 // Create cache key
                 // For programmatic glyphs: use Unicode codepoint + last_resort font (matches populate_programmatic_glyphs)
                 // For font glyphs: use shaped glyph ID + actual font
+
+                #[cfg(feature = "bold_italic_fonts")]
+                let style = cell.modifier
+                    & (ratatui::style::Modifier::BOLD | ratatui::style::Modifier::ITALIC);
+
+                #[cfg(not(feature = "bold_italic_fonts"))]
+                let style = ratatui::style::Modifier::empty();
+
                 let key = if is_programmatic {
                     Key {
-                        style: ratatui::style::Modifier::empty(),
+                        style,
                         glyph: ch as u32,
                         font: self.fonts.last_resort_id(),
                     }
                 } else {
                     Key {
-                        style: ratatui::style::Modifier::empty(),
+                        style,
                         glyph: info.glyph_id,
-                        font: font.id(),
+                        font: cell_font.id(),
                     }
                 };
 
@@ -917,12 +954,16 @@ impl ratatui::backend::Backend for BevyTerminalBackend {
                         // Calculate glyph bearing offset to apply during rasterization
                         let bearing_offset_x = pos.x_offset as f32 * advance_scale;
 
+                        // Don't apply fake styling to emoji characters to avoid distortion
+                        let final_fake_italic = cell_fake_italic && !is_emoji;
+                        let final_fake_bold = cell_fake_bold && !is_emoji;
+
                         let (rect, image) = rasterize_glyph(
                             cached,
                             metrics,
                             info,
-                            false, // no fake italic
-                            false, // no fake bold
+                            final_fake_italic, // Don't distort emoji
+                            final_fake_bold,   // Don't distort emoji
                             advance_scale,
                             glyph_width_px,   // Use actual glyph width
                             bearing_offset_x, // Apply offset in atlas
@@ -1036,7 +1077,10 @@ impl ratatui::backend::Backend for BevyTerminalBackend {
         Ok(())
     }
 
-    fn clear_region(&mut self, _clear_type: ratatui::backend::ClearType) -> Result<(), Self::Error> {
+    fn clear_region(
+        &mut self,
+        _clear_type: ratatui::backend::ClearType,
+    ) -> Result<(), Self::Error> {
         // For now, just delegate to clear() for all clear types
         self.clear()
     }

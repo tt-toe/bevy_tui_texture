@@ -17,6 +17,8 @@ default = ["keyboard_input", "mouse_input", "ratatui_backend"]
 keyboard_input = []
 mouse_input = []
 ratatui_backend = ["dep:ratatui"]
+bold_italic_fonts = []
+emoji_support = ["dep:unicode-properties"]
 
 # for Native
 [profile.release]
@@ -71,6 +73,7 @@ evictor = { version = "0.5.1", default-features = false }
 unicode-width = "0.2.0"
 web-time = "1.1"
 tracing = "0.1.44"
+unicode-properties = { version = "0.1.3", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "=0.2.106"

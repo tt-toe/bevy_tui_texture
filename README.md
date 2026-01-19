@@ -15,7 +15,6 @@ https://github.com/user-attachments/assets/57c2fb98-04a6-4ecf-8c72-58808a9f499f
 - **Programmatic Glyphs** - Automatic rendering of box-drawing, block elements, and Braille patterns
 - **Real-time Updates** - Efficient real-time terminal content updates with minimal overhead
 - **Easy Setup API** - Simple `SimpleTerminal2D` and `SimpleTerminal3D` helpers for quick integration
-- **Bevy 0.18 Compatible** - Built for the latest Bevy version with modern ECS patterns
 
 ## Quick Start
 
@@ -120,30 +119,29 @@ The `examples/` directory contains comprehensive demonstrations:
 
 ### WebAssembly
 
-- **`wasm_demo.rs`** - Full widget catalog running in browser (see [WebAssembly Support](#webassembly-support))
-- **`wasm_serve.rs`** - One-command WASM build & serve (recommended)
+- **`wasm_demo.rs`** - Full widget catalog running in browser
+- **`wasm_serve.rs`** - One-command WASM build & serve
 
-Run any example with:
+## Run examples with
 
 ```bash
 cargo run --example helloworld
 cargo run --example widget_catalog_3d
 
 # For WASM demo
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli
+# Install wasm-opt (via binaryen)
+# macOS: brew install binaryen
+# Ubuntu: apt install binaryen
+
+# Install wabt for wasm-strip
+# macOS: brew install wabt
+# Ubuntu: apt install wabt
 cargo run --example wasm_serve
+
+# Output files are placed in `examples/web/`.
 ```
-
-## Architecture
-
-The library is organized into several key modules:
-
-- **`bevy_plugin`** - Core Bevy plugin, resources, and components
-- **`backend`** - WGPU-based ratatui backend implementation
-- **`setup`** - Simplified setup utilities (`SimpleTerminal2D`, `SimpleTerminal3D`)
-- **`fonts`** - Font loading and rendering with Unicode support
-- **`input`** - Keyboard and mouse input handling system
-- **`colors`** - ANSI color conversion and management
-- **`utils`** - Text atlas and rendering utilities
 
 ## Feature Flags
 
@@ -203,35 +201,7 @@ The library renders ratatui terminal UIs as GPU textures, which works in WebGL2 
 - 3D ray casting for mouse interaction on 3D meshes
 - Programmatic glyphs (box-drawing, block elements, Braille)
 - Real-time animations and updates
-- Font embedding via `include_bytes!()` (see examples/widget_catalog_2d.rs)
-
-### Building for WebAssembly
-
-#### Prerequisites
-
-```bash
-# Add wasm target
-rustup target add wasm32-unknown-unknown
-
-# Install wasm-bindgen CLI
-cargo install wasm-bindgen-cli
-
-# Install wasm-opt (via binaryen)
-# macOS: brew install binaryen
-# Ubuntu: apt install binaryen
-
-# Install wabt for wasm-strip
-# macOS: brew install wabt
-# Ubuntu: apt install wabt
-```
-
-#### Build & Serve WASM
-
-```bash
-cargo run --example wasm_serve
-```
-
-Output files are placed in `examples/web/`.
+- Font embedding via `include_bytes!()`
 
 ## Contributing
 

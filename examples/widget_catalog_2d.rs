@@ -108,7 +108,7 @@ fn setup_terminal(
         "/assets/fonts/Mplus1Code-Regular.ttf"
     ));
     let font = TerminalFont::new(font_data).expect("Failed to load font");
-    let fonts = Arc::new(Fonts::new(font, 16));
+    let fonts = Arc::new(Fonts::new(font, 24));
 
     const COLS: u16 = 100;
     const ROWS: u16 = 30;
@@ -686,6 +686,7 @@ fn draw_glyphs_tab(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(3), // Styled Text
             Constraint::Length(3), // Box Drawing
             Constraint::Length(3), // Block Elements
             Constraint::Length(5), // Braille
@@ -695,16 +696,31 @@ fn draw_glyphs_tab(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
         .margin(1)
         .split(area);
 
+    // Styled Text (requires bold_italic_fonts feature)
+    let styled_lines = vec![Line::from(vec![
+        Span::raw("Regular "),
+        Span::styled("Bold", Style::default().bold()),
+        Span::raw(" "),
+        Span::styled("Italic", Style::default().italic()),
+        Span::raw(" "),
+        Span::styled("Bold+Italic", Style::default().bold().italic()),
+        Span::raw(" "),
+        Span::styled("🎨 Emoji", Style::default().fg(RatatuiColor::Red)),
+    ])];
+    let styled_para = Paragraph::new(styled_lines)
+        .block(Block::bordered().title("Styled Text (enable with --features bold_italic_fonts,emoji_support)"));
+    frame.render_widget(styled_para, chunks[0]);
+
     // Box Drawing
     let box_lines = vec![Line::from(vec![
         Span::raw("Box: "),
         Span::styled(
-            "─│┌┐└┘├┤┬┴┼ ━┃┏┓┗┛ ═║╔╗╚╝╠╣╦╩╬ ╭╮╯╰",
+            "─│┌┐└┘├┤┬┴┼ ━┃┏┓┗┛ ═║╔╗╚╝╠╣╦╩╬ ╞╡╤╧╪ ╭╮╯╰",
             Style::default().fg(RatatuiColor::Cyan),
         ),
     ])];
     let box_para = Paragraph::new(box_lines).block(Block::bordered().title("Box Drawing"));
-    frame.render_widget(box_para, chunks[0]);
+    frame.render_widget(box_para, chunks[1]);
 
     // Block Elements
     let block_lines = vec![Line::from(vec![
@@ -715,7 +731,7 @@ fn draw_glyphs_tab(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
         ),
     ])];
     let block_para = Paragraph::new(block_lines).block(Block::bordered().title("Block Elements"));
-    frame.render_widget(block_para, chunks[1]);
+    frame.render_widget(block_para, chunks[2]);
 
     // Braille
     let braille_lines = vec![
@@ -734,7 +750,7 @@ fn draw_glyphs_tab(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
     ];
     let braille_para =
         Paragraph::new(braille_lines).block(Block::bordered().title("Braille Patterns"));
-    frame.render_widget(braille_para, chunks[2]);
+    frame.render_widget(braille_para, chunks[3]);
 
     // Powerline
     let powerline_lines = vec![Line::from(vec![
@@ -746,7 +762,7 @@ fn draw_glyphs_tab(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
     ])];
     let powerline_para =
         Paragraph::new(powerline_lines).block(Block::bordered().title("Powerline Symbols"));
-    frame.render_widget(powerline_para, chunks[3]);
+    frame.render_widget(powerline_para, chunks[4]);
 
     // Info
     let info = Paragraph::new(vec![
@@ -759,5 +775,5 @@ fn draw_glyphs_tab(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
         Line::from("runtime overhead."),
     ])
     .block(Block::bordered().title("Info"));
-    frame.render_widget(info, chunks[4]);
+    frame.render_widget(info, chunks[5]);
 }
