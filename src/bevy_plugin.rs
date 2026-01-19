@@ -259,7 +259,10 @@ pub fn update_terminal_texture(
             sender.send(result).ok();
         });
 
-        render_device.wgpu_device().poll(wgpu::PollType::Wait).ok();
+        render_device.wgpu_device().poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        }).ok();
 
         if receiver.recv().ok().and_then(|r| r.ok()).is_some() {
             let data = buffer_slice.get_mapped_range();

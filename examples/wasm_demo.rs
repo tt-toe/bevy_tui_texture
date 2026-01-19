@@ -126,12 +126,15 @@ fn setup_terminal(
     ));
     console_log!("Camera spawned");
 
-    // Add ambient light
-    commands.insert_resource(AmbientLight {
-        color: bevy::color::Color::WHITE,
-        brightness: 1.0,
-        affects_lightmapped_meshes: true,
-    });
+    // Add directional light
+    commands.spawn((
+        DirectionalLight {
+            illuminance: 5000.0,
+            shadows_enabled: false,
+            ..default()
+        },
+        Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.5, -0.5, 0.0)),
+    ));
     console_log!("Ambient light added");
 
     // Create 3D terminal with easy setup API
@@ -627,7 +630,7 @@ fn draw_charts_tab(
             BarGroup::default().bars(
                 &data
                     .iter()
-                    .map(|(label, value)| Bar::default().value(*value).label((*label).into()))
+                    .map(|(label, value)| Bar::default().value(*value).label(*label))
                     .collect::<Vec<_>>(),
             ),
         )
@@ -679,7 +682,8 @@ fn draw_interactive_tab(
     let line_gauge = LineGauge::default()
         .block(Block::bordered().title("Line Gauge"))
         .filled_style(Style::default().fg(RatatuiColor::Magenta))
-        .line_set(symbols::line::THICK)
+        .filled_symbol(symbols::line::THICK.horizontal)
+        .unfilled_symbol(" ")
         .ratio(gauge_value as f64 / 100.0);
 
     frame.render_widget(line_gauge, chunks[1]);

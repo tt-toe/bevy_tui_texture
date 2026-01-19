@@ -598,9 +598,9 @@ fn draw_charts_tab(
     let bar_data = BarGroup::default().bars(&[
         Bar::default()
             .value(gauge_value as u64)
-            .label("Gauge".into()),
-        Bar::default().value(counter as u64).label("Counter".into()),
-        Bar::default().value(50).label("Static".into()),
+            .label("Gauge"),
+        Bar::default().value(counter as u64).label("Counter"),
+        Bar::default().value(50).label("Static"),
     ]);
 
     let barchart = BarChart::default()
@@ -650,7 +650,8 @@ fn draw_interactive_tab(
     let line_gauge = LineGauge::default()
         .block(Block::bordered().title("Line Gauge"))
         .filled_style(Style::default().fg(RatatuiColor::Magenta))
-        .line_set(symbols::line::THICK)
+        .filled_symbol(symbols::line::THICK.horizontal)
+        .unfilled_symbol(" ")
         .ratio(gauge_value as f64 / 100.0);
 
     frame.render_widget(line_gauge, chunks[1]);

@@ -15,7 +15,7 @@ https://github.com/user-attachments/assets/57c2fb98-04a6-4ecf-8c72-58808a9f499f
 - **Programmatic Glyphs** - Automatic rendering of box-drawing, block elements, and Braille patterns
 - **Real-time Updates** - Efficient real-time terminal content updates with minimal overhead
 - **Easy Setup API** - Simple `SimpleTerminal2D` and `SimpleTerminal3D` helpers for quick integration
-- **Bevy 0.17 Compatible** - Built for the latest Bevy version with modern ECS patterns
+- **Bevy 0.18 Compatible** - Built for the latest Bevy version with modern ECS patterns
 
 ## Quick Start
 
@@ -23,9 +23,9 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-bevy = "0.17"
+bevy = "0.18"
 font-kit = "0.14"
-bevy_tui_texture = "0.1.3"
+bevy_tui_texture = "0.2"
 ```
 
 ### Hello World Example
@@ -151,7 +151,7 @@ Configure features in your `Cargo.toml`:
 
 ```toml
 [dependencies.bevy_tui_texture]
-version = "0.1.3"
+version = "0.2"
 default-features = false
 features = ["keyboard_input", "mouse_input", "ratatui_backend"]
 ```
@@ -175,12 +175,14 @@ See `examples/benchmark.rs` for performance metrics.
 
 ## Requirements
 
-- Rust 1.75 or later (2024 edition)
-- Bevy 0.17.3
+- Rust 1.92 or later (2024 edition)
+- Bevy 0.18
+- Ratatui 0.30
 - A GPU with WGPU support
 
 | `bevy` | `ratatui` | `bevy_tui_texture` |
 |--------|-----------|--------------------|
+| `0.18` | `0.30`    | `0.2`              |
 | `0.17` | `0.29`    | `0.1`              |
 
 ## Platform Support
@@ -195,7 +197,7 @@ The library renders ratatui terminal UIs as GPU textures, which works in WebGL2 
 
 ### What Works
 
-- Bevy 0.17 + WGPU 26.0.1 (WebGL2 backend)
+- Bevy 0.18 + WGPU 27.0.1 (WebGL2 backend)
 - Full ratatui widget rendering (Tabs, Lists, Charts, Gauges, etc.)
 - Keyboard and mouse input handling
 - 3D ray casting for mouse interaction on 3D meshes

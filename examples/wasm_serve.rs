@@ -84,9 +84,7 @@ fn check_wasm_exists() -> bool {
     let js_file = "examples/web/wasm_demo.js";
     let index_file = "examples/web/index.html";
 
-    Path::new(wasm_file).exists() &&
-    Path::new(js_file).exists() &&
-    Path::new(index_file).exists()
+    Path::new(wasm_file).exists() && Path::new(js_file).exists() && Path::new(index_file).exists()
 }
 
 fn should_rebuild() -> bool {
@@ -94,14 +92,11 @@ fn should_rebuild() -> bool {
     let source_file = "examples/wasm_demo.rs";
     let output_file = "examples/web/wasm_demo_bg.wasm";
 
-    if let (Ok(source_meta), Ok(output_meta)) = (
-        fs::metadata(source_file),
-        fs::metadata(output_file)
-    ) {
-        if let (Ok(source_time), Ok(output_time)) = (
-            source_meta.modified(),
-            output_meta.modified()
-        ) {
+    if let (Ok(source_meta), Ok(output_meta)) =
+        (fs::metadata(source_file), fs::metadata(output_file))
+    {
+        if let (Ok(source_time), Ok(output_time)) = (source_meta.modified(), output_meta.modified())
+        {
             return source_time > output_time;
         }
     }
@@ -123,9 +118,12 @@ fn build_wasm() -> bool {
     let status = Command::new("cargo")
         .args([
             "build",
-            "--target", "wasm32-unknown-unknown",
-            "--profile", "wasm-release",
-            "--example", "wasm_demo",
+            "--target",
+            "wasm32-unknown-unknown",
+            "--profile",
+            "wasm-release",
+            "--example",
+            "wasm_demo",
         ])
         .status();
 
@@ -139,8 +137,10 @@ fn build_wasm() -> bool {
     let status = Command::new("wasm-bindgen")
         .args([
             "target/wasm32-unknown-unknown/wasm-release/examples/wasm_demo.wasm",
-            "--out-dir", "examples/web",
-            "--target", "web",
+            "--out-dir",
+            "examples/web",
+            "--target",
+            "web",
             "--no-typescript",
         ])
         .status();
@@ -163,7 +163,8 @@ fn build_wasm() -> bool {
             "--enable-bulk-memory",
             "--enable-nontrapping-float-to-int",
             "examples/web/wasm_demo_bg.wasm",
-            "-o", "examples/web/wasm_demo_bg.wasm",
+            "-o",
+            "examples/web/wasm_demo_bg.wasm",
         ])
         .status();
 
@@ -286,13 +287,13 @@ fn start_server() -> ExitCode {
     };
 
     println!("┌─────────────────────────────────────────────────────────────┐");
-    println!("│ 🚀 bevy_tui_texture - WASM Demo Server                     │");
+    println!("│ 🚀 bevy_tui_texture - WASM Demo Server                      │");
     println!("├─────────────────────────────────────────────────────────────┤");
-    println!("│ 📡 Server: http://127.0.0.1:8080                           │");
-    println!("│ 📁 Files:  examples/web/                                   │");
-    println!("│ 🎮 Demo:   Terminal UI in your browser!                    │");
+    println!("│ 📡 Server: http://127.0.0.1:8080                            │");
+    println!("│ 📁 Files:  examples/web/                                    │");
+    println!("│ 🎮 Demo:   Terminal UI in your browser!                     │");
     println!("│                                                             │");
-    println!("│ Press Ctrl+C to stop                                       │");
+    println!("│ Press Ctrl+C to stop                                        │");
     println!("└─────────────────────────────────────────────────────────────┘");
     println!();
 
@@ -320,10 +321,14 @@ fn start_server() -> ExitCode {
                 if let Ok(header) = Header::from_bytes(b"Content-Type", content_type.as_bytes()) {
                     response = response.with_header(header);
                 }
-                if let Ok(header) = Header::from_bytes(b"Cross-Origin-Opener-Policy", b"same-origin") {
+                if let Ok(header) =
+                    Header::from_bytes(b"Cross-Origin-Opener-Policy", b"same-origin")
+                {
                     response = response.with_header(header);
                 }
-                if let Ok(header) = Header::from_bytes(b"Cross-Origin-Embedder-Policy", b"require-corp") {
+                if let Ok(header) =
+                    Header::from_bytes(b"Cross-Origin-Embedder-Policy", b"require-corp")
+                {
                     response = response.with_header(header);
                 }
 
@@ -349,7 +354,8 @@ fn get_content_type(path: &str) -> String {
         Some("js") => "application/javascript",
         Some("wasm") => "application/wasm",
         _ => "application/octet-stream",
-    }.to_string()
+    }
+    .to_string()
 }
 
 fn open_browser(url: &str) {

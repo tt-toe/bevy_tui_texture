@@ -41,3 +41,4 @@ target
 # WebAssembly build artifacts
 dist/
 *.wasm
+wasm_demo.js

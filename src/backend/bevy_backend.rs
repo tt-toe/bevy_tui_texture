@@ -648,6 +648,7 @@ impl BevyTerminalBackend {
 // ====== Backend trait implementation ======
 
 impl ratatui::backend::Backend for BevyTerminalBackend {
+    type Error = std::io::Error;
     fn draw<'a, I>(&mut self, content: I) -> std::io::Result<()>
     where
         I: Iterator<Item = (u16, u16, &'a Cell)>,
@@ -1033,5 +1034,10 @@ impl ratatui::backend::Backend for BevyTerminalBackend {
         }
 
         Ok(())
+    }
+
+    fn clear_region(&mut self, _clear_type: ratatui::backend::ClearType) -> Result<(), Self::Error> {
+        // For now, just delegate to clear() for all clear types
+        self.clear()
     }
 }

@@ -2,8 +2,8 @@
 runner = 'wasm-server-runner'
 rustflags = ["-C", "strip=symbols"]
 
-[alias]
-wasm = "run -p xtask -- wasm"
+# [alias]
+# wasm = "run -p xtask -- wasm"
 
 # Optimization for wasm builds
 [profile.wasm-release]
