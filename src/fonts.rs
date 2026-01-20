@@ -277,6 +277,7 @@ impl Fonts {
         let is_italic = cell.modifier.contains(ratatui::style::Modifier::ITALIC);
 
 
+
         // Build priority-ordered list of fonts to try
         let mut fonts_to_try = Vec::new();
 

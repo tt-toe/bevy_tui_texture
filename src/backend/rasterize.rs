@@ -1,6 +1,6 @@
 use bitvec::order::Lsb0;
 use bitvec::slice::BitSlice;
-use raqote::{DrawOptions, DrawTarget, SolidSource, StrokeStyle, Transform};
+use raqote::{DrawOptions, DrawTarget, SolidSource, Transform};
 use rustybuzz::ttf_parser::{GlyphId, RasterGlyphImage, RasterImageFormat, RgbaColor};
 
 use crate::utils::text_atlas::{CacheRect, Entry};
@@ -26,6 +26,89 @@ const LUT_4: [u8; 16] = [
     14 * (255 / 15),
     255,
 ];
+
+// ============================================================================
+// Fake Bold Rendering
+// ============================================================================
+//
+// Fake bold is achieved by rendering the glyph path multiple times at slight
+// horizontal offsets. This creates a thickened appearance that simulates
+// bold weight without requiring a dedicated bold font.
+
+/// Default stroke thickness as a fraction of the em-square when the font
+/// does not provide underline metrics. Approximately 3% of the em-square.
+const DEFAULT_STROKE_THICKNESS_RATIO: f32 = 1.0 / 32.0;
+
+/// Minimum bold offset in pixels to ensure visibility even at small sizes.
+const MIN_BOLD_OFFSET_PX: f32 = 0.3;
+
+/// Font weight value for normal (regular) weight fonts.
+const FONT_WEIGHT_NORMAL: f32 = 400.0;
+
+/// Font weight delta between normal and bold (700 - 400 = 300).
+const FONT_WEIGHT_BOLD_DELTA: f32 = 300.0;
+
+/// Maximum weight factor to prevent excessive bolding for extra-bold fonts.
+const MAX_WEIGHT_FACTOR: f32 = 2.0;
+
+/// Horizontal offset ratios for fake bold rendering.
+/// Multiple passes at different offsets create a smooth, filled-in appearance.
+/// Positive values shift right, negative values shift left.
+const BOLD_OFFSET_RATIOS: [f32; 8] = [1.0, 0.5, -0.5, 1.5, 0.25, -0.25, 0.75, -0.75];
+
+/// Calculate the base bold offset based on font metrics.
+///
+/// The offset is derived from:
+/// 1. Font weight - heavier fonts need proportionally less additional bolding
+/// 2. Stroke thickness - from underline metrics or a reasonable default
+/// 3. Current rendering scale - converts from font units to pixels
+///
+/// # Arguments
+/// * `metrics` - Font face containing weight and metric information
+/// * `render_scale` - Current rendering scale (includes 2x supersampling)
+///
+/// # Returns
+/// Base offset in pixels for fake bold rendering
+fn calculate_bold_offset(metrics: &rustybuzz::Face, render_scale: f32) -> f32 {
+    let font_weight = metrics.weight().to_number() as f32;
+    let units_per_em = metrics.units_per_em() as f32;
+
+    // Calculate weight factor: 0.0 for normal weight, scaling up for heavier fonts
+    // Clamped to prevent excessive bolding on extra-bold fonts
+    let weight_factor = ((font_weight - FONT_WEIGHT_NORMAL) / FONT_WEIGHT_BOLD_DELTA)
+        .clamp(0.0, MAX_WEIGHT_FACTOR);
+
+    // Get font-specific stroke thickness from underline metrics if available,
+    // otherwise use a reasonable default based on em-square size
+    let stroke_thickness = metrics
+        .underline_metrics()
+        .map(|m| m.thickness as f32)
+        .unwrap_or(units_per_em * DEFAULT_STROKE_THICKNESS_RATIO);
+
+    // Convert from font units to pixels, accounting for 2x supersampling
+    let scale_to_pixels = render_scale / 2.0;
+    let base_offset = stroke_thickness * scale_to_pixels * weight_factor / units_per_em;
+
+    base_offset.max(MIN_BOLD_OFFSET_PX)
+}
+
+/// Apply fake bold effect by rendering the path at multiple horizontal offsets.
+///
+/// # Arguments
+/// * `target` - Draw target to render into
+/// * `path` - Glyph outline path to render
+/// * `base_offset` - Base offset in pixels (will be multiplied by ratios)
+fn apply_fake_bold(target: &mut DrawTarget<&mut [u32]>, path: &raqote::Path, base_offset: f32) {
+    let white = raqote::Source::Solid(SolidSource::from_unpremultiplied_argb(255, 255, 255, 255));
+    let draw_options = DrawOptions::default();
+
+    for ratio in BOLD_OFFSET_RATIOS {
+        let offset = base_offset * ratio;
+        let bold_transform = Transform::new(1.0, 0.0, 0.0, 1.0, offset, 0.0);
+        let transformed_path = path.clone().transform(&bold_transform);
+        target.fill(&transformed_path, &white, &draw_options);
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn rasterize_glyph(
@@ -56,6 +139,7 @@ pub(super) fn rasterize_glyph(
     } else {
         Transform::default()
     };
+
 
     let mut image = vec![0u32; cached.width as usize * 2 * cached.height as usize * 2];
     let mut target = DrawTarget::from_backing(
@@ -148,25 +232,8 @@ pub(super) fn rasterize_glyph(
         );
 
         if fake_bold {
-            // Use thicker stroke for better bold effect
-            target.stroke(
-                &path,
-                &raqote::Source::Solid(SolidSource::from_unpremultiplied_argb(255, 255, 255, 255)),
-                &StrokeStyle {
-                    width: 4.0,  // Increased stroke width for more visible bold effect
-                    ..Default::default()
-                },
-                &DrawOptions::new(),
-            );
-
-            // Additional technique: render the glyph slightly offset to create thickness
-            let bold_transform = Transform::new(1.0, 0.0, 0.0, 1.0, 0.5, 0.0);
-            let transformed_path = path.clone().transform(&bold_transform);
-            target.fill(
-                &transformed_path,
-                &raqote::Source::Solid(SolidSource::from_unpremultiplied_argb(128, 255, 255, 255)),
-                &DrawOptions::default(),
-            );
+            let bold_offset = calculate_bold_offset(metrics, scale);
+            apply_fake_bold(&mut target, &path, bold_offset);
         }
 
         let mut final_image = DrawTarget::new(cached.width as i32, cached.height as i32);

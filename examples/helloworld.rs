@@ -28,24 +28,21 @@ fn setup(
     render_queue: Res<RenderQueue>,
     mut images: ResMut<Assets<Image>>,
 ) {
-    // Load font (system font on native, embedded on WASM)
     let fonts = {
-        // Load system monospace font
-        let font_handle = SystemSource::new()
+        let font_data = SystemSource::new()
             .select_best_match(&[FamilyName::Monospace], &Properties::new())
-            .expect("No monospace font found on system");
-        let font_data = font_handle
+            .unwrap()
             .load()
             .expect("Failed to load font")
             .copy_font_data()
             .expect("Failed to copy font data");
-        // Leak the font data to get a 'static reference (fine for app-lifetime fonts)
         let font_data: &'static [u8] = Box::leak(font_data.to_vec().into_boxed_slice());
-        let font = TerminalFont::new(font_data).expect("Failed to parse font");
-        Arc::new(Fonts::new(font, 16))
+        Arc::new(Fonts::new(
+            TerminalFont::new(font_data).expect("Failed to parse font"),
+            16,
+        ))
     };
-
-    // Create terminal
+    // Create termial
     let terminal = SimpleTerminal2D::create_and_spawn(
         80,
         25,
@@ -60,10 +57,8 @@ fn setup(
         &mut images,
     )
     .expect("Failed to create terminal");
-
-    // Spawn camera
+    // Spawn Camera
     commands.spawn(Camera2d);
-
     commands.insert_resource(Terminal(terminal));
 }
 
@@ -77,13 +72,11 @@ fn render_terminal(
         .0
         .draw_and_render(&render_device, &render_queue, &mut images, |frame| {
             let area = frame.area();
-
             // Simple "Hello, World!" paragraph
             let text = Paragraph::new("Hello, World!")
                 .style(Style::default().fg(RatatuiColor::Green).bold())
                 .alignment(Alignment::Center)
                 .block(Block::bordered().title("Minimal Example"));
-
             frame.render_widget(text, area);
         });
 }

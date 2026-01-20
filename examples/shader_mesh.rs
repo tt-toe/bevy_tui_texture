@@ -1,4 +1,4 @@
-// ExtendedMaterial CRT Example - Custom Fragment Shader with CRT Effects
+// ExtendedMaterial CRT Example - Custom Fragment Shader, Mesh3d with CRT Effects
 //
 // Demonstrates using ExtendedMaterial to extend StandardMaterial with custom
 // fragment shader uniforms for CRT post-processing effects (scan lines, vignette).
@@ -25,14 +25,14 @@ use ratatui::widgets::*;
 use std::sync::Arc;
 use tracing::info;
 
-use bevy_tui_texture::Font as TerminalFont;
 use bevy_tui_texture::prelude::*;
+use bevy_tui_texture::Font as TerminalFont;
 
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
-                title: "ExtendedMaterial CRT Effect - Terminal Texture".to_string(),
+                title: "ExtendedMaterial CRT Effect with Mesh3d".to_string(),
                 resolution: WindowResolution::new(1024, 768),
                 ..default()
             }),

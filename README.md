@@ -30,17 +30,17 @@ bevy_tui_texture = "0.2"
 ### Hello World Example
 
 ```rust
-use std::sync::Arc;
 use bevy::prelude::*;
 use bevy::render::renderer::{RenderDevice, RenderQueue};
-use ratatui::prelude::*;
-use ratatui::widgets::*;
-use ratatui::style::Color as RatatuiColor;
 use bevy_tui_texture::prelude::*;
 use bevy_tui_texture::Font as TerminalFont;
-use font_kit::source::SystemSource;
 use font_kit::family_name::FamilyName;
 use font_kit::properties::Properties;
+use font_kit::source::SystemSource;
+use ratatui::prelude::*;
+use ratatui::style::Color as RatatuiColor;
+use ratatui::widgets::*;
+use std::sync::Arc;
 
 #[derive(Resource)]
 struct Terminal(SimpleTerminal2D);
@@ -60,22 +60,22 @@ fn setup(
     render_queue: Res<RenderQueue>,
     mut images: ResMut<Assets<Image>>,
 ) {
-    // Load system monospace font
-    let font_handle = SystemSource::new()
-        .select_best_match(&[FamilyName::Monospace], &Properties::new())
-        .expect("No monospace font found on system");
-    let font_data = font_handle.load().expect("Failed to load font").copy_font_data()
-        .expect("Failed to copy font data");
-    // Leak the font data to get a 'static reference (fine for app-lifetime fonts)
-    let font_data: &'static [u8] = Box::leak(font_data.to_vec().into_boxed_slice());
-    let font = TerminalFont::new(font_data).expect("Failed to parse font");
-    let fonts = Arc::new(Fonts::new(font, 16));
-    // Create terminal
+    let fonts = {
+        let font_data = SystemSource::new()
+            .select_best_match(&[FamilyName::Monospace], &Properties::new())
+            .unwrap().load().expect("Failed to load font").copy_font_data()
+            .expect("Failed to copy font data");
+        let font_data: &'static [u8] = Box::leak(font_data.to_vec().into_boxed_slice());
+        Arc::new(Fonts::new(
+            TerminalFont::new(font_data).expect("Failed to parse font"), 16))
+    };
+    // Create termial
     let terminal = SimpleTerminal2D::create_and_spawn(
-        80, 25, fonts, (0.0, 0.0), true, false, false,
-        &mut commands, &render_device, &render_queue, &mut images,
-    ).expect("Failed to create terminal");
-    // Spawn camera
+        80, 25, fonts, (0.0, 0.0), true, false, false, &mut commands, &render_device,
+        &render_queue, &mut images,
+    )
+    .expect("Failed to create terminal");
+    // Spawn Camera
     commands.spawn(Camera2d);
     commands.insert_resource(Terminal(terminal));
 }
@@ -114,7 +114,8 @@ The `examples/` directory contains comprehensive demonstrations:
 ### Advanced Examples
 
 - **`multiple_terminals.rs`** - Managing multiple independent terminals
-- **`shader.rs`** - Custom shader effects with terminal textures
+- **`sphere_terminal.rs`** - Interactive terminal UI mapped onto a CRT-like curved surface with dynamic curvature control
+- **`shader_mesh.rs`** - Custom shader effects and mesh3d with terminal textures
 - **`benchmark.rs`** - Performance benchmarking and optimization
 
 ### WebAssembly
@@ -131,13 +132,15 @@ cargo run --example widget_catalog_3d
 # For WASM demo
 rustup target add wasm32-unknown-unknown
 cargo install wasm-bindgen-cli
+
 # Install wasm-opt (via binaryen)
 # macOS: brew install binaryen
 # Ubuntu: apt install binaryen
 
-# Install wabt for wasm-strip
+# Install wabt for wasm-strip (via wabt)
 # macOS: brew install wabt
 # Ubuntu: apt install wabt
+
 cargo run --example wasm_serve
 
 # Output files are placed in `examples/web/`.
@@ -159,6 +162,8 @@ Available features:
 - **`keyboard_input`** (default) - Enable keyboard event handling
 - **`mouse_input`** (default) - Enable mouse event handling for both 2D UI and 3D mesh terminals
 - **`ratatui_backend`** (default) - Enable ratatui
+- **`bold_italic_fonts`** - Enable fake bold and italic font rendering support
+- **`emoji`** - Enable emoji and extended Unicode character support (WIP)
 
 ## Performance
 

@@ -108,7 +108,9 @@ fn setup_terminal(
         "/assets/fonts/Mplus1Code-Regular.ttf"
     ));
     let font = TerminalFont::new(font_data).expect("Failed to load font");
-    let fonts = Arc::new(Fonts::new(font, 24));
+    let mut fonts = Fonts::new(font.clone(), 16);
+    fonts.add_regular_fonts([font]);  // Add to regular collection for fake bold support
+    let fonts = Arc::new(fonts);
 
     const COLS: u16 = 100;
     const ROWS: u16 = 30;
@@ -708,7 +710,7 @@ fn draw_glyphs_tab(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
         Span::styled("🎨 Emoji", Style::default().fg(RatatuiColor::Red)),
     ])];
     let styled_para = Paragraph::new(styled_lines)
-        .block(Block::bordered().title("Styled Text (enable with --features bold_italic_fonts,emoji_support)"));
+        .block(Block::bordered().title("Styled Text (enable with --features bold_italic_fonts,emoji)"));
     frame.render_widget(styled_para, chunks[0]);
 
     // Box Drawing

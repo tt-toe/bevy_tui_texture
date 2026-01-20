@@ -1,6 +1,6 @@
 [package]
 name = "bevy_tui_texture"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 authors = ["TTT"]
 autoexamples = false
@@ -18,7 +18,7 @@ keyboard_input = []
 mouse_input = []
 ratatui_backend = ["dep:ratatui"]
 bold_italic_fonts = []
-emoji_support = ["dep:unicode-properties"]
+emoji = ["dep:unicode-properties"]
 
 # for Native
 [profile.release]
@@ -61,28 +61,28 @@ bevy = { version = "0.18", default-features = false, features = [
     "webgl2",              # WebGL2 backend for wasm
     "x11"                  # Keep x11 for native Linux
 ]}
-ratatui = { version = "0.30.0", optional = true, default-features = false }
-wgpu = { version = "27.0.1", default-features = false, features = ["wgsl", "webgl"] }
-rustybuzz = "0.20.0"
-raqote = { version = "0.8.5", default-features = false }
+ratatui = { version = "0.30", optional = true, default-features = false }
+wgpu = { version = "27.0", default-features = false, features = ["wgsl", "webgl"] }
+rustybuzz = "0.20"
+raqote = { version = "0.8", default-features = false }
 tiny-skia = "0.11"
-bytemuck = { version = "1.23.2", features = ["derive"] }
-bitvec = { version = "1.0.1", default-features = false, features = ["std"] }
-indexmap = { version = "2.11.0", default-features = false, features = ["std"] }
-evictor = { version = "0.5.1", default-features = false }
-unicode-width = "0.2.0"
+bytemuck = { version = "1.23", features = ["derive"] }
+bitvec = { version = "1.0", default-features = false, features = ["std"] }
+indexmap = { version = "2.11", default-features = false, features = ["std"] }
+evictor = { version = "0.5", default-features = false }
+unicode-width = "0.2"
 web-time = "1.1"
-tracing = "0.1.44"
-unicode-properties = { version = "0.1.3", optional = true }
+tracing = "0.1"
+unicode-properties = { version = "0.1", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-wasm-bindgen = "=0.2.106"
-web-sys = { version = "=0.3.83", features = ["Window", "Document", "HtmlCanvasElement", "console"] }
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = ["Window", "Document", "HtmlCanvasElement", "console"] }
 console_error_panic_hook = "0.1"
 getrandom = { version = "0.2", features = ["js"] }
 
 [dev-dependencies]
-winit = "0.30.12"
+winit = "0.30"
 env_logger = "0.11"
 futures-lite = "2.5"
 anyhow = "1.0"
@@ -92,7 +92,7 @@ tiny_http = "0.12"
 rand = "0.8"
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
-wasm-bindgen-test = "=0.3.56"
+wasm-bindgen-test = "0.3"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 font-kit = "0.14"
@@ -116,12 +116,11 @@ path = "examples/helloworld.rs"
 name = "benchmark"
 path = "examples/benchmark.rs"
 [[example]]
-name = "shader"
-path = "examples/shader.rs"
+name = "shader_mesh"
+path = "examples/shader_mesh.rs"
 [[example]]
 name = "wasm_demo"
 path = "examples/wasm_demo.rs"
 [[example]]
 name = "wasm_serve"
 path = "examples/wasm_serve.rs"
-

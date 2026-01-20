@@ -839,10 +839,11 @@ impl ratatui::backend::Backend for BevyTerminalBackend {
 
             // For now, use font_for_cell on the first cell
             #[cfg(feature = "bold_italic_fonts")]
-            let (font, _fake_bold, _fake_italic) = self.fonts.font_for_cell(&row_cells[0]);
+            let (font, _cell_fake_bold, _cell_fake_italic) =
+                self.fonts.font_for_cell(&row_cells[0]);
 
             #[cfg(not(feature = "bold_italic_fonts"))]
-            let (font, fake_bold, fake_italic) = {
+            let (font, _cell_fake_bold, _cell_fake_italic) = {
                 let (f, _, _) = self.fonts.font_for_cell(&row_cells[0]);
                 (f, false, false) // Disable fake styling when feature is off
             };
@@ -876,7 +877,7 @@ impl ratatui::backend::Backend for BevyTerminalBackend {
                 let (cell_font, cell_fake_bold, cell_fake_italic) = self.fonts.font_for_cell(cell);
 
                 #[cfg(not(feature = "bold_italic_fonts"))]
-                let (cell_font, cell_fake_bold, cell_fake_italic) = (font, fake_bold, fake_italic);
+                let (cell_font, cell_fake_bold, cell_fake_italic) = (font, false, false);
 
                 // Calculate character width using unicode-width for precise glyph width
                 use unicode_width::UnicodeWidthChar;
@@ -885,14 +886,14 @@ impl ratatui::backend::Backend for BevyTerminalBackend {
                 let glyph_width_px = ch_width * self.fonts.min_width_px();
 
                 // Check if this character is an emoji
-                #[cfg(feature = "emoji_support")]
+                #[cfg(feature = "emoji")]
                 fn is_emoji(ch: char) -> bool {
                     use unicode_properties::UnicodeEmoji;
                     // Simplify emoji detection - just check if it's an emoji character
                     ch.is_emoji_char()
                 }
 
-                #[cfg(not(feature = "emoji_support"))]
+                #[cfg(not(feature = "emoji"))]
                 fn is_emoji(_ch: char) -> bool {
                     false
                 }
