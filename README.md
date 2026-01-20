@@ -114,7 +114,6 @@ The `examples/` directory contains comprehensive demonstrations:
 ### Advanced Examples
 
 - **`multiple_terminals.rs`** - Managing multiple independent terminals
-- **`sphere_terminal.rs`** - Interactive terminal UI mapped onto a CRT-like curved surface with dynamic curvature control
 - **`shader_mesh.rs`** - Custom shader effects and mesh3d with terminal textures
 - **`benchmark.rs`** - Performance benchmarking and optimization
 
