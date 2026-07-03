@@ -211,7 +211,7 @@ pub mod prelude {
     };
 
     // Simplified terminal API
-    pub use crate::setup::{SimpleTerminal2D, SimpleTerminal3D, TerminalTexture};
+    pub use crate::setup::{SimpleTerminal2D, SimpleTerminal3D, TerminalTexture, WorldTerminal3D};
 
     // Backend and builders
     pub use crate::{BevyTerminalBackend, Font, Fonts, TerminalBuilder};

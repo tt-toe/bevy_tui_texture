@@ -1,6 +1,6 @@
 [package]
 name = "bevy_tui_texture"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 authors = ["TTT"]
 autoexamples = false
@@ -47,7 +47,7 @@ debug = false
 
 # General
 [dependencies]
-bevy = { version = "0.18", default-features = false, features = [
+bevy = { version = "0.19", default-features = false, features = [
     "zstd_rust",
     "tonemapping_luts",
     "bevy_render",
@@ -61,8 +61,8 @@ bevy = { version = "0.18", default-features = false, features = [
     "webgl2",              # WebGL2 backend for wasm
     "x11"                  # Keep x11 for native Linux
 ]}
-ratatui = { version = "0.30", optional = true, default-features = false }
-wgpu = { version = "27.0", default-features = false, features = ["wgsl", "webgl"] }
+ratatui = { version = "0.30.2", optional = true, default-features = false }
+wgpu = { version = "29.0", default-features = false, features = ["wgsl", "webgl"] }
 rustybuzz = "0.20"
 raqote = { version = "0.8", default-features = false }
 tiny-skia = "0.11"
@@ -82,6 +82,18 @@ console_error_panic_hook = "0.1"
 getrandom = { version = "0.2", features = ["js"] }
 
 [dev-dependencies]
+# Extra bevy features for examples only (the lib's bevy is default-features=false):
+# - bevy_log: without it examples run silently — shader/asset errors invisible
+# - bevy_gltf/bevy_scene + png/jpeg: the retro_crt glTF model
+bevy = { version = "0.19", default-features = false, features = [
+    "bevy_log",
+    "bevy_gltf",
+    "bevy_scene",
+    "bevy_world_serialization", # WorldAssetRoot (0.19 scene spawning)
+    "reflect_auto_register",    # spawning WorldAssets panics on unregistered types without this
+    "png",
+    "jpeg",
+] }
 winit = "0.30"
 env_logger = "0.11"
 futures-lite = "2.5"
@@ -124,3 +136,9 @@ path = "examples/wasm_demo.rs"
 [[example]]
 name = "wasm_serve"
 path = "examples/wasm_serve.rs"
+[[example]]
+name = "world_terminal"
+path = "examples/world_terminal.rs"
+[[example]]
+name = "retro_crt"
+path = "examples/retro_crt.rs"

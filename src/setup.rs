@@ -17,6 +17,13 @@
 //!    - Supports position, rotation, and scale in 3D space
 //!    - Perfect for in-game terminals and spatial UIs
 //!
+//! 4. **`WorldTerminal3D`** - World-unit-sized in-game screen
+//!    - Quad sized in world units (height + automatic texture aspect ratio)
+//!    - Oriented by a facing direction (e.g. toward the game camera)
+//!    - `update()` redraws AND touches its own material — no marker
+//!      component or material query needed in user code
+//!    - Perfect for in-world monitors, signs, and dashboards
+//!
 //! # Examples
 //!
 //! ## Level 1: TerminalTexture (Manual Entity Management)
@@ -267,7 +274,7 @@ impl TerminalTexture {
         programmatic_glyphs: bool,
         render_device: &RenderDevice,
         render_queue: &RenderQueue,
-        images: &mut ResMut<Assets<Image>>,
+        images: &mut Assets<Image>,
     ) -> Result<Self, String> {
         let char_width_px = fonts.min_width_px();
         let char_height_px = fonts.height_px();
@@ -370,7 +377,7 @@ impl TerminalTexture {
         &mut self,
         render_device: &RenderDevice,
         render_queue: &RenderQueue,
-        images: &mut ResMut<Assets<Image>>,
+        images: &mut Assets<Image>,
         draw_fn: F,
     ) where
         F: FnOnce(&mut ratatui::Frame),
@@ -381,8 +388,9 @@ impl TerminalTexture {
 
             if async_copy.is_ready() {
                 // Copy completed buffer data to Bevy Image
-                if let Some(image) = images.get_mut(&self.image_handle) {
-                    async_copy.copy_to_image(image);
+                // (bevy 0.19: get_mut returns an AssetMut guard)
+                if let Some(mut image) = images.get_mut(&self.image_handle) {
+                    async_copy.copy_to_image(&mut image);
                 }
                 async_copy.buffer.unmap();
             } else {
@@ -496,7 +504,7 @@ impl SimpleTerminal2D {
         commands: &mut Commands,
         render_device: &RenderDevice,
         render_queue: &RenderQueue,
-        images: &mut ResMut<Assets<Image>>,
+        images: &mut Assets<Image>,
     ) -> Result<Self, String> {
         // Create texture state
         let texture_state = TerminalTexture::create(
@@ -608,7 +616,7 @@ impl SimpleTerminal2D {
         &mut self,
         render_device: &RenderDevice,
         render_queue: &RenderQueue,
-        images: &mut ResMut<Assets<Image>>,
+        images: &mut Assets<Image>,
         draw_fn: F,
     ) where
         F: FnOnce(&mut ratatui::Frame),
@@ -693,11 +701,11 @@ impl SimpleTerminal3D {
         enable_keyboard: bool,
         enable_mouse: bool,
         commands: &mut Commands,
-        meshes: &mut ResMut<Assets<Mesh>>,
-        materials: &mut ResMut<Assets<StandardMaterial>>,
+        meshes: &mut Assets<Mesh>,
+        materials: &mut Assets<StandardMaterial>,
         render_device: &RenderDevice,
         render_queue: &RenderQueue,
-        images: &mut ResMut<Assets<Image>>,
+        images: &mut Assets<Image>,
     ) -> Result<Self, String> {
         let char_width_px = fonts.min_width_px();
         let char_height_px = fonts.height_px();
@@ -889,8 +897,8 @@ impl SimpleTerminal3D {
         &mut self,
         render_device: &RenderDevice,
         render_queue: &RenderQueue,
-        images: &mut ResMut<Assets<Image>>,
-        materials: &mut ResMut<Assets<StandardMaterial>>,
+        images: &mut Assets<Image>,
+        materials: &mut Assets<StandardMaterial>,
         marker_query: &Query<&MeshMaterial3d<StandardMaterial>, With<T>>,
         draw_fn: F,
     ) where
@@ -902,9 +910,177 @@ impl SimpleTerminal3D {
 
         // Trigger StandardMaterial change detection
         for material_handle in marker_query.iter() {
-            if let Some(material) = materials.get_mut(&material_handle.0) {
+            if let Some(mut material) = materials.get_mut(&material_handle.0) {
                 material.base_color_texture = Some(self.texture_state.image_handle());
             }
         }
+    }
+}
+
+/// World-unit-sized terminal screen inside a 3D scene.
+///
+/// Unlike [`SimpleTerminal3D`] (whose plane is sized in *pixels* and needs a
+/// marker component + material query for updates), `WorldTerminal3D`:
+///
+/// - sizes its quad in **world units**: you give a height, the width follows
+///   the texture's pixel aspect ratio,
+/// - orients the quad toward a **facing direction** (e.g. the game camera),
+/// - stores its own material handle, so [`Self::update`] both redraws the
+///   terminal and triggers the required `StandardMaterial` change detection —
+///   the caller never touches `Assets<StandardMaterial>` bookkeeping.
+///
+/// # Example
+///
+/// ```ignore
+/// # use bevy::prelude::*;
+/// # use bevy_tui_texture::setup::WorldTerminal3D;
+/// # use ratatui::widgets::Paragraph;
+/// fn setup(/* ... */) {
+///     let screen = WorldTerminal3D::create_and_spawn(
+///         24, 10, fonts,
+///         Vec3::new(3.0, 4.0, -2.0),           // position in the scene
+///         Vec3::new(8.0, 6.0, 12.0) - Vec3::new(3.0, 4.0, -2.0), // face the camera
+///         2.0,                                  // quad height in world units
+///         true,                                 // programmatic glyphs
+///         true,                                 // enable mouse/keyboard input
+///         &mut commands, &mut meshes, &mut materials,
+///         &render_device, &render_queue, &mut images,
+///     ).unwrap();
+///     commands.insert_resource(MyScreen(screen));
+/// }
+///
+/// fn render(mut screen: ResMut<MyScreen>, /* ... */) {
+///     screen.0.update(&render_device, &render_queue, &mut images, &mut materials, |frame| {
+///         frame.render_widget(Paragraph::new("in-world!"), frame.area());
+///     });
+/// }
+/// ```
+pub struct WorldTerminal3D {
+    texture_state: TerminalTexture,
+    entity_id: Entity,
+    material_handle: Handle<StandardMaterial>,
+}
+
+impl WorldTerminal3D {
+    /// Create the terminal texture and spawn a world-unit-sized screen quad.
+    ///
+    /// # Arguments
+    ///
+    /// * `cols`, `rows` - Terminal grid size (characters)
+    /// * `fonts` - Font configuration (shared via Arc)
+    /// * `position` - Quad center in world space
+    /// * `facing` - Direction the screen surface faces (does not need to be
+    ///   normalized); e.g. `camera_pos - position` to face a camera
+    /// * `height` - Quad height in world units; width = height × texture aspect
+    /// * `programmatic_glyphs` - Pre-populate box drawing / braille glyphs
+    /// * `enable_input` - Attach [`TerminalInput`](crate::input::TerminalInput)
+    ///   for in-world mouse picking and keyboard focus
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_and_spawn(
+        cols: u16,
+        rows: u16,
+        fonts: Arc<Fonts>,
+        position: Vec3,
+        facing: Vec3,
+        height: f32,
+        programmatic_glyphs: bool,
+        enable_input: bool,
+        commands: &mut Commands,
+        meshes: &mut Assets<Mesh>,
+        materials: &mut Assets<StandardMaterial>,
+        render_device: &RenderDevice,
+        render_queue: &RenderQueue,
+        images: &mut Assets<Image>,
+    ) -> Result<Self, String> {
+        let texture_state = TerminalTexture::create(
+            cols,
+            rows,
+            fonts,
+            programmatic_glyphs,
+            render_device,
+            render_queue,
+            images,
+        )?;
+
+        let aspect = texture_state.width as f32 / texture_state.height as f32;
+        let half_height = height / 2.0;
+        let mesh = meshes.add(Plane3d::new(
+            Vec3::Z,
+            Vec2::new(half_height * aspect, half_height),
+        ));
+        let material_handle = materials.add(StandardMaterial {
+            base_color: Color::WHITE,
+            base_color_texture: Some(texture_state.image_handle()),
+            // Terminal content should not depend on scene lighting.
+            unlit: true,
+            alpha_mode: AlphaMode::Opaque,
+            double_sided: true,
+            cull_mode: None,
+            ..default()
+        });
+
+        let facing = facing.try_normalize().unwrap_or(Vec3::Z);
+        let dimensions = texture_state.dimensions();
+
+        let mut entity_builder = commands.spawn((
+            Mesh3d(mesh),
+            MeshMaterial3d(material_handle.clone()),
+            Transform::from_translation(position)
+                .with_rotation(Quat::from_rotation_arc(Vec3::Z, facing)),
+            TerminalComponent,
+            dimensions,
+        ));
+        if enable_input {
+            entity_builder.insert(crate::input::TerminalInput::default());
+        }
+        let entity_id = entity_builder.id();
+
+        Ok(Self {
+            texture_state,
+            entity_id,
+            material_handle,
+        })
+    }
+
+    /// Redraw the terminal and propagate the texture to the GPU.
+    ///
+    /// Handles the full per-frame pipeline: ratatui draw → GPU render →
+    /// async copy to the Bevy `Image` → `StandardMaterial` change detection
+    /// (materials do not observe `Image` mutations on their own).
+    pub fn update<F>(
+        &mut self,
+        render_device: &RenderDevice,
+        render_queue: &RenderQueue,
+        images: &mut Assets<Image>,
+        materials: &mut Assets<StandardMaterial>,
+        draw_fn: F,
+    ) where
+        F: FnOnce(&mut ratatui::Frame),
+    {
+        self.texture_state
+            .update(render_device, render_queue, images, draw_fn);
+        if let Some(mut material) = materials.get_mut(&self.material_handle) {
+            material.base_color_texture = Some(self.texture_state.image_handle());
+        }
+    }
+
+    /// Entity of the spawned screen quad (attach further components here).
+    pub fn entity(&self) -> Entity {
+        self.entity_id
+    }
+
+    /// Terminal dimensions (grid size and cell metrics).
+    pub fn dimensions(&self) -> TerminalDimensions {
+        self.texture_state.dimensions()
+    }
+
+    /// Handle of the Bevy `Image` the terminal renders into.
+    pub fn image_handle(&self) -> Handle<Image> {
+        self.texture_state.image_handle()
+    }
+
+    /// Handle of the screen's `StandardMaterial`.
+    pub fn material_handle(&self) -> Handle<StandardMaterial> {
+        self.material_handle.clone()
     }
 }

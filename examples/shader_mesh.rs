@@ -171,7 +171,7 @@ fn setup(
     commands.spawn((
         DirectionalLight {
             illuminance: 5000.0,
-            shadows_enabled: false,
+            shadow_maps_enabled: false,
             ..default()
         },
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.5, -0.5, 0.0)),
@@ -256,7 +256,7 @@ fn update_crt_uniforms(
     app_state: Res<AppState>,
     time: Res<Time>,
 ) {
-    if let Some(material) = materials.get_mut(&terminal_state.material_handle) {
+    if let Some(mut material) = materials.get_mut(&terminal_state.material_handle) {
         material.extension.uniforms.effect_intensity =
             if app_state.effects_enabled { 1.0 } else { 0.0 };
         material.extension.uniforms.time = time.elapsed_secs();

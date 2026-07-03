@@ -347,8 +347,12 @@ struct HitTestResult {
 enum SortKey {
     /// Z-index for 2D UI terminals (higher = on top)
     ZIndex(i32),
-    /// Distance for 3D mesh terminals (lower = closer)
-    Distance(f32),
+    /// 3D mesh terminal hit: camera priority (0 = topmost-rendered camera,
+    /// i.e. highest `Camera::order`), then ray distance (lower = closer).
+    Distance {
+        camera_priority: usize,
+        distance: f32,
+    },
 }
 
 #[cfg(feature = "mouse_input")]
@@ -356,7 +360,23 @@ impl PartialOrd for SortKey {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         match (self, other) {
             (SortKey::ZIndex(a), SortKey::ZIndex(b)) => b.partial_cmp(a), // Higher Z on top
-            (SortKey::Distance(a), SortKey::Distance(b)) => a.partial_cmp(b), // Closer first
+            (
+                SortKey::Distance {
+                    camera_priority: ca,
+                    distance: da,
+                },
+                SortKey::Distance {
+                    camera_priority: cb,
+                    distance: db,
+                },
+            ) => {
+                // Terminals seen by a higher-order (overlay) camera win;
+                // within the same camera, closer hits win.
+                match ca.cmp(cb) {
+                    std::cmp::Ordering::Equal => da.partial_cmp(db),
+                    ord => Some(ord),
+                }
+            }
             _ => None, // Can't compare ZIndex with Distance
         }
     }
@@ -713,7 +733,7 @@ pub fn mouse_input_system(
     config: Res<TerminalInputConfig>,
     mut focus: ResMut<TerminalFocus>,
     _windows: Query<&bevy::window::Window>,
-    camera_query: Query<(&Camera, &GlobalTransform, &Projection)>,
+    camera_query: Query<(&Camera, &GlobalTransform)>,
     meshes: Res<Assets<bevy::mesh::Mesh>>,
     terminals: Query<(
         Entity,
@@ -733,29 +753,32 @@ pub fn mouse_input_system(
         None => return,
     };
 
-    let world_ray: Option<crate::input::ray::Ray> = match camera_query.single() {
-        Ok((camera, camera_transform, projection)) => {
-            if let Some(viewport) = camera.logical_viewport_rect() {
-                let cursor_ndc = Vec2::new(
-                    (cursor_pos.x - viewport.min.x) / viewport.width() * 2.0 - 1.0,
-                    -((cursor_pos.y - viewport.min.y) / viewport.height() * 2.0 - 1.0),
-                );
-                let viewport_size = Vec2::new(viewport.width(), viewport.height());
-                Some(crate::input::ray::Ray::from_camera(
-                    cursor_ndc,
-                    camera_transform,
-                    projection,
-                    viewport_size,
-                ))
-            } else {
-                None
+    // Build one ray per active camera whose viewport contains the cursor,
+    // topmost-rendered camera first (highest `Camera::order`). Multi-camera
+    // setups (world + UI overlay) are common; a terminal is picked through
+    // the frontmost camera that sees it.
+    //
+    // `Camera::viewport_to_world` uses the camera's real projection matrix,
+    // so every projection kind (perspective, orthographic with any
+    // `ScalingMode`, custom) is handled correctly.
+    let mut cameras: Vec<(&Camera, &GlobalTransform)> = camera_query
+        .iter()
+        .filter(|(camera, _)| camera.is_active)
+        .collect();
+    cameras.sort_by_key(|(camera, _)| std::cmp::Reverse(camera.order));
+    let world_rays: Vec<crate::input::ray::Ray> = cameras
+        .iter()
+        .filter_map(|(camera, camera_transform)| {
+            let viewport = camera.logical_viewport_rect()?;
+            if !viewport.contains(cursor_pos) {
+                return None;
             }
-        }
-        Err(_) => {
-            // No camera available - continue with 2D-only processing
-            None
-        }
-    };
+            let ray3d = camera
+                .viewport_to_world(camera_transform, cursor_pos - viewport.min)
+                .ok()?;
+            Some(crate::input::ray::Ray::new(ray3d.origin, *ray3d.direction))
+        })
+        .collect();
 
     let mut hit_candidates: Vec<(Entity, HitTestResult, SortKey)> = Vec::new();
 
@@ -770,15 +793,24 @@ pub fn mouse_input_system(
 
         match terminal_type {
             TerminalType::Mesh3D => {
-                // Check Mesh3d first, then fallback to Mesh2d for backward compatibility
-                if let Some(ray) = world_ray.as_ref() {
-                    // Get the inner Handle<Mesh> from either Mesh3d or Mesh2d
-                    let mesh_handle = mesh3d.map(|m| &m.0).or_else(|| mesh2d.map(|m| &m.0));
+                // Get the inner Handle<Mesh> from either Mesh3d or Mesh2d
+                let mesh_handle = mesh3d.map(|m| &m.0).or_else(|| mesh2d.map(|m| &m.0));
 
-                    if let Some((hit_result, distance)) = mesh_handle
-                        .and_then(|handle| ray_cast_hit_test_inner(ray, transform, handle, &meshes, dimensions))
-                    {
-                        hit_candidates.push((entity, hit_result, SortKey::Distance(distance)));
+                // Test cameras front-to-back; the first camera whose ray hits
+                // this terminal determines its hit (and camera priority).
+                for (camera_priority, ray) in world_rays.iter().enumerate() {
+                    if let Some((hit_result, distance)) = mesh_handle.and_then(|handle| {
+                        ray_cast_hit_test_inner(ray, transform, handle, &meshes, dimensions)
+                    }) {
+                        hit_candidates.push((
+                            entity,
+                            hit_result,
+                            SortKey::Distance {
+                                camera_priority,
+                                distance,
+                            },
+                        ));
+                        break;
                     }
                 }
             }

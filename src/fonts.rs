@@ -48,26 +48,62 @@ use rustybuzz::Face;
 
 /// A TrueType font that can be used for text rendering.
 ///
-/// Fonts are loaded from static byte slices (typically embedded via `include_bytes!`)
-/// and are identified by a unique hash for caching purposes.
+/// Fonts are loaded either from static byte slices (typically embedded via
+/// `include_bytes!`, see [`Font::new`]) or from owned bytes read at runtime
+/// (see [`Font::from_vec`]) and are identified by a unique hash for caching
+/// purposes.
 ///
 /// # Example
 ///
 /// ```no_run
 /// use bevy_tui_texture::Font;
 ///
+/// // Embedded font data
 /// let font_data = include_bytes!("../assets/fonts/Mplus1Code-Regular.ttf");
 /// let font = Font::new(font_data).expect("Failed to load font");
+///
+/// // Runtime-loaded font data (no leaking required)
+/// let bytes = std::fs::read("assets/fonts/Mplus1Code-Regular.ttf").unwrap();
+/// let font = Font::from_vec(bytes).expect("Failed to load font");
 /// ```
 #[derive(Clone)]
 pub struct Font {
+    // NOTE: declared before `_data` so the Face drops first.
     font: Face<'static>,
     advance: f32,
     id: u64,
+    /// Keeps runtime-loaded font bytes alive for the lifetime of the `Face`
+    /// (`None` for `&'static` data). `Clone` clones the `Arc`, so every copy
+    /// of the `Face` keeps the backing allocation alive.
+    _data: Option<std::sync::Arc<[u8]>>,
 }
 
 impl Font {
+    /// Load a font from a static byte slice (e.g. `include_bytes!`).
     pub fn new(data: &'static [u8]) -> Option<Self> {
+        Self::build(data, None)
+    }
+
+    /// Load a font from owned bytes (e.g. `std::fs::read` at runtime).
+    ///
+    /// Unlike [`Font::new`], this does not require `'static` data — the bytes
+    /// are kept alive internally for as long as the font (or any clone of it)
+    /// exists. No leaking required.
+    pub fn from_vec(data: Vec<u8>) -> Option<Self> {
+        let data: std::sync::Arc<[u8]> = data.into();
+        // SAFETY: `slice` points into the Arc's heap allocation, which
+        // - is never moved (Arc contents are heap-stable),
+        // - is never mutated (`Arc<[u8]>` is immutable),
+        // - outlives the `Face`: the Arc is stored in `_data` next to the
+        //   `Face`, `Clone` clones the Arc alongside the Face, and the field
+        //   order makes the Face drop first.
+        // The `Face` is never handed out with the `'static` lifetime beyond
+        // `&self` borrows (`Font::font()` is crate-private).
+        let slice: &'static [u8] = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(&data) };
+        Self::build(slice, Some(data))
+    }
+
+    fn build(data: &'static [u8], keep_alive: Option<std::sync::Arc<[u8]>>) -> Option<Self> {
         let mut hasher = RandomState::new().build_hasher();
         hasher.write(data);
 
@@ -79,6 +115,7 @@ impl Font {
                 font,
                 advance,
                 id: hasher.finish(),
+                _data: keep_alive,
             }
         })
     }

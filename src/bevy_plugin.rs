@@ -205,10 +205,11 @@ pub fn update_terminal_texture(
     height: u32,
     render_device: &RenderDevice,
     render_queue: &RenderQueue,
-    images: &mut ResMut<Assets<Image>>,
+    images: &mut Assets<Image>,
 ) {
     // Copy GPU texture to Bevy Image - do everything INSIDE get_mut scope for change detection
-    if let Some(image) = images.get_mut(image_handle) {
+    // (bevy 0.19: get_mut returns an AssetMut guard, hence `mut`)
+    if let Some(mut image) = images.get_mut(image_handle) {
         let unpadded_bytes_per_row = width * 4;
         let bytes_per_row = {
             let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
@@ -302,8 +303,8 @@ pub fn update_terminal_and_material<T: Component>(
     height: u32,
     render_device: &RenderDevice,
     render_queue: &RenderQueue,
-    images: &mut ResMut<Assets<Image>>,
-    materials: &mut ResMut<Assets<ColorMaterial>>,
+    images: &mut Assets<Image>,
+    materials: &mut Assets<ColorMaterial>,
     query: &Query<(&MeshMaterial2d<ColorMaterial>, &T)>,
 ) {
     // 1. Render to GPU texture
@@ -333,12 +334,12 @@ pub fn update_terminal_and_material<T: Component>(
 ///
 /// Generic over marker component type `T` for flexible querying.
 pub fn update_material_texture<T: Component>(
-    materials: &mut ResMut<Assets<ColorMaterial>>,
+    materials: &mut Assets<ColorMaterial>,
     query: &Query<(&MeshMaterial2d<ColorMaterial>, &T)>,
     image_handle: &Handle<Image>,
 ) {
     for (material_handle, _) in query.iter() {
-        if let Some(material) = materials.get_mut(&material_handle.0) {
+        if let Some(mut material) = materials.get_mut(&material_handle.0) {
             material.texture = Some(image_handle.clone());
         }
     }

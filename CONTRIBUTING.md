@@ -33,7 +33,7 @@ Thank you for your interest in contributing to bevy_tui_texture! This document p
 
 ```bash
 # Clone the repository
-git clone https://github.com/YOUR_USERNAME/bevy_tui_texture.git
+git clone https://github.com/tt-toe/bevy_tui_texture.git
 cd bevy_tui_texture
 
 # Build the project

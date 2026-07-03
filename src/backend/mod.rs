@@ -90,8 +90,8 @@ pub(crate) fn build_text_bg_compositor(
 
     let bg_pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
         label: Some("BG Pipeline Layout"),
-        bind_group_layouts: &[&bg_bind_group_layout],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[Some(&bg_bind_group_layout)],
+        immediate_size: 0,
     });
 
     let bg_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
@@ -123,7 +123,7 @@ pub(crate) fn build_text_bg_compositor(
         },
         depth_stencil: None,
         multisample: MultisampleState::default(),
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     });
 
@@ -237,8 +237,8 @@ pub(crate) fn build_text_fg_compositor(
 
     let fg_pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
         label: Some("FG Pipeline Layout"),
-        bind_group_layouts: &[&fg_bind_group_layout_0, &fg_bind_group_layout_1],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[Some(&fg_bind_group_layout_0), Some(&fg_bind_group_layout_1)],
+        immediate_size: 0,
     });
 
     let fg_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
@@ -276,7 +276,7 @@ pub(crate) fn build_text_fg_compositor(
         },
         depth_stencil: None,
         multisample: MultisampleState::default(),
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     });
 
@@ -442,10 +442,12 @@ impl<'s> RenderSurface<'s> for Surface<'s> {
     }
 
     fn get_current_texture(&self, _token: private::Token) -> Option<Self::Target> {
+        // wgpu 29: get_current_texture returns an enum instead of a Result.
         let output = match self.get_current_texture() {
-            Ok(output) => output,
-            Err(err) => {
-                error!("{err}");
+            wgpu::CurrentSurfaceTexture::Success(output)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(output) => output,
+            status => {
+                error!("surface texture unavailable: {status:?}");
                 return None;
             }
         };

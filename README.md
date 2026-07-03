@@ -22,9 +22,9 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-bevy = "0.18"
+bevy = "0.19"
 font-kit = "0.14"
-bevy_tui_texture = "0.2"
+bevy_tui_texture = "0.3"
 ```
 
 ### Hello World Example
@@ -151,7 +151,7 @@ Configure features in your `Cargo.toml`:
 
 ```toml
 [dependencies.bevy_tui_texture]
-version = "0.2"
+version = "0.3"
 default-features = false
 features = ["keyboard_input", "mouse_input", "ratatui_backend"]
 ```
@@ -178,12 +178,13 @@ See `examples/benchmark.rs` for performance metrics.
 ## Requirements
 
 - Rust 1.92 or later (2024 edition)
-- Bevy 0.18
+- Bevy 0.19
 - Ratatui 0.30
 - A GPU with WGPU support
 
 | `bevy` | `ratatui` | `bevy_tui_texture` |
 |--------|-----------|--------------------|
+| `0.19` | `0.30`    | `0.3`              |
 | `0.18` | `0.30`    | `0.2`              |
 | `0.17` | `0.29`    | `0.1`              |
 
@@ -199,7 +200,7 @@ The library renders ratatui terminal UIs as GPU textures, which works in WebGL2 
 
 ### What Works
 
-- Bevy 0.18 + WGPU 27.0.1 (WebGL2 backend)
+- Bevy 0.19 + WGPU 29.0 (WebGL2 backend)
 - Full ratatui widget rendering (Tabs, Lists, Charts, Gauges, etc.)
 - Keyboard and mouse input handling
 - 3D ray casting for mouse interaction on 3D meshes
