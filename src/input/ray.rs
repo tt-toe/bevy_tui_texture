@@ -159,7 +159,7 @@ pub struct RayHit {
 /// - distance: t value along ray
 /// - barycentric: (u, v, w) coordinates where w = 1 - u - v
 ///
-/// Reference: https://en.wikipedia.org/wiki/Möller–Trumbore_intersection_algorithm
+/// Reference: <https://en.wikipedia.org/wiki/Möller–Trumbore_intersection_algorithm>
 pub fn ray_triangle_intersection(ray: &Ray, v0: Vec3, v1: Vec3, v2: Vec3) -> Option<(f32, Vec3)> {
     const EPSILON: f32 = 0.000001;
 

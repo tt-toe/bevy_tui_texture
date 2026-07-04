@@ -3,12 +3,13 @@
 //! Bevy input systems → `TerminalEvent` messages → User systems → Terminal updates
 
 use bevy::prelude::*;
+#[cfg(feature = "mouse_input")]
 use tracing::debug;
 //use bevy::log::debug;
 //use log::debug;
 
 // Ray casting for 3D mouse input
-#[cfg(feature = "mouse_input")]
+#[cfg(all(feature = "mouse_input", feature = "3d"))]
 pub mod ray;
 
 // ============================================================================
@@ -341,8 +342,10 @@ pub fn keyboard_input_system(
 // Mouse Input - Unified System Helpers
 // ============================================================================
 
-/// Terminal type detected from components.
-#[cfg(feature = "mouse_input")]
+/// Terminal type detected from components. Only meaningful when both mesh
+/// (3d) and UI (2d) terminals can coexist - the single-feature builds below
+/// know their terminal kind up front and skip detection entirely.
+#[cfg(all(feature = "mouse_input", feature = "2d", feature = "3d"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TerminalType {
     /// 3D mesh terminal (has Mesh2d or Mesh3d component)
@@ -407,7 +410,7 @@ impl PartialOrd for SortKey {
 /// Detect terminal type from components.
 ///
 /// Priority: 3D mesh > 2D UI (for hybrid entities)
-#[cfg(feature = "mouse_input")]
+#[cfg(all(feature = "mouse_input", feature = "2d", feature = "3d"))]
 fn detect_terminal_type(
     mesh2d: Option<&Mesh2d>,
     mesh3d: Option<&Mesh3d>,
@@ -427,7 +430,7 @@ fn detect_terminal_type(
 /// Perform 2D UI bounding box hit test.
 ///
 /// Converts cursor position to terminal grid coordinates using UI layout bounds.
-#[cfg(feature = "mouse_input")]
+#[cfg(all(feature = "mouse_input", feature = "2d"))]
 fn bounding_box_hit_test(
     cursor_pos: bevy::math::Vec2,
     ui_transform: Option<&bevy::ui::UiGlobalTransform>,
@@ -550,7 +553,7 @@ fn bounding_box_hit_test(
 ///
 /// Converts cursor position to terminal grid coordinates using ray casting and UV mapping.
 /// Works with both Mesh2d and Mesh3d by accepting the inner Handle<Mesh>.
-#[cfg(feature = "mouse_input")]
+#[cfg(all(feature = "mouse_input", feature = "3d"))]
 fn ray_cast_hit_test_inner(
     world_ray: &crate::input::ray::Ray,
     mesh_transform: &bevy::transform::components::GlobalTransform,
@@ -738,7 +741,7 @@ fn emit_button_events(
 /// 4. Collects hits with sort keys (Z-index for 2D, distance for 3D)
 /// 5. Selects the topmost/closest terminal
 /// 6. Emits mouse events and handles focus
-#[cfg(feature = "mouse_input")]
+#[cfg(all(feature = "mouse_input", feature = "2d", feature = "3d"))]
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn mouse_input_system(
     buttons: Res<ButtonInput<MouseButton>>,
@@ -879,6 +882,177 @@ pub fn mouse_input_system(
             hit_candidates[0].0, hit_candidates[0].2
         );
     }
+
+    if let Some((entity, hit_result, _sort_key)) = hit_candidates.first() {
+        emit_mouse_move(
+            *entity,
+            hit_result.col,
+            hit_result.row,
+            &surfaces,
+            &mut events,
+        );
+        emit_button_events(
+            *entity,
+            hit_result.col,
+            hit_result.row,
+            &buttons,
+            &mut focus,
+            &config,
+            &surfaces,
+            &mut events,
+        );
+    }
+}
+
+/// Mouse input for 2D UI terminals only (`3d` feature disabled - no mesh
+/// terminals can exist, so there is nothing to auto-detect).
+#[cfg(all(feature = "mouse_input", feature = "2d", not(feature = "3d")))]
+#[allow(clippy::type_complexity)]
+pub fn mouse_input_system(
+    buttons: Res<ButtonInput<MouseButton>>,
+    cursor: Res<CursorPosition>,
+    config: Res<TerminalInputConfig>,
+    mut focus: ResMut<TerminalFocus>,
+    terminals: Query<(
+        Entity,
+        &TerminalInput,
+        Option<&bevy::ui::Node>,
+        Option<&bevy::ui::ComputedNode>,
+        Option<&bevy::ui::UiGlobalTransform>,
+        Option<&crate::bevy_plugin::TerminalDimensions>,
+        Option<&bevy::ui::ZIndex>,
+    )>,
+    surfaces: Query<&crate::setup::TuiSurface>,
+    mut events: MessageWriter<TerminalEvent>,
+) {
+    let cursor_pos = match cursor.position {
+        Some(pos) => pos,
+        None => return,
+    };
+
+    let mut hit_candidates: Vec<(Entity, HitTestResult, SortKey)> = Vec::new();
+
+    for (entity, input, node, computed, ui_transform, dimensions, z_index) in terminals.iter() {
+        if !input.mouse {
+            continue;
+        }
+
+        if let Some(hit_result) =
+            bounding_box_hit_test(cursor_pos, ui_transform, node, computed, dimensions)
+        {
+            let z = z_index.map(|z| z.0).unwrap_or(0);
+            hit_candidates.push((entity, hit_result, SortKey::ZIndex(z)));
+        }
+    }
+
+    if hit_candidates.is_empty() {
+        return;
+    }
+
+    hit_candidates.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+
+    if let Some((entity, hit_result, _sort_key)) = hit_candidates.first() {
+        emit_mouse_move(
+            *entity,
+            hit_result.col,
+            hit_result.row,
+            &surfaces,
+            &mut events,
+        );
+        emit_button_events(
+            *entity,
+            hit_result.col,
+            hit_result.row,
+            &buttons,
+            &mut focus,
+            &config,
+            &surfaces,
+            &mut events,
+        );
+    }
+}
+
+/// Mouse input for 3D mesh terminals only (`2d` feature disabled - no UI
+/// terminals can exist, so there is nothing to auto-detect).
+#[cfg(all(feature = "mouse_input", feature = "3d", not(feature = "2d")))]
+#[allow(clippy::type_complexity)]
+pub fn mouse_input_system(
+    buttons: Res<ButtonInput<MouseButton>>,
+    cursor: Res<CursorPosition>,
+    config: Res<TerminalInputConfig>,
+    mut focus: ResMut<TerminalFocus>,
+    camera_query: Query<(&Camera, &GlobalTransform)>,
+    meshes: Res<Assets<bevy::mesh::Mesh>>,
+    terminals: Query<(
+        Entity,
+        &TerminalInput,
+        Option<&GlobalTransform>,
+        Option<&Mesh2d>,
+        Option<&Mesh3d>,
+        Option<&crate::bevy_plugin::TerminalDimensions>,
+    )>,
+    surfaces: Query<&crate::setup::TuiSurface>,
+    mut events: MessageWriter<TerminalEvent>,
+) {
+    let cursor_pos = match cursor.position {
+        Some(pos) => pos,
+        None => return,
+    };
+
+    // See the unified system's doc comment for the multi-camera rationale -
+    // identical here, just without any 2D UI terminals to also consider.
+    let mut cameras: Vec<(&Camera, &GlobalTransform)> = camera_query
+        .iter()
+        .filter(|(camera, _)| camera.is_active)
+        .collect();
+    cameras.sort_by_key(|(camera, _)| std::cmp::Reverse(camera.order));
+    let world_rays: Vec<crate::input::ray::Ray> = cameras
+        .iter()
+        .filter_map(|(camera, camera_transform)| {
+            let viewport = camera.logical_viewport_rect()?;
+            if !viewport.contains(cursor_pos) {
+                return None;
+            }
+            let ray3d = camera
+                .viewport_to_world(camera_transform, cursor_pos - viewport.min)
+                .ok()?;
+            Some(crate::input::ray::Ray::new(ray3d.origin, *ray3d.direction))
+        })
+        .collect();
+
+    let mut hit_candidates: Vec<(Entity, HitTestResult, SortKey)> = Vec::new();
+
+    for (entity, input, transform, mesh2d, mesh3d, dimensions) in terminals.iter() {
+        if !input.mouse {
+            continue;
+        }
+        let mesh_handle = mesh3d.map(|m| &m.0).or_else(|| mesh2d.map(|m| &m.0));
+        let Some(transform) = transform else {
+            continue; // no GlobalTransform - can't ray-cast
+        };
+
+        for (camera_priority, ray) in world_rays.iter().enumerate() {
+            if let Some((hit_result, distance)) = mesh_handle.and_then(|handle| {
+                ray_cast_hit_test_inner(ray, transform, handle, &meshes, dimensions)
+            }) {
+                hit_candidates.push((
+                    entity,
+                    hit_result,
+                    SortKey::Distance {
+                        camera_priority,
+                        distance,
+                    },
+                ));
+                break;
+            }
+        }
+    }
+
+    if hit_candidates.is_empty() {
+        return;
+    }
+
+    hit_candidates.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
 
     if let Some((entity, hit_result, _sort_key)) = hit_candidates.first() {
         emit_mouse_move(

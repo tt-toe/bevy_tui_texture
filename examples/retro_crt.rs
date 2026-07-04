@@ -339,7 +339,7 @@ fn setup(
     let fonts = Arc::new(Fonts::new(font, 16));
 
     // Create main terminal texture
-    let mut texture = TerminalTexture::create(
+    let texture = TerminalTexture::create(
         32,
         24,
         fonts.clone(),
@@ -349,6 +349,7 @@ fn setup(
         &mut images,
     )
     .expect("Failed to create main terminal");
+    let mut main_tui = Tui::from_texture_state(texture);
 
     // Camera with Order Independent Transparency (MSAA disabled for OIT compatibility)
     commands.spawn((
@@ -428,9 +429,9 @@ fn setup(
     let gltf_handle: Handle<Gltf> = asset_server.load("models/retro_crt.glb");
     commands.spawn((GltfAsset(gltf_handle), GltfModel));
 
-    // Initial synchronous render for main terminal (prevents first-frame
-    // black texture) via `TerminalTexture::draw_sync`.
-    texture.draw_sync(&render_device, &render_queue, &mut images, |frame| {
+    // Initial draw for the main terminal - the zero-latency flush shows
+    // this on the first presented frame, no synchronous GPU call needed.
+    main_tui.draw(|frame| {
         let area = frame.area();
 
         // Clear with colorful background
@@ -483,7 +484,7 @@ fn setup(
     // Object_2's mesh attaches to it via `AttachTerminal` once the glTF
     // loads (claim_object2_screen below), found by querying the
     // `MainScreen` marker rather than a resource.
-    commands.spawn((Tui::from_texture_state(texture), MainScreen));
+    commands.spawn((main_tui, MainScreen));
     commands.insert_resource(AppState::default());
 }
 

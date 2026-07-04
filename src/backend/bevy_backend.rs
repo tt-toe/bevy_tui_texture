@@ -61,6 +61,11 @@ pub struct BevyTerminalBackend {
     pub(super) cells: Vec<Cell>,
     pub(super) dirty_rows: Vec<bool>,
     pub(super) dirty_cells: BitVec,
+    /// Set by `draw()` when ratatui's internal buffer diff contained at
+    /// least one changed cell; cleared at the start of every `draw()` call.
+    /// Lets `Tui::draw` skip marking itself dirty (and thus skip the GPU
+    /// render + copy) when a redraw produces byte-identical content.
+    pub(super) cells_changed_last_draw: bool,
     pub(super) cursor: (u16, u16),
     pub(super) viewport: Viewport,
 
@@ -177,11 +182,7 @@ impl TerminalBuilder {
     ///
     /// This is synchronous (unlike the original async Builder).
     /// Device and Queue are borrowed, not owned.
-    pub fn build(
-        self,
-        device: &Device,
-        _queue: &Queue,
-    ) -> Result<BevyTerminalBackend, crate::TerminalError> {
+    pub fn build(self, device: &Device, _queue: &Queue) -> BevyTerminalBackend {
         use crate::backend::{
             build_text_bg_compositor, build_text_fg_compositor, build_wgpu_state, CACHE_HEIGHT,
             CACHE_WIDTH,
@@ -292,12 +293,13 @@ impl TerminalBuilder {
         // Initialize blink timers
         let now = Instant::now();
 
-        Ok(BevyTerminalBackend {
+        BevyTerminalBackend {
             cols: self.cols,
             rows: self.rows,
             cells: vec![],
             dirty_rows: vec![],
             dirty_cells: BitVec::new(),
+            cells_changed_last_draw: false,
             cursor: (0, 0),
             viewport: self.viewport,
             rendered: vec![],
@@ -328,7 +330,7 @@ impl TerminalBuilder {
             slow_duration: self.slow_blink,
             last_slow_toggle: now,
             show_slow: true,
-        })
+        }
     }
 }
 
@@ -350,21 +352,23 @@ fn pixmap_to_rgba8(pixmap: tiny_skia::Pixmap) -> Vec<u32> {
 }
 
 impl BevyTerminalBackend {
+    /// Whether the most recent `draw()` call's ratatui buffer diff touched
+    /// at least one cell. `false` means the redraw was byte-identical to
+    /// the previous frame - callers use this to skip GPU work entirely for
+    /// unchanged content.
+    pub(crate) fn cells_changed_last_draw(&self) -> bool {
+        self.cells_changed_last_draw
+    }
+
     /// Pre-populate programmatic glyphs into the texture atlas.
     ///
     /// This method renders all special glyphs (box-drawing, block elements, braille, powerline)
     /// using tiny-skia and queues them for GPU upload. Should be called once during initialization.
+    /// Glyphs not yet implemented are silently skipped (not an error).
     ///
     /// # Arguments
     /// * `queue` - WGPU queue for uploading textures to GPU
-    ///
-    /// # Returns
-    /// * `Ok(())` on success
-    /// * `Err(TerminalError::GlyphPopulation)` if any glyph fails to render
-    pub fn populate_programmatic_glyphs(
-        &mut self,
-        queue: &Queue,
-    ) -> Result<(), crate::TerminalError> {
+    pub fn populate_programmatic_glyphs(&mut self, queue: &Queue) {
         use crate::backend::programmatic_glyphs::{
             all_programmatic_glyphs, render_programmatic_glyph,
         };
@@ -375,7 +379,7 @@ impl BevyTerminalBackend {
         let height = self.fonts.height_px();
         let font_id = self.fonts.last_resort_id();
 
-        tracing::info!(
+        tracing::debug!(
             "Pre-populating {} programmatic glyphs ({}x{} px)...",
             all_programmatic_glyphs().count(),
             width,
@@ -417,12 +421,11 @@ impl BevyTerminalBackend {
         // Flush all uploads to GPU immediately
         self.flush_cache_updates(queue);
 
-        tracing::info!(
+        tracing::debug!(
             "Successfully pre-populated {} programmatic glyphs ({} skipped - not yet implemented)",
             populated_count,
             skipped_count
         );
-        Ok(())
     }
 
     /// Flush pending cache updates to GPU
@@ -674,8 +677,10 @@ impl ratatui::backend::Backend for BevyTerminalBackend {
         self.slow_blinking
             .resize(bounds.height as usize * bounds.width as usize, false);
         self.dirty_rows.resize(bounds.height as usize, true);
+        self.cells_changed_last_draw = false;
 
         for (x, y, cell) in content {
+            self.cells_changed_last_draw = true;
             let index = y as usize * bounds.width as usize + x as usize;
 
             self.fast_blinking.set(

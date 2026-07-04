@@ -14,7 +14,7 @@ https://github.com/user-attachments/assets/57c2fb98-04a6-4ecf-8c72-58808a9f499f
 - **Interactive Input** - Built-in keyboard and mouse input handling with focus management
 - **Programmatic Glyphs** - Automatic rendering of box-drawing, block elements, and Braille patterns
 - **Real-time Updates** - Efficient real-time terminal content updates with minimal overhead
-- **Easy Setup API** - Simple `SimpleTerminal2D` and `SimpleTerminal3D` helpers for quick integration
+- **Easy Setup API** - `TerminalBundle::ui`/`::world_quad` spawn helpers for quick integration
 
 ## Quick Start
 
@@ -29,6 +29,8 @@ bevy_tui_texture = "0.3"
 
 ### Hello World Example
 
+Mirrors `examples/helloworld.rs` (also embedded as this crate's Quick Start doctest):
+
 ```rust
 use bevy::prelude::*;
 use bevy::render::renderer::{RenderDevice, RenderQueue};
@@ -42,8 +44,8 @@ use ratatui::style::Color as RatatuiColor;
 use ratatui::widgets::*;
 use std::sync::Arc;
 
-#[derive(Resource)]
-struct Terminal(SimpleTerminal2D);
+#[derive(Component)]
+struct HelloTerminal;
 
 fn main() {
     App::new()
@@ -59,42 +61,44 @@ fn setup(
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
     mut images: ResMut<Assets<Image>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     let fonts = {
         let font_data = SystemSource::new()
             .select_best_match(&[FamilyName::Monospace], &Properties::new())
-            .unwrap().load().expect("Failed to load font").copy_font_data()
+            .expect("No monospace font found on this system")
+            .load().expect("Failed to load font").copy_font_data()
             .expect("Failed to copy font data");
         let font_data: &'static [u8] = Box::leak(font_data.to_vec().into_boxed_slice());
         Arc::new(Fonts::new(
             TerminalFont::new(font_data).expect("Failed to parse font"), 16))
     };
-    // Create termial
-    let terminal = SimpleTerminal2D::create_and_spawn(
-        80, 25, fonts, (0.0, 0.0), true, false, false, &mut commands, &render_device,
-        &render_queue, &mut images,
+
+    let mut ctx = TerminalSpawnCtx {
+        render_device: &render_device, render_queue: &render_queue,
+        images: &mut images, meshes: &mut meshes, materials: &mut materials,
+    };
+    let bundle = TerminalBundle::ui(
+        80, 25, fonts,
+        TerminalConfig { keyboard: false, mouse: false, ..default() },
+        &mut ctx,
     )
     .expect("Failed to create terminal");
-    // Spawn Camera
+
+    commands.spawn((bundle, Node::default(), HelloTerminal));
     commands.spawn(Camera2d);
-    commands.insert_resource(Terminal(terminal));
 }
 
-fn render_terminal(
-    mut terminal: ResMut<Terminal>,
-    render_device: Res<RenderDevice>,
-    render_queue: Res<RenderQueue>,
-    mut images: ResMut<Assets<Image>>,
-) {
-    terminal.0.draw_and_render(&render_device, &render_queue, &mut images, |frame| {
-            let area = frame.area();
-            // Simple "Hello, World!" paragraph
-            let text = Paragraph::new("Hello, World!")
-                .style(Style::default().fg(RatatuiColor::Green).bold())
-                .alignment(Alignment::Center)
-                .block(Block::bordered().title("Minimal Example"));
-            frame.render_widget(text, area);
-        });
+fn render_terminal(mut screens: Query<&mut Tui, With<HelloTerminal>>) {
+    let Ok(mut term) = screens.single_mut() else { return };
+    term.draw(|frame| {
+        let text = Paragraph::new("Hello, World!")
+            .style(Style::default().fg(RatatuiColor::Green).bold())
+            .alignment(Alignment::Center)
+            .block(Block::bordered().title("Minimal Example"));
+        frame.render_widget(text, frame.area());
+    });
 }
 ```
 
@@ -114,7 +118,10 @@ The `examples/` directory contains comprehensive demonstrations:
 ### Advanced Examples
 
 - **`multiple_terminals.rs`** - Managing multiple independent terminals
+- **`world_terminal.rs`** - World-unit-sized in-game screen (`TerminalBundle::world_quad`)
 - **`shader_mesh.rs`** - Custom shader effects and mesh3d with terminal textures
+- **`retro_crt.rs`** - glTF model + `ExtendedMaterial` CRT shader + overlay UI + camera modes
+- **`tui_component.rs`** - Manual entity spawning with `TerminalTexture` (no spawn helpers)
 - **`benchmark.rs`** - Performance benchmarking and optimization
 
 ### WebAssembly
@@ -153,16 +160,21 @@ Configure features in your `Cargo.toml`:
 [dependencies.bevy_tui_texture]
 version = "0.3"
 default-features = false
-features = ["keyboard_input", "mouse_input", "ratatui_backend"]
+features = ["2d", "3d", "keyboard_input", "mouse_input"]
 ```
 
 Available features:
 
+- **`2d`** (default) - 2D UI terminals (`TuiUi`, `TerminalBundle::ui`)
+- **`3d`** (default) - 3D mesh terminals (`TerminalBundle::world_quad`, `AttachTerminal`, mesh raycasting)
 - **`keyboard_input`** (default) - Enable keyboard event handling
 - **`mouse_input`** (default) - Enable mouse event handling for both 2D UI and 3D mesh terminals
-- **`ratatui_backend`** (default) - Enable ratatui
 - **`bold_italic_fonts`** - Enable fake bold and italic font rendering support
 - **`emoji`** - Enable emoji and extended Unicode character support (WIP)
+
+`TerminalBundle`/`TerminalSpawnCtx` require both `2d` and `3d` together (not
+split further); build with just one display surface by disabling the other,
+e.g. `features = ["3d", "keyboard_input", "mouse_input"]` for a 3D-only app.
 
 ## Performance
 

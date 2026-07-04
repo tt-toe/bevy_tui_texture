@@ -7,7 +7,9 @@
 //!    - User must manually spawn entities and add input components
 //!    - Maximum flexibility and control; wrap it in a [`Tui`] to draw with
 //!      zero render-resource parameters per frame (`gpu_flush_system`,
-//!      registered by `TerminalPlugin`, owns the GPU render + async copy)
+//!      registered by `TerminalPlugin`, renders into the library-owned
+//!      texture, then a render-world system copies it into the terminal's
+//!      `Image`/`GpuImage` - no CPU readback, no material touch needed)
 //!
 //! 2. **`TerminalBundle::ui` / `TerminalBundle::world_quad`** - thin spawn
 //!    helpers that create the texture, build the right components (`Tui`,
@@ -70,129 +72,19 @@
 //! ```
 
 use std::sync::Arc;
+#[cfg(feature = "3d")]
 use std::sync::Mutex;
 
+#[cfg(feature = "3d")]
 use bevy::pbr::{Material, StandardMaterial};
 use bevy::prelude::*;
 use bevy::render::renderer::{RenderDevice, RenderQueue};
-use wgpu::Buffer;
 
 use crate::backend::bevy_backend::{BevyTerminalBackend, TerminalBuilder};
 use crate::bevy_plugin::TerminalDimensions;
 use crate::fonts::Fonts;
+#[cfg(feature = "3d")]
 use crate::input::TerminalInput;
-
-/// Async GPU→CPU buffer copy state
-///
-/// Manages a staging buffer with async mapping for non-blocking GPU texture readback.
-/// This enables 1-frame latency texture updates without blocking the CPU.
-struct AsyncCopy {
-    buffer: Buffer,
-    ready: Arc<Mutex<Option<Result<(), wgpu::BufferAsyncError>>>>,
-    height: u32,
-    bytes_per_row: u32,
-    unpadded_bytes_per_row: u32,
-}
-
-impl AsyncCopy {
-    /// Check if the buffer mapping is complete (non-blocking)
-    fn is_ready(&self) -> bool {
-        self.ready.lock().unwrap().is_some()
-    }
-
-    /// Copy buffer contents to an image (call only after is_ready() returns true)
-    fn copy_to_image(&self, image: &mut Image) {
-        let buffer_slice = self.buffer.slice(..);
-        let data = buffer_slice.get_mapped_range();
-
-        if let Some(image_data) = &mut image.data {
-            if self.bytes_per_row == self.unpadded_bytes_per_row {
-                // No padding, direct copy
-                image_data.copy_from_slice(&data);
-            } else {
-                // Has padding, copy row by row
-                for y in 0..self.height {
-                    let src_offset = (y * self.bytes_per_row) as usize;
-                    let dst_offset = (y * self.unpadded_bytes_per_row) as usize;
-                    let row_data =
-                        &data[src_offset..src_offset + self.unpadded_bytes_per_row as usize];
-                    image_data[dst_offset..dst_offset + self.unpadded_bytes_per_row as usize]
-                        .copy_from_slice(row_data);
-                }
-            }
-        }
-    }
-
-    /// Create a new async copy from texture to staging buffer
-    fn from_texture(
-        texture: &wgpu::Texture,
-        width: u32,
-        height: u32,
-        render_device: &RenderDevice,
-        render_queue: &RenderQueue,
-    ) -> Self {
-        let unpadded_bytes_per_row = width * 4;
-        let bytes_per_row = {
-            let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-            let padding = (align - (unpadded_bytes_per_row % align)) % align;
-            unpadded_bytes_per_row + padding
-        };
-
-        let buffer_size = (bytes_per_row * height) as wgpu::BufferAddress;
-
-        let staging_buffer = render_device
-            .wgpu_device()
-            .create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Terminal Staging Buffer (Async)"),
-                size: buffer_size,
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            });
-
-        let mut encoder =
-            render_device
-                .wgpu_device()
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("Terminal Copy Encoder (Async)"),
-                });
-
-        encoder.copy_texture_to_buffer(
-            texture.as_image_copy(),
-            wgpu::TexelCopyBufferInfo {
-                buffer: &staging_buffer,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(bytes_per_row),
-                    rows_per_image: Some(height),
-                },
-            },
-            wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-        );
-
-        render_queue.0.submit(Some(encoder.finish()));
-
-        // Issue async map request
-        let buffer_slice = staging_buffer.slice(..);
-        let ready = Arc::new(Mutex::new(None));
-        let ready_clone = Arc::clone(&ready);
-
-        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-            *ready_clone.lock().unwrap() = Some(result);
-        });
-
-        Self {
-            buffer: staging_buffer,
-            ready,
-            height,
-            bytes_per_row,
-            unpadded_bytes_per_row,
-        }
-    }
-}
 
 /// Core terminal texture state without entity management.
 ///
@@ -213,7 +105,6 @@ pub struct TerminalTexture {
     rows: u16,
     char_width_px: u32,
     char_height_px: u32,
-    pending_copy: Option<AsyncCopy>, // Async buffer copy in-flight
 }
 
 impl TerminalTexture {
@@ -280,17 +171,23 @@ impl TerminalTexture {
                 view_formats: &[],
             });
 
-        // Create Bevy Image with white background (will be immediately overwritten)
-        let mut image = Image::new_fill(
+        // Render-world-only image: no CPU-side pixel data ever exists for
+        // it. It starts wgpu-zero-initialized (transparent black, which
+        // reads as plain black through any `AlphaMode::Opaque` material)
+        // and is updated exclusively via the render-world GPU->GPU copy
+        // system (`copy_tui_textures` in `bevy_plugin.rs`) - never through
+        // bevy's normal CPU-upload asset pipeline. `COPY_SRC` is
+        // deliberately absent: nothing ever copies data back out of this
+        // destination texture.
+        let mut image = Image::new_uninit(
             bevy::render::render_resource::Extent3d {
                 width,
                 height,
                 depth_or_array_layers: 1,
             },
             bevy::render::render_resource::TextureDimension::D2,
-            &[255, 255, 255, 255], // White instead of black to debug
             bevy::render::render_resource::TextureFormat::Rgba8Unorm,
-            default(), // Default render asset usages
+            bevy::asset::RenderAssetUsages::RENDER_WORLD,
         );
         image.texture_descriptor.usage = bevy::render::render_resource::TextureUsages::COPY_DST
             | bevy::render::render_resource::TextureUsages::TEXTURE_BINDING;
@@ -299,14 +196,11 @@ impl TerminalTexture {
         // Create backend
         let mut backend = TerminalBuilder::new(fonts)
             .with_dimensions(cols, rows)
-            .build(render_device.wgpu_device(), render_queue.0.as_ref())
-            ?;
+            .build(render_device.wgpu_device(), render_queue.0.as_ref());
 
         // Optionally pre-populate programmatic glyphs
         if programmatic_glyphs {
-            backend
-                .populate_programmatic_glyphs(render_queue.0.as_ref())
-                ?;
+            backend.populate_programmatic_glyphs(render_queue.0.as_ref());
         }
 
         let terminal = ratatui::Terminal::new(backend)
@@ -322,29 +216,13 @@ impl TerminalTexture {
             rows,
             char_width_px,
             char_height_px,
-            pending_copy: None,
         })
     }
 
-    /// Draw synchronously: render to the GPU texture and **block** until the
-    /// result is copied into the `Image` asset, instead of `Tui`'s normal
-    /// async (1-frame-latency) flush path.
-    ///
-    /// Call this once right after [`TerminalTexture::create`] to guarantee
-    /// the very first displayed frame already has real content instead of
-    /// the create-time fill color. Do not call this every frame - it blocks
-    /// the CPU on the GPU, which the async flush path exists to avoid.
-    pub fn draw_sync<F>(
-        &mut self,
-        render_device: &RenderDevice,
-        render_queue: &RenderQueue,
-        images: &mut Assets<Image>,
-        draw_fn: F,
-    ) where
-        F: FnOnce(&mut ratatui::Frame),
-    {
-        let _ = self.terminal.draw(draw_fn);
-
+    /// Render the terminal's current ratatui buffer to the library-owned
+    /// GPU texture. Synchronous (a GPU render pass, not a readback) -
+    /// called by [`Tui::flush`] whenever the terminal is dirty.
+    fn render_to_texture(&mut self, render_device: &RenderDevice, render_queue: &RenderQueue) {
         let texture_view = self
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -353,16 +231,92 @@ impl TerminalTexture {
             render_queue.0.as_ref(),
             &texture_view,
         );
+    }
 
-        crate::bevy_plugin::update_terminal_texture(
-            &self.texture,
-            &self.image_handle,
-            self.width,
-            self.height,
-            render_device,
-            render_queue,
-            images,
+    /// Read the library-owned texture's current pixels back to the CPU,
+    /// **blocking** until the copy completes. Opt-in only (screenshots,
+    /// tests) - never call this every frame, it stalls the CPU on the GPU.
+    /// Returns tightly-packed RGBA8 bytes (`width * height * 4`), with any
+    /// wgpu row padding already stripped.
+    pub(crate) fn read_back_pixels_blocking(
+        &self,
+        render_device: &RenderDevice,
+        render_queue: &RenderQueue,
+    ) -> Vec<u8> {
+        let unpadded_bytes_per_row = self.width * 4;
+        let bytes_per_row = {
+            let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+            let padding = (align - (unpadded_bytes_per_row % align)) % align;
+            unpadded_bytes_per_row + padding
+        };
+        let buffer_size = (bytes_per_row * self.height) as wgpu::BufferAddress;
+
+        let staging_buffer = render_device
+            .wgpu_device()
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Terminal Readback Buffer"),
+                size: buffer_size,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+
+        let mut encoder =
+            render_device
+                .wgpu_device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Terminal Readback Encoder"),
+                });
+        encoder.copy_texture_to_buffer(
+            self.texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging_buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(self.height),
+                },
+            },
+            wgpu::Extent3d {
+                width: self.width,
+                height: self.height,
+                depth_or_array_layers: 1,
+            },
         );
+        render_queue.0.submit(Some(encoder.finish()));
+
+        let buffer_slice = staging_buffer.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+            sender.send(result).ok();
+        });
+        render_device
+            .wgpu_device()
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })
+            .ok();
+        receiver
+            .recv()
+            .expect("map_async callback never ran")
+            .expect("failed to map readback buffer");
+
+        let mapped = buffer_slice.get_mapped_range();
+        let mut out = vec![0u8; (unpadded_bytes_per_row * self.height) as usize];
+        if bytes_per_row == unpadded_bytes_per_row {
+            out.copy_from_slice(&mapped);
+        } else {
+            for y in 0..self.height {
+                let src_offset = (y * bytes_per_row) as usize;
+                let dst_offset = (y * unpadded_bytes_per_row) as usize;
+                out[dst_offset..dst_offset + unpadded_bytes_per_row as usize].copy_from_slice(
+                    &mapped[src_offset..src_offset + unpadded_bytes_per_row as usize],
+                );
+            }
+        }
+        drop(mapped);
+        staging_buffer.unmap();
+        out
     }
 
     /// Get the terminal dimensions for entity setup.
@@ -385,68 +339,6 @@ impl TerminalTexture {
     pub fn image_handle(&self) -> Handle<Image> {
         self.image_handle.clone()
     }
-}
-
-// ============================================================================
-// Shared internal GPU flush functions
-//
-// `Tui::flush` (called every frame by the plugin-owned `gpu_flush_system`)
-// calls these two functions to poll the previous frame's async copy and
-// kick off the next render + copy.
-// ============================================================================
-
-/// Collect the previous frame's async GPU→CPU copy, if any, into the Bevy
-/// `Image` asset (non-blocking poll). Returns `true` if the `Image` was
-/// actually updated this frame (i.e. a material touch is warranted).
-fn collect_pending_copy(
-    tt: &mut TerminalTexture,
-    render_device: &RenderDevice,
-    images: &mut Assets<Image>,
-) -> bool {
-    let Some(async_copy) = tt.pending_copy.take() else {
-        return false;
-    };
-
-    let _ = render_device.wgpu_device().poll(wgpu::PollType::Poll);
-
-    if async_copy.is_ready() {
-        // (bevy 0.19: get_mut returns an AssetMut guard)
-        if let Some(mut image) = images.get_mut(&tt.image_handle) {
-            async_copy.copy_to_image(&mut image);
-        }
-        async_copy.buffer.unmap();
-        true
-    } else {
-        // Not ready yet, restore it for next frame.
-        tt.pending_copy = Some(async_copy);
-        false
-    }
-}
-
-/// Render the terminal's current buffer to the GPU texture and start a new
-/// async copy back to the CPU-side `Image`. Call only when there is no
-/// `pending_copy` in flight.
-fn render_and_start_copy(
-    tt: &mut TerminalTexture,
-    render_device: &RenderDevice,
-    render_queue: &RenderQueue,
-) {
-    let texture_view = tt
-        .texture
-        .create_view(&wgpu::TextureViewDescriptor::default());
-    tt.terminal.backend_mut().render_to_texture(
-        render_device.wgpu_device(),
-        render_queue.0.as_ref(),
-        &texture_view,
-    );
-
-    tt.pending_copy = Some(AsyncCopy::from_texture(
-        &tt.texture,
-        tt.width,
-        tt.height,
-        render_device,
-        render_queue,
-    ));
 }
 
 /// Registry mapping click regions to caller-defined `u64` ids, rebuilt on
@@ -515,15 +407,28 @@ impl HitRegions {
 /// the redundant "Terminal User Interface Terminal".
 ///
 /// [`Tui::draw`] only draws into ratatui's internal buffer and marks the
-/// component dirty - it touches no GPU state and is cheap to call every
-/// frame. The actual GPU render + async copy + material touch is owned by
-/// the plugin's [`gpu_flush_system`](crate::bevy_plugin::gpu_flush_system),
-/// registered automatically in `TerminalSystemSet::Render`.
+/// component dirty (skipped entirely if the draw was byte-identical to the
+/// previous frame) - it touches no GPU state and is cheap to call every
+/// frame. The actual GPU render is owned by the plugin's
+/// [`gpu_flush_system`](crate::bevy_plugin::gpu_flush_system), registered
+/// automatically in `TerminalSystemSet::Render`; a render-world system then
+/// copies the result into this `Tui`'s `Image`/`GpuImage` - no CPU
+/// readback, no material touch (see `IMPROVEMENT.md` for why this replaced
+/// the old async-copy architecture).
 #[derive(Component)]
 pub struct Tui {
     texture_state: TerminalTexture,
     dirty: bool,
+    /// Set by `flush` whenever it renders a fresh frame into the
+    /// library-owned texture; drained by the render-world extract system
+    /// (`extract_tui_copies` in `bevy_plugin.rs`), which is the only other
+    /// reader/writer of this flag.
+    copy_pending: bool,
     hit_regions: HitRegions,
+    /// Set once a `draw()`/`draw_with_hits()` call has logged its ratatui
+    /// error, so a terminal that keeps failing every frame doesn't spam the
+    /// log - one `warn!` per terminal is enough to diagnose it.
+    draw_error_logged: bool,
 }
 
 impl Tui {
@@ -534,18 +439,27 @@ impl Tui {
         Self {
             texture_state,
             dirty: false,
+            copy_pending: false,
             hit_regions: HitRegions::default(),
+            draw_error_logged: false,
         }
     }
 
     /// Draw with ratatui. Touches no GPU state - renders into the backend
-    /// buffer and sets the dirty flag. Cheap to call every frame.
+    /// buffer and, if the ratatui diff actually changed at least one cell,
+    /// sets the dirty flag (a byte-identical redraw is a no-op past this
+    /// point: no GPU render, no copy, next frame). Cheap to call every
+    /// frame either way.
     ///
     /// Error handling: ratatui's `Terminal::draw` returns `io::Result`; this
-    /// swallows the error exactly as the rest of this crate does today.
+    /// crate cannot recover from a backend draw failure, so it does not
+    /// panic - but the first occurrence per `Tui` is logged via `warn!`
+    /// (further occurrences are suppressed to avoid per-frame log spam).
     pub fn draw(&mut self, f: impl FnOnce(&mut ratatui::Frame)) {
-        let _ = self.texture_state.terminal.draw(f);
-        self.dirty = true;
+        match self.texture_state.terminal.draw(f) {
+            Ok(_) => self.mark_dirty_if_changed(),
+            Err(err) => self.log_draw_error(err),
+        }
     }
 
     /// `draw()` variant handing the caller a `&mut HitRegions` alongside the
@@ -555,8 +469,27 @@ impl Tui {
     pub fn draw_with_hits(&mut self, f: impl FnOnce(&mut ratatui::Frame, &mut HitRegions)) {
         self.hit_regions.clear();
         let hit_regions = &mut self.hit_regions;
-        let _ = self.texture_state.terminal.draw(|frame| f(frame, hit_regions));
-        self.dirty = true;
+        match self
+            .texture_state
+            .terminal
+            .draw(|frame| f(frame, hit_regions))
+        {
+            Ok(_) => self.mark_dirty_if_changed(),
+            Err(err) => self.log_draw_error(err),
+        }
+    }
+
+    fn mark_dirty_if_changed(&mut self) {
+        if self.texture_state.terminal.backend().cells_changed_last_draw() {
+            self.dirty = true;
+        }
+    }
+
+    fn log_draw_error(&mut self, err: std::io::Error) {
+        if !self.draw_error_logged {
+            tracing::warn!("Tui::draw failed, content for this terminal may be stale: {err}");
+            self.draw_error_logged = true;
+        }
     }
 
     /// The hit regions registered by the most recent [`Tui::draw_with_hits`]
@@ -581,28 +514,56 @@ impl Tui {
         &self.texture_state.image_handle
     }
 
-    /// Escape hatch for binding the texture into your own render passes.
+    /// Escape hatch for binding the library-owned texture into your own
+    /// render passes. Note this is the *source* texture this `Tui` renders
+    /// into every dirty frame, not the destination `Image`/`GpuImage` the
+    /// render world copies into - the two are kept in sync automatically,
+    /// but they are different GPU textures.
     pub fn wgpu_texture(&self) -> &wgpu::Texture {
         &self.texture_state.texture
     }
 
-    /// Called by [`gpu_flush_system`](crate::bevy_plugin::gpu_flush_system).
-    /// Returns `true` if the `Image` asset was updated this frame (i.e. a
-    /// material touch is warranted).
-    pub(crate) fn flush(
-        &mut self,
-        render_device: &RenderDevice,
-        render_queue: &RenderQueue,
-        images: &mut Assets<Image>,
-    ) -> bool {
-        let applied = collect_pending_copy(&mut self.texture_state, render_device, images);
+    /// Read this terminal's current pixels back to the CPU, **blocking**
+    /// until the GPU copy completes. An explicit opt-in for screenshots and
+    /// tests only - the normal per-frame path never touches the CPU at all;
+    /// do not call this every frame. Returns tightly-packed RGBA8 bytes.
+    pub fn read_back_blocking(&self, render_device: &RenderDevice, render_queue: &RenderQueue) -> Vec<u8> {
+        self.texture_state
+            .read_back_pixels_blocking(render_device, render_queue)
+    }
 
-        if self.dirty && self.texture_state.pending_copy.is_none() {
-            render_and_start_copy(&mut self.texture_state, render_device, render_queue);
+    /// Called by [`gpu_flush_system`](crate::bevy_plugin::gpu_flush_system).
+    /// If dirty, renders into the library-owned texture and marks a copy as
+    /// pending for the render-world extract system to pick up; the actual
+    /// `Image`/`GpuImage` update happens there, not here.
+    pub(crate) fn flush(&mut self, render_device: &RenderDevice, render_queue: &RenderQueue) {
+        if self.dirty {
+            self.texture_state
+                .render_to_texture(render_device, render_queue);
+            self.copy_pending = true;
             self.dirty = false;
         }
+    }
 
-        applied
+    /// Drain the pending-copy flag, if set, returning the source texture
+    /// (cloned - `wgpu::Texture` is a cheap `Arc`-backed handle), the
+    /// destination image's asset id, and the copy size. Called once per
+    /// frame by the render-world extract system
+    /// (`extract_tui_copies` in `bevy_plugin.rs`) via `ResMut<MainWorld>`.
+    pub(crate) fn take_copy_pending(&mut self) -> Option<(wgpu::Texture, AssetId<Image>, wgpu::Extent3d)> {
+        if !self.copy_pending {
+            return None;
+        }
+        self.copy_pending = false;
+        Some((
+            self.texture_state.texture.clone(),
+            self.texture_state.image_handle.id(),
+            wgpu::Extent3d {
+                width: self.texture_state.width,
+                height: self.texture_state.height,
+                depth_or_array_layers: 1,
+            },
+        ))
     }
 }
 
@@ -634,9 +595,9 @@ pub struct TerminalConfig {
     pub keyboard: bool,
     /// Whether this terminal can receive mouse input.
     pub mouse: bool,
-    /// Rendered synchronously at creation via [`TerminalTexture::draw_sync`]
-    /// so the very first displayed frame already has real content instead
-    /// of the create-time fill color.
+    /// Drawn once at creation time (before the entity's own draw system
+    /// runs), so the very first presented frame already has real content
+    /// instead of the create-time fill color.
     pub initial_draw: Option<Box<dyn FnOnce(&mut ratatui::Frame) + Send>>,
 }
 
@@ -662,6 +623,11 @@ impl Default for TerminalConfig {
 /// conflicting access). Plain references compose freely: build one from
 /// whatever `Res`/`ResMut` (or another `TerminalSpawnCtx`) your system
 /// already has, no matter how many other resources it also needs.
+///
+/// Gated behind `all(2d, 3d)` as a whole, not split per-field: this is the
+/// immediate-mode spawn path (see [`TerminalBundle`]); the declarative
+/// `TuiRequest` alternative gates its variants individually.
+#[cfg(all(feature = "2d", feature = "3d"))]
 pub struct TerminalSpawnCtx<'w> {
     pub render_device: &'w RenderDevice,
     pub render_queue: &'w RenderQueue,
@@ -675,6 +641,7 @@ pub struct TerminalSpawnCtx<'w> {
 /// auto-inserts a required component when the entity doesn't already have
 /// one); otherwise a default `Node` is inserted so the entity is still a
 /// valid UI node.
+#[cfg(feature = "2d")]
 #[derive(Component, Default)]
 #[require(Node)]
 pub struct TuiUi;
@@ -683,8 +650,10 @@ pub struct TuiUi;
 /// more (no positioning, no god-function). Not a real bundle-deriving type;
 /// just a namespace for the two constructors below, which each return
 /// `impl Bundle` for the caller to spawn directly.
+#[cfg(all(feature = "2d", feature = "3d"))]
 pub struct TerminalBundle;
 
+#[cfg(all(feature = "2d", feature = "3d"))]
 impl TerminalBundle {
     /// 2D (bevy_ui) terminal. The returned bundle carries no `Node` of its
     /// own (see [`TuiUi`]) - place it with ordinary bevy_ui components in
@@ -708,7 +677,7 @@ impl TerminalBundle {
         config: TerminalConfig,
         ctx: &mut TerminalSpawnCtx,
     ) -> Result<impl Bundle, crate::TerminalError> {
-        let mut texture_state = TerminalTexture::create(
+        let texture_state = TerminalTexture::create(
             cols,
             rows,
             fonts,
@@ -718,18 +687,18 @@ impl TerminalBundle {
             ctx.images,
         )?;
 
-        if let Some(initial_draw) = config.initial_draw {
-            texture_state.draw_sync(ctx.render_device, ctx.render_queue, ctx.images, initial_draw);
-        }
-
         let image_node = ImageNode {
             image: texture_state.image_handle(),
             ..default()
         };
         let dimensions = texture_state.dimensions();
+        let mut tui = Tui::from_texture_state(texture_state);
+        if let Some(initial_draw) = config.initial_draw {
+            tui.draw(initial_draw);
+        }
 
         Ok((
-            Tui::from_texture_state(texture_state),
+            tui,
             TuiUi,
             image_node,
             dimensions,
@@ -757,7 +726,7 @@ impl TerminalBundle {
         config: TerminalConfig,
         ctx: &mut TerminalSpawnCtx,
     ) -> Result<impl Bundle, crate::TerminalError> {
-        let mut texture_state = TerminalTexture::create(
+        let texture_state = TerminalTexture::create(
             cols,
             rows,
             fonts,
@@ -766,10 +735,6 @@ impl TerminalBundle {
             ctx.render_queue,
             ctx.images,
         )?;
-
-        if let Some(initial_draw) = config.initial_draw {
-            texture_state.draw_sync(ctx.render_device, ctx.render_queue, ctx.images, initial_draw);
-        }
 
         let aspect = texture_state.width as f32 / texture_state.height as f32;
         let half_height = height / 2.0;
@@ -788,9 +753,13 @@ impl TerminalBundle {
             ..default()
         });
         let dimensions = texture_state.dimensions();
+        let mut tui = Tui::from_texture_state(texture_state);
+        if let Some(initial_draw) = config.initial_draw {
+            tui.draw(initial_draw);
+        }
 
         Ok((
-            Tui::from_texture_state(texture_state),
+            tui,
             Mesh3d(mesh),
             MeshMaterial3d(material),
             dimensions,
@@ -808,8 +777,9 @@ impl TerminalBundle {
 
 /// Type-erased "insert this material" action. Never constructed directly -
 /// [`AttachMaterial::standard`]/[`AttachMaterial::custom`] build it. `Arc`
-/// (not `Box`) so [`attach_terminal_system`] can cheaply clone it out of a
+/// (not `Box`) so `attach_terminal_system` can cheaply clone it out of a
 /// query item into a `Commands::queue` closure every re-claim attempt.
+#[cfg(feature = "3d")]
 #[derive(Clone)]
 struct UntypedMaterialInsert(std::sync::Arc<dyn Fn(Handle<Image>, Entity, &mut World) + Send + Sync>);
 
@@ -818,8 +788,10 @@ struct UntypedMaterialInsert(std::sync::Arc<dyn Fn(Handle<Image>, Entity, &mut W
 /// `AttachTerminal<M>` would force every call site, query, and system to
 /// name `M`, and would duplicate the per-type registration
 /// `TerminalMaterialPlugin::<M>` already provides.
+#[cfg(feature = "3d")]
 pub struct AttachMaterial(UntypedMaterialInsert);
 
+#[cfg(feature = "3d")]
 impl AttachMaterial {
     /// Plain `StandardMaterial`, unlit, textured with the terminal.
     pub fn standard() -> Self {
@@ -836,7 +808,7 @@ impl AttachMaterial {
     /// per-frame touching) from the terminal's image handle.
     ///
     /// `factory` is invoked at most once per entity even though
-    /// [`attach_terminal_system`] may call this action every frame while
+    /// `attach_terminal_system` may call this action every frame while
     /// re-claiming (see that function's doc comment): the built handle is
     /// cached internally and reused on subsequent calls, so re-claiming
     /// never mints duplicate material assets.
@@ -868,7 +840,7 @@ impl AttachMaterial {
 }
 
 /// Insert on a mesh entity (e.g. a glTF primitive) to attach a `Tui` to it.
-/// [`attach_terminal_system`] then:
+/// `attach_terminal_system` then:
 /// 1. builds (or re-fetches the cached) material via [`AttachMaterial`],
 ///    handing it the terminal's `Handle<Image>`, and swaps out
 ///    `MeshMaterial3d<StandardMaterial>`,
@@ -883,6 +855,7 @@ impl AttachMaterial {
 ///    query (for [`AttachMaterial::custom`] targets of a type other than
 ///    `StandardMaterial`) or settles into harmless no-op re-assertion of
 ///    the same cached handle (for [`AttachMaterial::standard`]).
+#[cfg(feature = "3d")]
 #[derive(Component)]
 pub struct AttachTerminal {
     /// Entity carrying the `Tui` component to display on this mesh.
@@ -893,6 +866,7 @@ pub struct AttachTerminal {
 /// Plugin system backing [`AttachTerminal`]. Registered automatically by
 /// `TerminalPlugin`. See `AttachTerminal`'s doc comment for the full
 /// behavior.
+#[cfg(feature = "3d")]
 pub(crate) fn attach_terminal_system(
     mut commands: Commands,
     to_attach: Query<(Entity, &AttachTerminal), With<MeshMaterial3d<StandardMaterial>>>,
@@ -966,13 +940,46 @@ mod tui_flush_tests {
         ))
     }
 
-    /// Regression test: draw once, then simulate several
-    /// `gpu_flush_system` ticks (with device polls in between, standing in
-    /// for real frame boundaries) WITHOUT calling `draw()` again. The
-    /// `Image` asset must eventually reflect the single draw call - a naive
-    /// "only redraw on change" optimization must not lose the last frame.
+    /// A repeatedly-failing `draw()` logs its error only once per `Tui`,
+    /// not once per call - `log_draw_error` is the de-duplication gate this
+    /// asserts on directly (a real ratatui backend failure is impractical
+    /// to trigger from the outside, so this drives the same private method
+    /// `draw`/`draw_with_hits` call on error).
     #[test]
-    fn tui_flush_completes_without_further_draw_calls() {
+    fn draw_error_logged_only_once() {
+        let Some((render_device, render_queue)) = try_gpu() else {
+            eprintln!("skipping: no GPU adapter available in this environment");
+            return;
+        };
+
+        let font_data = include_bytes!("../assets/fonts/Mplus1Code-Regular.ttf");
+        let font = Font::new(font_data).expect("failed to load test font");
+        let fonts = Arc::new(Fonts::new(font, 16));
+
+        let mut images = Assets::<Image>::default();
+        let texture_state =
+            TerminalTexture::create(4, 2, fonts, false, &render_device, &render_queue, &mut images)
+                .expect("failed to create terminal texture");
+        let mut tui = Tui::from_texture_state(texture_state);
+
+        assert!(!tui.draw_error_logged);
+        let fake_err = || std::io::Error::other("simulated backend failure");
+        tui.log_draw_error(fake_err());
+        assert!(tui.draw_error_logged, "first error must flip the flag");
+        // Second call must not panic and must leave the flag set - the
+        // actual "only warn! once" behavior lives in the `if
+        // !self.draw_error_logged` guard inside `log_draw_error` itself.
+        tui.log_draw_error(fake_err());
+        assert!(tui.draw_error_logged);
+    }
+
+    /// Regression test: draw once, flush once, then read back the
+    /// library-owned texture directly (bypassing the render world - this
+    /// bare-device test has none). The rendered content must be visible
+    /// without ever touching the `Image` asset, confirming the Phase A
+    /// render_to_texture + `read_back_blocking` path works end to end.
+    #[test]
+    fn flush_renders_drawn_content_synchronously() {
         let Some((render_device, render_queue)) = try_gpu() else {
             eprintln!("skipping: no GPU adapter available in this environment");
             return;
@@ -993,44 +1000,73 @@ mod tui_flush_tests {
             &mut images,
         )
         .expect("failed to create terminal texture");
-        let image_handle = texture_state.image_handle();
         let mut tui = Tui::from_texture_state(texture_state);
 
-        // Draw distinctive content ONCE.
+        // Draw distinctive content and flush exactly once.
         tui.draw(|frame| {
             frame.render_widget(
                 Block::default().style(Style::default().bg(RatatuiColor::Red)),
                 frame.area(),
             );
         });
+        tui.flush(&render_device, &render_queue);
 
-        // Simulate several Render-schedule ticks with no further draw()
-        // calls, forcing a device poll each time so the async buffer-map
-        // callback isn't left waiting on a bare non-blocking poll (as a real
-        // multi-frame app naturally would over several ticks).
-        let mut applied = false;
-        for _ in 0..5 {
-            let _ = render_device.wgpu_device().poll(wgpu::PollType::Wait {
-                submission_index: None,
-                timeout: None,
-            });
-            if tui.flush(&render_device, &render_queue, &mut images) {
-                applied = true;
-                break;
-            }
-        }
-
-        assert!(
-            applied,
-            "Image was never updated after a single draw() + repeated flush()"
-        );
-
-        let image = images.get(&image_handle).expect("image asset exists");
-        let data = image.data.as_ref().expect("image has pixel data");
-        let has_red_pixel = data.chunks_exact(4).any(|px| px[0] > 200 && px[2] < 60);
+        let pixels = tui.read_back_blocking(&render_device, &render_queue);
+        let has_red_pixel = pixels.chunks_exact(4).any(|px| px[0] > 200 && px[2] < 60);
         assert!(
             has_red_pixel,
-            "rendered image does not contain the drawn red background"
+            "rendered texture does not contain the drawn red background"
+        );
+    }
+
+    /// No-change skip (design point 7): redrawing byte-identical content
+    /// must not re-mark the terminal dirty, so `flush` performs no GPU
+    /// work on the second call. Needs a real texture only to construct
+    /// `Tui` - `draw()`'s dirty tracking itself is pure CPU/ratatui logic.
+    #[test]
+    fn identical_redraw_does_not_mark_dirty() {
+        let Some((render_device, render_queue)) = try_gpu() else {
+            eprintln!("skipping: no GPU adapter available in this environment");
+            return;
+        };
+
+        let font_data = include_bytes!("../assets/fonts/Mplus1Code-Regular.ttf");
+        let font = Font::new(font_data).expect("failed to load test font");
+        let fonts = Arc::new(Fonts::new(font, 16));
+
+        let mut images = Assets::<Image>::default();
+        let texture_state = TerminalTexture::create(
+            4,
+            2,
+            fonts,
+            false,
+            &render_device,
+            &render_queue,
+            &mut images,
+        )
+        .expect("failed to create terminal texture");
+        let mut tui = Tui::from_texture_state(texture_state);
+
+        let paint_red =
+            |frame: &mut ratatui::Frame| {
+                frame.render_widget(
+                    Block::default().style(Style::default().bg(RatatuiColor::Red)),
+                    frame.area(),
+                );
+            };
+
+        // First draw: empty -> red is definitely a change.
+        tui.draw(paint_red);
+        assert!(tui.dirty, "first draw onto an empty buffer must be dirty");
+        tui.flush(&render_device, &render_queue);
+        assert!(!tui.dirty, "flush must clear dirty");
+
+        // Second draw: byte-identical content -> zero-cell diff -> must
+        // NOT re-mark dirty (this is the whole point of the optimization).
+        tui.draw(paint_red);
+        assert!(
+            !tui.dirty,
+            "identical redraw must not mark dirty (no-change skip)"
         );
     }
 }

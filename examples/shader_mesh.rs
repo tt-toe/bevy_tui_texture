@@ -40,10 +40,6 @@ fn main() {
         }))
         .add_plugins(MaterialPlugin::<CrtMaterial>::default())
         .add_plugins(TerminalPlugin::default())
-        // Touches the ExtendedMaterial every frame after a Tui redraw - the
-        // library provides a blanket `TerminalMaterial` impl for
-        // `ExtendedMaterial<StandardMaterial, E>`.
-        .add_plugins(TerminalMaterialPlugin::<CrtMaterial>::default())
         .add_systems(Startup, setup)
         .add_systems(Update, handle_input.in_set(TerminalSystemSet::UserUpdate))
         .add_systems(Update, render_terminal.in_set(TerminalSystemSet::Render))
@@ -111,7 +107,7 @@ fn setup(
     let fonts = Arc::new(Fonts::new(font, 16));
 
     // Create terminal texture
-    let mut texture_state = TerminalTexture::create(
+    let texture_state = TerminalTexture::create(
         80,
         30,
         fonts,
@@ -122,8 +118,13 @@ fn setup(
     )
     .expect("Failed to create terminal");
 
-    // Initial synchronous render (prevents first-frame black texture).
-    texture_state.draw_sync(&render_device, &render_queue, &mut images, |frame| {
+    let image_handle = texture_state.image_handle();
+    let dimensions = texture_state.dimensions();
+    let mut tui = Tui::from_texture_state(texture_state);
+
+    // Initial draw (the zero-latency flush shows this on the first
+    // presented frame - no synchronous GPU call needed at creation time).
+    tui.draw(|frame| {
         let area = frame.area();
 
         // Clear with colorful background
@@ -146,7 +147,7 @@ fn setup(
     let material = CrtMaterial {
         base: StandardMaterial {
             base_color: bevy::color::Color::WHITE, // CRITICAL: White to show texture colors accurately
-            base_color_texture: Some(texture_state.image_handle()),
+            base_color_texture: Some(image_handle),
             unlit: false, // Must be false for pbr_input_from_standard_material to work
             alpha_mode: AlphaMode::Opaque,
             double_sided: true,
@@ -169,7 +170,6 @@ fn setup(
     let mesh_handle = meshes.add(mesh);
 
     // Spawn terminal entity
-    let dimensions = texture_state.dimensions();
     let terminal_entity = commands
         .spawn((
             Mesh3d(mesh_handle),
@@ -181,7 +181,7 @@ fn setup(
         ))
         .id();
     commands.entity(terminal_entity).insert((
-        Tui::from_texture_state(texture_state),
+        tui,
         TuiSurface {
             tui: terminal_entity,
         },
@@ -243,9 +243,11 @@ fn update_crt_uniforms(
     }
 }
 
-/// Zero render-resource parameters: `TerminalMaterialPlugin::<CrtMaterial>`
-/// (registered in `main`) touches the material every frame after
-/// `gpu_flush_system`'s GPU render.
+/// Zero render-resource parameters: `gpu_flush_system` (registered by
+/// `TerminalPlugin`) renders into the library-owned texture, and a
+/// render-world system copies it straight into `CrtMaterial`'s bind group -
+/// no plugin registration or per-frame touching needed for this custom
+/// material type.
 fn render_terminal(mut screens: Query<&mut Tui, With<MainTerminal>>, mut app_state: ResMut<AppState>) {
     app_state.frame_count += 1;
 

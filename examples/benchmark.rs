@@ -49,6 +49,7 @@ struct BenchmarkState {
     mode: u8, // 0 = gradient, 1 = random boxes
     scroll_offset: f32,
     frame_count: u32,
+    last_report_secs: f32,
 }
 
 fn setup(
@@ -122,6 +123,19 @@ fn render_benchmark(
         .get(&FrameTimeDiagnosticsPlugin::FPS)
         .and_then(|d| d.smoothed())
         .unwrap_or(0.0);
+
+    // Print numeric FPS/frame-time samples to stdout every ~2s so
+    // before/after architecture comparisons have exact logged numbers to
+    // diff, not just an on-screen readout to eyeball.
+    let elapsed = time.elapsed_secs();
+    if elapsed - state.last_report_secs >= 2.0 {
+        state.last_report_secs = elapsed;
+        println!(
+            "[benchmark] t={elapsed:>6.1}s  fps={fps:>6.1}  frame_time_ms={:>6.2}  frames={}",
+            if fps > 0.0 { 1000.0 / fps } else { 0.0 },
+            state.frame_count
+        );
+    }
 
     // Get time in milliseconds for better random seed
     let time_ms = (time.elapsed_secs() * 1000.0) as u32;

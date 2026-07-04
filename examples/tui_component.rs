@@ -7,10 +7,14 @@
 //! - user drawing systems take **zero render-resource parameters**
 //!   (`Tui::draw` only touches the ratatui buffer; the plugin's
 //!   `gpu_flush_system`, registered automatically by `TerminalPlugin`,
-//!   owns the GPU render + async copy + material touch),
-//! - the same pattern works for a custom (`ExtendedMaterial`-based)
-//!   material type via `TerminalMaterialPlugin::<M>` — no per-frame user
-//!   touching there either, as long as `M: TerminalMaterial`.
+//!   renders into the library-owned texture, and a render-world system
+//!   copies it straight into whatever `Image`/`GpuImage` the material's
+//!   bind group already references),
+//! - this works identically for a custom (`ExtendedMaterial`-based)
+//!   material type - **no plugin registration and no per-frame touching
+//!   needed for any material type**, custom or `StandardMaterial`, since
+//!   the render-world copy writes into the same GPU texture the material
+//!   already samples.
 //!
 //! See also `world_terminal.rs`, which uses the same zero-render-resource
 //! pattern for a single in-world screen built via `TerminalBundle::world_quad`.
@@ -42,11 +46,11 @@ fn main() {
             ..default()
         }))
         .add_plugins(TerminalPlugin::default())
-        // Registers the generic per-type material-touch system for Screen B's
-        // ExtendedMaterial. StandardMaterial (Screen A) needs no such
-        // registration — gpu_flush_system touches it directly.
+        // Only registration ScreenB's ExtendedMaterial needs: the ordinary
+        // bevy MaterialPlugin, so its shader pipeline exists at all. No
+        // terminal-specific plugin - the render-world GPU copy updates its
+        // texture exactly the same way it updates ScreenA's StandardMaterial.
         .add_plugins(MaterialPlugin::<ScreenBMaterial>::default())
-        .add_plugins(TerminalMaterialPlugin::<ScreenBMaterial>::default())
         .init_resource::<ClickCounts>()
         .add_systems(Startup, setup)
         .add_systems(
@@ -60,8 +64,8 @@ fn main() {
         .run();
 }
 
-/// Trivial no-op extension: proves `TerminalMaterialPlugin<M>` works for any
-/// `M: TerminalMaterial`, not just StandardMaterial, without requiring a
+/// Trivial no-op extension: proves the render-world copy updates any
+/// material's texture, not just `StandardMaterial`, without requiring a
 /// custom WGSL shader (all shader hooks default to the base material's).
 #[derive(Asset, AsBindGroup, Clone, Default, TypePath)]
 struct NoExtension {}
@@ -69,11 +73,6 @@ struct NoExtension {}
 impl MaterialExtension for NoExtension {}
 
 type ScreenBMaterial = ExtendedMaterial<StandardMaterial, NoExtension>;
-
-// No `impl TerminalMaterial for ScreenBMaterial` needed: the library
-// provides a blanket impl for any `ExtendedMaterial<StandardMaterial, E>`
-// (see bevy_plugin.rs) — orphan rules require it to live there, since
-// `ExtendedMaterial` is foreign to this example crate.
 
 /// Marker for the StandardMaterial screen (left).
 #[derive(Component)]
@@ -149,7 +148,7 @@ fn setup(
         TerminalInput::default(),
     ));
 
-    // --- Screen B: custom ExtendedMaterial, touched via TerminalMaterialPlugin ---
+    // --- Screen B: custom ExtendedMaterial, updated via the render-world copy ---
     let texture_b = TerminalTexture::create(
         24,
         8,
@@ -218,9 +217,9 @@ fn update_screen_a(
 }
 
 /// Same zero-plumbing pattern, on a screen using a custom ExtendedMaterial.
-/// The only extra setup was `TerminalMaterialPlugin::<ScreenBMaterial>`
-/// (registered once in `main`) — this draw system itself needs nothing more
-/// than the StandardMaterial screen's.
+/// No terminal-specific setup was needed at all beyond the ordinary bevy
+/// `MaterialPlugin` registration in `main` - this draw system needs
+/// nothing more than the StandardMaterial screen's.
 fn update_screen_b(
     mut screens: Query<&mut Tui, With<ScreenB>>,
     time: Res<Time>,
@@ -242,7 +241,7 @@ fn update_screen_b(
                 .split(inner);
         frame.render_widget(
             Paragraph::new(format!(
-                "TerminalMaterialPlugin<M>\nclicks {}",
+                "any material, zero touching\nclicks {}",
                 clicks.b
             ))
             .style(Style::default().fg(TuiColor::White)),

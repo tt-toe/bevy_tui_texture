@@ -14,10 +14,13 @@ description = "A Bevy plugin for rendering terminal-style UIs using ratatui and 
 repository = "https://github.com/tt-toe/bevy_tui_texture"
 
 [features]
-default = ["keyboard_input", "mouse_input", "ratatui_backend"]
+default = ["2d", "3d", "keyboard_input", "mouse_input"]
+# 2D UI terminals (TuiUi / ImageNode path)
+2d = ["bevy/bevy_ui_render", "bevy/bevy_sprite", "bevy/bevy_sprite_render"]
+# 3D mesh terminals (world-quad spawning, AttachTerminal, raycast input)
+3d = ["bevy/bevy_pbr", "bevy/bevy_picking", "bevy/mesh_picking"]
 keyboard_input = []
 mouse_input = []
-ratatui_backend = ["dep:ratatui"]
 bold_italic_fonts = []
 emoji = ["dep:unicode-properties"]
 
@@ -48,21 +51,16 @@ debug = false
 
 # General
 [dependencies]
+# Core only: no webgl2/x11 (downstream picks its own windowing/backend),
+# no zstd_rust/tonemapping_luts (examples-only, moved to dev-dependencies),
+# no bevy_pbr/bevy_picking/mesh_picking/bevy_ui_render/bevy_sprite* (gated
+# behind this crate's own "2d"/"3d" features below instead of forced on
+# every downstream consumer).
 bevy = { version = "0.19", default-features = false, features = [
-    "zstd_rust",
-    "tonemapping_luts",
     "bevy_render",
     "bevy_core_pipeline",
-    "bevy_pbr",            # For MeshMaterial3d, StandardMaterial
-    "bevy_sprite",
-    "bevy_sprite_render",
-    "bevy_picking",        # For mesh ray casting
-    "mesh_picking",        # For mesh_picking module
-    "bevy_ui_render",
-    "webgl2",              # WebGL2 backend for wasm
-    "x11"                  # Keep x11 for native Linux
 ]}
-ratatui = { version = "0.30.2", optional = true, default-features = false }
+ratatui = { version = "0.30.2", default-features = false }
 wgpu = { version = "29.0", default-features = false, features = ["wgsl", "webgl"] }
 rustybuzz = "0.20"
 raqote = { version = "0.8", default-features = false }
@@ -87,6 +85,8 @@ getrandom = { version = "0.2", features = ["js"] }
 # Extra bevy features for examples only (the lib's bevy is default-features=false):
 # - bevy_log: without it examples run silently — shader/asset errors invisible
 # - bevy_gltf/bevy_scene + png/jpeg: the retro_crt glTF model
+# - zstd_rust/tonemapping_luts: examples want full tonemapping; not needed by the lib itself
+# - webgl2/x11: windowing/GPU backend choice belongs to the app, not the lib
 bevy = { version = "0.19", default-features = false, features = [
     "bevy_log",
     "bevy_gltf",
@@ -95,6 +95,10 @@ bevy = { version = "0.19", default-features = false, features = [
     "reflect_auto_register",    # spawning WorldAssets panics on unregistered types without this
     "png",
     "jpeg",
+    "zstd_rust",
+    "tonemapping_luts",
+    "webgl2",
+    "x11",
 ] }
 winit = "0.30"
 env_logger = "0.11"

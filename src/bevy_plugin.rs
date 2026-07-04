@@ -1,14 +1,17 @@
 // This module provides a Bevy plugin that integrates BevyTerminalBackend
 // into Bevy applications.
 
-use bevy::pbr::{Material, StandardMaterial};
 use bevy::prelude::*;
+use bevy::render::render_asset::RenderAssets;
 use bevy::render::renderer::{RenderDevice, RenderQueue};
-use tracing::{info, warn};
+use bevy::render::texture::GpuImage;
+use bevy::render::{ExtractSchedule, MainWorld, Render, RenderApp, RenderSystems};
+use std::collections::HashMap;
+use tracing::debug;
 use wgpu;
 
 use crate::input::*;
-use crate::setup::{Tui, TuiSurface};
+use crate::setup::Tui;
 
 /// System sets for organizing terminal systems.
 ///
@@ -127,7 +130,7 @@ impl Plugin for TerminalPlugin {
                 Update,
                 keyboard_input_system.in_set(TerminalSystemSet::Input),
             );
-            info!("Keyboard input enabled");
+            debug!("Keyboard input enabled");
         }
 
         #[cfg(feature = "mouse_input")]
@@ -139,7 +142,7 @@ impl Plugin for TerminalPlugin {
                     .in_set(TerminalSystemSet::Input),
             );
 
-            info!("Unified mouse input enabled (2D + 3D auto-detection)");
+            debug!("Unified mouse input enabled (2D + 3D auto-detection)");
         }
 
         // Window resize system (always enabled)
@@ -153,23 +156,38 @@ impl Plugin for TerminalPlugin {
                 Update,
                 terminal_focus_system.in_set(TerminalSystemSet::Input),
             );
-            info!("Auto-focus (Tab cycling) enabled");
+            debug!("Auto-focus (Tab cycling) enabled");
         }
 
-        // Plugin-owned GPU plumbing for the `Tui` component: collects
-        // pending async copies, starts new renders, and touches
-        // StandardMaterial - all so user drawing systems can take zero
-        // render-resource parameters.
+        // Plugin-owned GPU plumbing for the `Tui` component: renders dirty
+        // terminals into their library-owned texture, so user drawing
+        // systems can take zero render-resource parameters. The actual
+        // `Image`/`GpuImage` update happens in the render world - see
+        // `extract_tui_copies` / `copy_tui_textures` below.
         app.add_systems(Update, gpu_flush_system.in_set(TerminalSystemSet::Render));
 
         // Attaching a Tui to an existing mesh. Runs early so the same-frame
         // Render pass sees the swapped material.
+        #[cfg(feature = "3d")]
         app.add_systems(
             Update,
             crate::setup::attach_terminal_system.in_set(TerminalSystemSet::Input),
         );
 
-        info!("TerminalPlugin initialized with input handling");
+        // Render-world half of the GPU->GPU copy: extract which terminals
+        // were re-rendered this frame, then copy their library-owned
+        // texture into the destination `GpuImage`. Absent (no render
+        // sub-app) in configurations without a rendering backend, e.g. some
+        // headless test setups - silently skip registration there, matching
+        // every other bevy render-world plugin's own convention.
+        if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+            render_app
+                .init_resource::<PendingTuiCopies>()
+                .add_systems(ExtractSchedule, extract_tui_copies)
+                .add_systems(Render, copy_tui_textures.in_set(RenderSystems::Render));
+        }
+
+        debug!("TerminalPlugin initialized with input handling");
     }
 }
 
@@ -189,130 +207,93 @@ pub struct TerminalDimensions {
 // `Tui` GPU plumbing
 // ============================================================================
 
-/// Implemented for material types that can display a terminal texture, so
-/// [`TerminalMaterialPlugin`] knows how to re-point (or just touch) the
-/// material at the `Tui`'s image handle when it changes. This is required
-/// because 3D materials do not observe `Image` asset mutations on their own
-/// (see CLAUDE.md "Common Gotchas" #1) - `Assets::get_mut` must be called
-/// with a real field write to reliably mark the asset changed.
-pub trait TerminalMaterial: Material {
-    /// Point (or re-point) this material at the terminal's texture.
-    fn set_terminal_texture(&mut self, image: &Handle<Image>);
-}
-
-impl TerminalMaterial for StandardMaterial {
-    fn set_terminal_texture(&mut self, image: &Handle<Image>) {
-        self.base_color_texture = Some(image.clone());
-    }
-}
-
-/// Blanket impl for any `ExtendedMaterial<StandardMaterial, E>` (e.g.
-/// retro_crt's `CrtMaterial`). This must live here, in the crate that
-/// defines `TerminalMaterial`: `ExtendedMaterial` is a foreign type, so
-/// downstream crates cannot write this impl themselves (orphan rules only
-/// permit implementing a *local* trait for a foreign type, not the reverse).
-/// Because of this blanket impl, users get `TerminalMaterialPlugin` support
-/// for any `ExtendedMaterial<StandardMaterial, _>` for free - no manual
-/// `TerminalMaterial` impl needed.
-impl<E: bevy::pbr::MaterialExtension> TerminalMaterial
-    for bevy::pbr::ExtendedMaterial<StandardMaterial, E>
-{
-    fn set_terminal_texture(&mut self, image: &Handle<Image>) {
-        self.base.base_color_texture = Some(image.clone());
-    }
-}
-
-/// Plugin-owned GPU flush for every [`Tui`](crate::setup::Tui) entity.
-/// Registered automatically by [`TerminalPlugin`] in
-/// `TerminalSystemSet::Render`. For each `Tui`:
-///
-/// 1. If a pending async copy exists: poll it; if ready, copy into the
-///    `Image` asset and unmap. Runs regardless of whether `draw()` was
-///    called this frame, so static content completes without the user
-///    calling `draw()` again.
-/// 2. If dirty and no pending copy: render to the GPU texture and start a
-///    new async copy; clear dirty.
-/// 3. If the `Image` was updated this frame, touch `StandardMaterial` for
-///    every [`TuiSurface`](crate::setup::TuiSurface) pointing at this `Tui`.
-///    This is hardcoded here (not through the generic
-///    [`TerminalMaterialPlugin`] mechanism) because `StandardMaterial` is
-///    the overwhelmingly common case, and a direct touch avoids the
-///    scheduling overhead of a separate per-type system. Custom/extended
-///    material types opt in via `TerminalMaterialPlugin::<M>`.
+/// Plugin-owned GPU flush for every [`Tui`] entity. Registered automatically
+/// by [`TerminalPlugin`] in `TerminalSystemSet::Render`. If dirty, renders
+/// into the library-owned texture and marks a copy pending; see
+/// [`Tui::flush`](crate::setup::Tui) for details. No material touching
+/// happens here or anywhere else - the render-world copy
+/// (`copy_tui_textures`, below) writes directly into the exact texture the
+/// destination material's bind group already references, so there is no
+/// asset mutation to react to and nothing to re-touch.
 pub fn gpu_flush_system(
-    mut terminals: Query<(Entity, &mut Tui)>,
-    surfaces: Query<(&TuiSurface, &MeshMaterial3d<StandardMaterial>)>,
+    mut terminals: Query<&mut Tui>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
-    mut images: ResMut<Assets<Image>>,
-    mut std_materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    for (entity, mut tui) in &mut terminals {
-        let applied = tui.flush(&render_device, &render_queue, &mut images);
-        if !applied {
-            continue;
-        }
+    for mut tui in &mut terminals {
+        tui.flush(&render_device, &render_queue);
+    }
+}
 
-        for (surface, material_handle) in &surfaces {
-            if surface.tui != entity {
-                continue;
-            }
-            if let Some(mut material) = std_materials.get_mut(&material_handle.0) {
-                material.set_terminal_texture(tui.image_handle());
-            }
+// ============================================================================
+// Render-world GPU->GPU copy (replaces the old CPU readback entirely)
+// ============================================================================
+
+/// One outstanding texture-to-texture copy, keyed by destination `Image`
+/// asset id in [`PendingTuiCopies`]. Persists across render frames until
+/// performed - the sole retry mechanism for "destination `GpuImage` not
+/// prepared yet" (see `copy_tui_textures`).
+struct PendingTuiCopy {
+    source: wgpu::Texture,
+    size: wgpu::Extent3d,
+}
+
+/// Render-world resource: terminals whose library-owned texture was
+/// re-rendered this frame (or a prior frame, if the destination `GpuImage`
+/// wasn't ready yet) and still need their copy performed.
+#[derive(Resource, Default)]
+struct PendingTuiCopies(HashMap<AssetId<Image>, PendingTuiCopy>);
+
+/// Extract system: drains each `Tui`'s pending-copy flag (set by
+/// [`gpu_flush_system`] via [`Tui::flush`](crate::setup::Tui::flush)) into
+/// the render-world [`PendingTuiCopies`] map. Runs in the render world but
+/// mutates the main world through [`MainWorld`] (rather than the read-only
+/// `Extract<Query>>`) because clearing the flag - so a static terminal's
+/// next frame doesn't re-push the same copy - requires `&mut Tui`.
+fn extract_tui_copies(mut main_world: ResMut<MainWorld>, mut pending: ResMut<PendingTuiCopies>) {
+    let mut query = main_world.query::<&mut Tui>();
+    for mut tui in query.iter_mut(&mut main_world) {
+        if let Some((source, dest, size)) = tui.take_copy_pending() {
+            pending.0.insert(dest, PendingTuiCopy { source, size });
         }
     }
 }
 
-/// Generic per-material-type touch system for [`Tui`] surfaces using a
-/// custom material (e.g. an `ExtendedMaterial`-based shader). Register once
-/// per material type:
-///
-/// ```ignore
-/// app.add_plugins(TerminalMaterialPlugin::<CrtMaterial>::default());
-/// ```
-///
-/// Do not register this for `StandardMaterial` - [`gpu_flush_system`]
-/// already handles it directly (see its doc comment for the performance
-/// rationale). Doing so anyway is harmless (the asset is simply touched
-/// twice); a warning is logged when the plugin is built.
-pub struct TerminalMaterialPlugin<M: TerminalMaterial>(std::marker::PhantomData<M>);
-
-impl<M: TerminalMaterial> Default for TerminalMaterialPlugin<M> {
-    fn default() -> Self {
-        Self(std::marker::PhantomData)
-    }
-}
-
-impl<M: TerminalMaterial> Plugin for TerminalMaterialPlugin<M> {
-    fn build(&self, app: &mut App) {
-        if std::any::TypeId::of::<M>() == std::any::TypeId::of::<StandardMaterial>() {
-            warn!(
-                "TerminalMaterialPlugin::<StandardMaterial> registered explicitly; \
-                 gpu_flush_system already touches StandardMaterial directly, so this \
-                 will touch it a second time (harmless, just wasted work)."
-            );
-        }
-        app.add_systems(
-            Update,
-            touch_terminal_material_system::<M>.in_set(TerminalSystemSet::Render),
-        );
-    }
-}
-
-fn touch_terminal_material_system<M: TerminalMaterial>(
-    terminals: Query<&Tui>,
-    surfaces: Query<(&TuiSurface, &MeshMaterial3d<M>)>,
-    mut materials: ResMut<Assets<M>>,
+/// Render-world system: performs every pending GPU->GPU copy queued by
+/// [`extract_tui_copies`], in [`RenderSystems::Render`] (after
+/// [`RenderSystems::PrepareAssets`], so newly created destination
+/// `GpuImage`s are already prepared). A destination not yet prepared (can
+/// happen on a terminal's very first frame) is left in the map and retried
+/// next frame - it is never dropped.
+fn copy_tui_textures(
+    mut pending: ResMut<PendingTuiCopies>,
+    gpu_images: Res<RenderAssets<GpuImage>>,
+    render_device: Res<RenderDevice>,
+    render_queue: Res<RenderQueue>,
 ) {
-    for (surface, material_handle) in &surfaces {
-        let Ok(tui) = terminals.get(surface.tui) else {
-            continue;
+    if pending.0.is_empty() {
+        return;
+    }
+
+    let mut encoder = render_device
+        .wgpu_device()
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Tui GPU->GPU Copy Encoder"),
+        });
+
+    pending.0.retain(|dest, copy| {
+        let Some(gpu_image) = gpu_images.get(*dest) else {
+            return true; // destination GpuImage not prepared yet - retry next frame
         };
-        if let Some(mut material) = materials.get_mut(&material_handle.0) {
-            material.set_terminal_texture(tui.image_handle());
-        }
-    }
+        encoder.copy_texture_to_texture(
+            copy.source.as_image_copy(),
+            gpu_image.texture.as_image_copy(),
+            copy.size,
+        );
+        false // performed - drop from the pending map
+    });
+
+    render_queue.0.submit(Some(encoder.finish()));
 }
 
 /// Copy GPU texture to Bevy Image with proper padding alignment.
