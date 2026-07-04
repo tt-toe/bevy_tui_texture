@@ -33,8 +33,10 @@
 //!
 //! ## Architecture Highlights
 //!
+//! - Uses `TerminalBundle::ui()` - the terminal is a `Tui` Component on its
+//!   own entity, queried directly (no wrapping Resource, zero
+//!   render-resource parameters in the draw system)
 //! - Uses `TerminalEvent` system for unified input handling
-//! - Demonstrates proper state management with `Resource`
 //! - Shows coordinate mapping from pixels to terminal cells
 //! - Illustrates proper system ordering with `TerminalSystemSet`
 
@@ -75,10 +77,13 @@ fn main() {
         .run();
 }
 
+/// Marker for the terminal entity - its `Tui` is queried directly, no
+/// wrapping Resource needed.
+#[derive(Component)]
+struct CatalogTerminal;
+
 #[derive(Resource)]
 struct WidgetCatalogState {
-    terminal: SimpleTerminal2D,
-
     selected_tab: usize,
     list_state: ListState,
     selected_button: Option<usize>,
@@ -100,6 +105,8 @@ fn setup_terminal(
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
     mut images: ResMut<Assets<Image>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     info!("Setting up widget catalog terminal with easy setup API...");
 
@@ -118,32 +125,39 @@ fn setup_terminal(
     // Spawn camera
     commands.spawn(Camera2d);
 
-    // Create terminal with easy setup API
-    let terminal = SimpleTerminal2D::create_and_spawn(
+    // Create terminal with the new bundle API
+    let mut ctx = TerminalSpawnCtx {
+        render_device: &render_device,
+        render_queue: &render_queue,
+        images: &mut images,
+        meshes: &mut meshes,
+        materials: &mut materials,
+    };
+    let bundle = TerminalBundle::ui(
         COLS,
         ROWS,
         fonts,
-        (0.0, 0.0), // Position at origin
-        true,       // Enable programmatic glyphs
-        true,       // Enable keyboard
-        true,       // Enable mouse
-        &mut commands,
-        &render_device,
-        &render_queue,
-        &mut images,
+        TerminalConfig {
+            programmatic_glyphs: true,
+            keyboard: true,
+            mouse: true,
+            ..default()
+        },
+        &mut ctx,
     )
     .expect("Failed to create terminal");
 
-    let terminal_entity = terminal.entity();
+    let terminal_entity = commands
+        .spawn((bundle, Node::default(), CatalogTerminal))
+        .id();
 
     // Set focus on this terminal
     commands.insert_resource(TerminalFocus {
         focused: Some(terminal_entity),
     });
 
-    // Create state with terminal and initial values
+    // Create state with initial values
     commands.insert_resource(WidgetCatalogState {
-        terminal,
         selected_tab: 0,
         list_state: ListState::default().with_selected(Some(0)),
         selected_button: None,
@@ -164,7 +178,7 @@ fn setup_terminal(
 fn handle_terminal_events(
     mut events: MessageReader<TerminalEvent>,
     mut state: ResMut<WidgetCatalogState>,
-    query: Query<Entity, With<TerminalComponent>>,
+    query: Query<Entity, With<CatalogTerminal>>,
 ) {
     // Get the terminal entity - only process events for this terminal
     let terminal_entity = match query.single() {
@@ -321,12 +335,13 @@ fn handle_terminal_events(
 }
 
 fn render_terminal(
+    mut screens: Query<&mut Tui, With<CatalogTerminal>>,
     mut state: ResMut<WidgetCatalogState>,
-    render_device: Res<RenderDevice>,
-    render_queue: Res<RenderQueue>,
-    mut images: ResMut<Assets<Image>>,
     time: Res<Time>,
 ) {
+    let Ok(mut term) = screens.single_mut() else {
+        return;
+    };
     // Update sparkline data with random values
     state.sparkline_timer.tick(time.delta());
     if state.sparkline_timer.just_finished() {
@@ -337,12 +352,15 @@ fn render_terminal(
         }
     }
 
+    // Split into a plain `&mut` so `sparkline_data`/`list_state` below can
+    // be borrowed disjointly (one immutably, one mutably) instead of cloned -
+    // `ResMut::deref`/`deref_mut` can't be called twice at once, but a single
+    // `&mut WidgetCatalogState` splits into independent field borrows fine.
+    let state = &mut *state;
     let selected_tab = state.selected_tab;
     let selected_button = state.selected_button;
     let gauge_value = state.gauge_value;
     let counter = state.counter;
-    let sparkline_data = state.sparkline_data.clone();
-    let mut list_state = state.list_state.clone();
     let mouse_position = state.mouse_position;
 
     // Variables to capture layout rectangles
@@ -351,9 +369,7 @@ fn render_terminal(
     let mut list_inner_rect = None;
     let mut gauge_inner_rect = None;
 
-    state
-        .terminal
-        .draw_and_render(&render_device, &render_queue, &mut images, |frame| {
+    term.draw(|frame| {
             let area = frame.area();
 
             let tabs = Tabs::new(vec!["Buttons", "Lists", "Charts", "Interactive", "Glyphs"])
@@ -378,7 +394,7 @@ fn render_terminal(
             let ruler = (0..100)
                 .map(|i| {
                     if i % 10 == 0 {
-                        (i / 10).to_string().chars().next().unwrap()
+                        char::from(b'0' + (i / 10) as u8)
                     } else if i % 5 == 0 {
                         '|'
                     } else {
@@ -401,9 +417,10 @@ fn render_terminal(
                     h_button_rects = h_btn_rects;
                 }
                 1 => {
-                    list_inner_rect = Some(draw_lists_tab(frame, chunks[2], &mut list_state));
+                    list_inner_rect =
+                        Some(draw_lists_tab(frame, chunks[2], &mut state.list_state));
                 }
-                2 => draw_charts_tab(frame, chunks[2], gauge_value, counter, &sparkline_data),
+                2 => draw_charts_tab(frame, chunks[2], gauge_value, counter, &state.sparkline_data),
                 3 => {
                     gauge_inner_rect = Some(draw_interactive_tab(frame, chunks[2], gauge_value));
                 }
@@ -444,7 +461,6 @@ fn render_terminal(
     state.h_button_rects = h_button_rects;
     state.list_inner_rect = list_inner_rect;
     state.gauge_inner_rect = gauge_inner_rect;
-    state.list_state = list_state;
 }
 
 fn draw_buttons_tab(
@@ -544,8 +560,8 @@ fn draw_buttons_tab(
 
     frame.render_widget(info, chunks[4]);
 
-    // Return the button rectangles for hit testing
-    let button_rects = chunks.iter().take(3).cloned().collect();
+    // Return the button rectangles for hit testing (`Rect` is `Copy`)
+    let button_rects = chunks.iter().take(3).copied().collect();
     let h_button_rects = h_chunks.to_vec();
 
     (button_rects, h_button_rects)

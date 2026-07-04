@@ -89,7 +89,7 @@ pub enum TerminalEventType {
 }
 
 /// Modifier keys state.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct KeyModifiers {
     /// Control key pressed
     pub ctrl: bool,
@@ -245,6 +245,23 @@ pub fn keycode_to_char(key: KeyCode, shift: bool) -> Option<char> {
 }
 
 // ============================================================================
+// Event-target remapping
+// ============================================================================
+
+/// Remap a hit-tested / focused entity to the [`Tui`](crate::setup::Tui)
+/// entity it displays, via [`TuiSurface`](crate::setup::TuiSurface).
+///
+/// For library-spawned terminals (`tui == surface`) and for any entity
+/// without a `TuiSurface` component at all, this is the identity -
+/// `TerminalEvent::target` is unchanged. Only attached terminals (see
+/// `AttachTerminal`), where the surface entity (carrying
+/// `TerminalInput`/`TerminalDimensions`, where hit-testing happens) differs
+/// from the `Tui` entity, actually remap.
+fn remap_to_tui(entity: Entity, surfaces: &Query<&crate::setup::TuiSurface>) -> Entity {
+    surfaces.get(entity).map(|s| s.tui).unwrap_or(entity)
+}
+
+// ============================================================================
 // Input Systems
 // ============================================================================
 
@@ -270,6 +287,7 @@ pub fn keyboard_input_system(
     keyboard: Res<ButtonInput<KeyCode>>,
     focus: Res<TerminalFocus>,
     terminals: Query<&TerminalInput>,
+    surfaces: Query<&crate::setup::TuiSurface>,
     mut events: MessageWriter<TerminalEvent>,
 ) {
     // Check if any terminal has focus
@@ -286,6 +304,10 @@ pub fn keyboard_input_system(
         return;
     }
 
+    // `focus.focused` stores the surface entity (where TerminalInput lives);
+    // remap to the Tui entity only for the emitted event's target.
+    let target = remap_to_tui(focused_entity, &surfaces);
+
     // Check for modifier keys
     let modifiers = KeyModifiers {
         ctrl: keyboard.pressed(KeyCode::ControlLeft) || keyboard.pressed(KeyCode::ControlRight),
@@ -298,17 +320,17 @@ pub fn keyboard_input_system(
     for key in keyboard.get_just_pressed() {
         // Emit KeyPress event
         events.write(TerminalEvent {
-            target: focused_entity,
+            target,
             event: TerminalEventType::KeyPress {
                 key: *key,
-                modifiers: modifiers.clone(),
+                modifiers,
             },
         });
 
         // Emit CharInput for printable characters
         if let Some(character) = keycode_to_char(*key, modifiers.shift) {
             events.write(TerminalEvent {
-                target: focused_entity,
+                target,
                 event: TerminalEventType::CharInput { character },
             });
         }
@@ -408,14 +430,14 @@ fn detect_terminal_type(
 #[cfg(feature = "mouse_input")]
 fn bounding_box_hit_test(
     cursor_pos: bevy::math::Vec2,
-    transform: Option<&bevy::transform::components::GlobalTransform>,
+    ui_transform: Option<&bevy::ui::UiGlobalTransform>,
     node: Option<&bevy::ui::Node>,
     computed: Option<&bevy::ui::ComputedNode>,
     dimensions: Option<&crate::bevy_plugin::TerminalDimensions>,
 ) -> Option<HitTestResult> {
     // Get terminal size and scale factor
     // ComputedNode.size is in physical pixels, we need to convert to logical
-    let (width_px, height_px, inverse_scale) = if let Some(comp) = computed {
+    let (width_px, height_px, _inverse_scale) = if let Some(comp) = computed {
         let node_size = comp.unrounded_size();
         // Convert from physical to logical pixels using inverse_scale_factor
         (
@@ -433,62 +455,39 @@ fn bounding_box_hit_test(
     };
 
     // Coordinate system handling for Bevy UI:
-    // - Cursor (input) is in UI coordinates: top-left origin, +Y down, pixels
-    // - GlobalTransform is in world coordinates: center origin, +Y up
-    // - Node.left/top are in UI coordinates: top-left origin, +Y down, pixels
-    //
-    // For UI nodes, we need to use UI coordinate system to match cursor position!
-
-    // Debug: Log all available position information
-    if let Some(t) = transform {
-        let gt = t.translation();
+    // - Cursor (input) is in UI coordinates: top-left origin, +Y down, pixels.
+    // - `UiGlobalTransform` (bevy 0.19's UI-specific transform - plain
+    //   `GlobalTransform` is NOT among `Node`'s required components and is
+    //   simply absent on pure-UI entities) resolves to the same top-left
+    //   origin, +Y down, pixel space as the cursor, but gives the node's
+    //   CENTER - so it works for ANY anchor mode (left/top, right/bottom,
+    //   percent, ...), unlike reading `Node.left`/`Node.top` directly (which
+    //   silently reads 0 for any axis anchored from the opposite edge).
+    let (node_min_x, node_min_y) = if let Some(t) = ui_transform {
+        let center = t.translation;
         debug!(
-            "GlobalTransform (world coords, center origin): ({:.1}, {:.1}, {:.1})",
-            gt.x, gt.y, gt.z
+            "UiGlobalTransform center=({:.1}, {:.1}), size=({:.1}x{:.1})",
+            center.x, center.y, width_px, height_px
         );
-    }
-    if let Some(n) = node {
-        debug!(
-            "Node (UI coords, top-left origin): left={:?}, top={:?}, position_type={:?}",
-            n.left, n.top, n.position_type
-        );
-    }
-    if let Some(c) = computed {
-        debug!(
-            "ComputedNode: physical_size=({:.1}, {:.1}), inverse_scale={:.2} → logical_size=({:.1}, {:.1})",
-            c.unrounded_size().x,
-            c.unrounded_size().y,
-            inverse_scale,
-            width_px,
-            height_px
-        );
-    }
-
-    // Get position in UI coordinates (top-left origin, +Y down)
-    // For UI nodes, use Node.left/top which are in logical pixels
-    let (node_min_x, node_min_y) = if let Some(n) = node {
+        (center.x - width_px / 2.0, center.y - height_px / 2.0)
+    } else if let Some(n) = node {
+        // Fallback only correct for explicitly left/top-anchored nodes.
         let left_px = match n.left {
             bevy::ui::Val::Px(v) => v,
-            bevy::ui::Val::Auto => 0.0,
-            bevy::ui::Val::Percent(_) => 0.0,
             _ => 0.0,
         };
         let top_px = match n.top {
             bevy::ui::Val::Px(v) => v,
-            bevy::ui::Val::Auto => 0.0,
-            bevy::ui::Val::Percent(_) => 0.0,
             _ => 0.0,
         };
-
         debug!(
-            "Hit test using Node: pos=({:.1}, {:.1}), size=({:.1}x{:.1}) (all in logical pixels)",
+            "Hit test using Node.left/top fallback: pos=({:.1}, {:.1}), size=({:.1}x{:.1})",
             left_px, top_px, width_px, height_px
         );
-
         (left_px, top_px)
     } else {
         debug!(
-            "Hit test using fallback: origin with size=({:.1}x{:.1})",
+            "Hit test using origin fallback: size=({:.1}x{:.1})",
             width_px, height_px
         );
         (0.0, 0.0)
@@ -631,27 +630,37 @@ fn ray_cast_hit_test_inner(
 }
 
 #[cfg(feature = "mouse_input")]
-fn emit_mouse_move(entity: Entity, col: u16, row: u16, events: &mut MessageWriter<TerminalEvent>) {
+fn emit_mouse_move(
+    surface_entity: Entity,
+    col: u16,
+    row: u16,
+    surfaces: &Query<&crate::setup::TuiSurface>,
+    events: &mut MessageWriter<TerminalEvent>,
+) {
     events.write(TerminalEvent {
-        target: entity,
+        target: remap_to_tui(surface_entity, surfaces),
         event: TerminalEventType::MouseMove {
             position: (col, row),
         },
     });
 }
 
+/// `old_focus`/`new_focus` are surface entities (what `TerminalFocus` stores,
+/// matching keyboard_input_system's `TerminalInput` lookup); the emitted
+/// `TerminalEvent::target` is remapped to each side's Tui entity.
 #[cfg(feature = "mouse_input")]
 fn emit_focus_events(
     new_focus: Entity,
     old_focus: &mut Option<Entity>,
     focus_button: MouseButton,
     button: MouseButton,
+    surfaces: &Query<&crate::setup::TuiSurface>,
     events: &mut MessageWriter<TerminalEvent>,
 ) {
     if button == focus_button && *old_focus != Some(new_focus) {
         if let Some(old_entity) = *old_focus {
             events.write(TerminalEvent {
-                target: old_entity,
+                target: remap_to_tui(old_entity, surfaces),
                 event: TerminalEventType::FocusLost,
             });
         }
@@ -659,34 +668,38 @@ fn emit_focus_events(
         *old_focus = Some(new_focus);
 
         events.write(TerminalEvent {
-            target: new_focus,
+            target: remap_to_tui(new_focus, surfaces),
             event: TerminalEventType::FocusGained,
         });
     }
 }
 
 #[cfg(feature = "mouse_input")]
+#[allow(clippy::too_many_arguments)]
 fn emit_button_events(
-    entity: Entity,
+    surface_entity: Entity,
     col: u16,
     row: u16,
     buttons: &ButtonInput<MouseButton>,
     focus: &mut TerminalFocus,
     config: &TerminalInputConfig,
+    surfaces: &Query<&crate::setup::TuiSurface>,
     events: &mut MessageWriter<TerminalEvent>,
 ) {
+    let target = remap_to_tui(surface_entity, surfaces);
     for button in [MouseButton::Left, MouseButton::Right, MouseButton::Middle] {
         if buttons.just_pressed(button) {
             emit_focus_events(
-                entity,
+                surface_entity,
                 &mut focus.focused,
                 config.focus_button,
                 button,
+                surfaces,
                 events,
             );
 
             events.write(TerminalEvent {
-                target: entity,
+                target,
                 event: TerminalEventType::MousePress {
                     button,
                     position: (col, row),
@@ -696,7 +709,7 @@ fn emit_button_events(
 
         if buttons.just_released(button) {
             events.write(TerminalEvent {
-                target: entity,
+                target,
                 event: TerminalEventType::MouseRelease {
                     button,
                     position: (col, row),
@@ -738,14 +751,19 @@ pub fn mouse_input_system(
     terminals: Query<(
         Entity,
         &TerminalInput,
-        &GlobalTransform,
+        // `GlobalTransform` is required for 3D mesh ray-casting but is NOT
+        // among `Node`'s required components - pure-UI entities don't have
+        // it, hence Option here (see `UiGlobalTransform` below for those).
+        Option<&GlobalTransform>,
         Option<&Mesh2d>,
         Option<&Mesh3d>,
         Option<&bevy::ui::Node>,
         Option<&bevy::ui::ComputedNode>,
+        Option<&bevy::ui::UiGlobalTransform>,
         Option<&crate::bevy_plugin::TerminalDimensions>,
         Option<&bevy::ui::ZIndex>,
     )>,
+    surfaces: Query<&crate::setup::TuiSurface>,
     mut events: MessageWriter<TerminalEvent>,
 ) {
     let cursor_pos = match cursor.position {
@@ -782,7 +800,7 @@ pub fn mouse_input_system(
 
     let mut hit_candidates: Vec<(Entity, HitTestResult, SortKey)> = Vec::new();
 
-    for (entity, input, transform, mesh2d, mesh3d, node, computed, dimensions, z_index) in
+    for (entity, input, transform, mesh2d, mesh3d, node, computed, ui_transform, dimensions, z_index) in
         terminals.iter()
     {
         if !input.mouse {
@@ -795,6 +813,9 @@ pub fn mouse_input_system(
             TerminalType::Mesh3D => {
                 // Get the inner Handle<Mesh> from either Mesh3d or Mesh2d
                 let mesh_handle = mesh3d.map(|m| &m.0).or_else(|| mesh2d.map(|m| &m.0));
+                let Some(transform) = transform else {
+                    continue; // no GlobalTransform - can't ray-cast
+                };
 
                 // Test cameras front-to-back; the first camera whose ray hits
                 // this terminal determines its hit (and camera priority).
@@ -816,7 +837,7 @@ pub fn mouse_input_system(
             }
             TerminalType::UI2D => {
                 if let Some(hit_result) =
-                    bounding_box_hit_test(cursor_pos, Some(transform), node, computed, dimensions)
+                    bounding_box_hit_test(cursor_pos, ui_transform, node, computed, dimensions)
                 {
                     let z = z_index.map(|z| z.0).unwrap_or(0);
                     hit_candidates.push((entity, hit_result, SortKey::ZIndex(z)));
@@ -860,7 +881,13 @@ pub fn mouse_input_system(
     }
 
     if let Some((entity, hit_result, _sort_key)) = hit_candidates.first() {
-        emit_mouse_move(*entity, hit_result.col, hit_result.row, &mut events);
+        emit_mouse_move(
+            *entity,
+            hit_result.col,
+            hit_result.row,
+            &surfaces,
+            &mut events,
+        );
         emit_button_events(
             *entity,
             hit_result.col,
@@ -868,6 +895,7 @@ pub fn mouse_input_system(
             &buttons,
             &mut focus,
             &config,
+            &surfaces,
             &mut events,
         );
     }
@@ -878,7 +906,8 @@ pub fn mouse_input_system(
 /// Listens for window resize events and forwards them to all terminals.
 pub fn window_resize_system(
     mut resize_events: MessageReader<bevy::window::WindowResized>,
-    terminals: Query<Entity, With<crate::TerminalComponent>>,
+    terminals: Query<Entity, With<crate::setup::Tui>>,
+    surfaces: Query<&crate::setup::TuiSurface>,
     mut events: MessageWriter<TerminalEvent>,
 ) {
     for resize_event in resize_events.read() {
@@ -887,7 +916,7 @@ pub fn window_resize_system(
         // Emit resize event for all terminals
         for entity in terminals.iter() {
             events.write(TerminalEvent {
-                target: entity,
+                target: remap_to_tui(entity, &surfaces),
                 event: TerminalEventType::Resize { new_size },
             });
         }
@@ -902,6 +931,7 @@ pub fn terminal_focus_system(
     keyboard: Res<ButtonInput<KeyCode>>,
     mut focus: ResMut<TerminalFocus>,
     terminals: Query<(Entity, &TerminalInput)>,
+    surfaces: Query<&crate::setup::TuiSurface>,
     mut events: MessageWriter<TerminalEvent>,
 ) {
     // Check if Tab was just pressed
@@ -943,7 +973,7 @@ pub fn terminal_focus_system(
         // Emit FocusLost for old focus
         if let Some(old_focus) = focus.focused {
             events.write(TerminalEvent {
-                target: old_focus,
+                target: remap_to_tui(old_focus, &surfaces),
                 event: TerminalEventType::FocusLost,
             });
         }
@@ -953,7 +983,7 @@ pub fn terminal_focus_system(
 
         // Emit FocusGained
         events.write(TerminalEvent {
-            target: next_entity,
+            target: remap_to_tui(next_entity, &surfaces),
             event: TerminalEventType::FocusGained,
         });
     }

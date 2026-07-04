@@ -2,6 +2,7 @@
 name = "bevy_tui_texture"
 version = "0.3.0"
 edition = "2024"
+rust-version = "1.92"
 authors = ["TTT"]
 autoexamples = false
 license = "MIT"
@@ -73,6 +74,7 @@ evictor = { version = "0.5", default-features = false }
 unicode-width = "0.2"
 web-time = "1.1"
 tracing = "0.1"
+thiserror = "2.0"
 unicode-properties = { version = "0.1", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -139,6 +141,9 @@ path = "examples/wasm_serve.rs"
 [[example]]
 name = "world_terminal"
 path = "examples/world_terminal.rs"
+[[example]]
+name = "tui_component"
+path = "examples/tui_component.rs"
 [[example]]
 name = "retro_crt"
 path = "examples/retro_crt.rs"

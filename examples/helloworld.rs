@@ -10,8 +10,10 @@ use ratatui::style::Color as RatatuiColor;
 use ratatui::widgets::*;
 use std::sync::Arc;
 
-#[derive(Resource)]
-struct Terminal(SimpleTerminal2D);
+/// Marker for the terminal entity - its `Tui` is queried directly, no
+/// wrapping Resource needed.
+#[derive(Component)]
+struct HelloTerminal;
 
 fn main() {
     App::new()
@@ -27,11 +29,13 @@ fn setup(
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
     mut images: ResMut<Assets<Image>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     let fonts = {
         let font_data = SystemSource::new()
             .select_best_match(&[FamilyName::Monospace], &Properties::new())
-            .unwrap()
+            .expect("No monospace font found on this system")
             .load()
             .expect("Failed to load font")
             .copy_font_data()
@@ -42,41 +46,42 @@ fn setup(
             16,
         ))
     };
-    // Create termial
-    let terminal = SimpleTerminal2D::create_and_spawn(
+
+    let mut ctx = TerminalSpawnCtx {
+        render_device: &render_device,
+        render_queue: &render_queue,
+        images: &mut images,
+        meshes: &mut meshes,
+        materials: &mut materials,
+    };
+    let bundle = TerminalBundle::ui(
         80,
         25,
         fonts,
-        (0.0, 0.0),
-        true,
-        false,
-        false,
-        &mut commands,
-        &render_device,
-        &render_queue,
-        &mut images,
+        TerminalConfig {
+            keyboard: false,
+            mouse: false,
+            ..default()
+        },
+        &mut ctx,
     )
     .expect("Failed to create terminal");
-    // Spawn Camera
+
+    commands.spawn((bundle, Node::default(), HelloTerminal));
     commands.spawn(Camera2d);
-    commands.insert_resource(Terminal(terminal));
 }
 
-fn render_terminal(
-    mut terminal: ResMut<Terminal>,
-    render_device: Res<RenderDevice>,
-    render_queue: Res<RenderQueue>,
-    mut images: ResMut<Assets<Image>>,
-) {
-    terminal
-        .0
-        .draw_and_render(&render_device, &render_queue, &mut images, |frame| {
-            let area = frame.area();
-            // Simple "Hello, World!" paragraph
-            let text = Paragraph::new("Hello, World!")
-                .style(Style::default().fg(RatatuiColor::Green).bold())
-                .alignment(Alignment::Center)
-                .block(Block::bordered().title("Minimal Example"));
-            frame.render_widget(text, area);
-        });
+fn render_terminal(mut screens: Query<&mut Tui, With<HelloTerminal>>) {
+    let Ok(mut term) = screens.single_mut() else {
+        return;
+    };
+    term.draw(|frame| {
+        let area = frame.area();
+        // Simple "Hello, World!" paragraph
+        let text = Paragraph::new("Hello, World!")
+            .style(Style::default().fg(RatatuiColor::Green).bold())
+            .alignment(Alignment::Center)
+            .block(Block::bordered().title("Minimal Example"));
+        frame.render_widget(text, area);
+    });
 }

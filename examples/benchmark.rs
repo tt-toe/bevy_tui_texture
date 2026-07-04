@@ -39,10 +39,10 @@ fn main() {
         .run();
 }
 
-#[derive(Resource)]
-struct BenchmarkTerminal {
-    terminal: SimpleTerminal2D,
-}
+/// Marker for the benchmark terminal entity - its `Tui` is queried
+/// directly, no wrapping Resource needed.
+#[derive(Component)]
+struct BenchmarkTerminal;
 
 #[derive(Resource, Default)]
 struct BenchmarkState {
@@ -56,6 +56,8 @@ fn setup(
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
     mut images: ResMut<Assets<Image>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     let font_data = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -64,35 +66,52 @@ fn setup(
     let font = TerminalFont::new(font_data).expect("Failed to load font");
     let fonts = Arc::new(Fonts::new(font, 16));
 
-    let terminal = SimpleTerminal2D::create_and_spawn(
+    let mut ctx = TerminalSpawnCtx {
+        render_device: &render_device,
+        render_queue: &render_queue,
+        images: &mut images,
+        meshes: &mut meshes,
+        materials: &mut materials,
+    };
+    let bundle = TerminalBundle::ui(
         COLS,
         ROWS,
         fonts,
-        (10.0, 10.0),
-        true,
-        false,
-        false, // NO INPUT - pure rendering benchmark
-        &mut commands,
-        &render_device,
-        &render_queue,
-        &mut images,
+        TerminalConfig {
+            keyboard: false,
+            mouse: false, // NO INPUT - pure rendering benchmark
+            ..default()
+        },
+        &mut ctx,
     )
     .expect("Failed to create terminal");
 
+    commands.spawn((
+        bundle,
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px(10.0),
+            top: Val::Px(10.0),
+            ..default()
+        },
+        BenchmarkTerminal,
+    ));
+
     commands.spawn(Camera2d);
-    commands.insert_resource(BenchmarkTerminal { terminal });
     commands.insert_resource(BenchmarkState::default());
 }
 
+/// Zero render-resource parameters: the plugin's `gpu_flush_system` owns
+/// the GPU render + async copy.
 fn render_benchmark(
-    mut terminal_res: ResMut<BenchmarkTerminal>,
+    mut screens: Query<&mut Tui, With<BenchmarkTerminal>>,
     mut state: ResMut<BenchmarkState>,
-    render_device: Res<RenderDevice>,
-    render_queue: Res<RenderQueue>,
-    mut images: ResMut<Assets<Image>>,
     time: Res<Time>,
     diagnostics: Res<DiagnosticsStore>,
 ) {
+    let Ok(mut term) = screens.single_mut() else {
+        return;
+    };
     state.frame_count += 1;
     state.scroll_offset += time.delta_secs() * 20.0;
 
@@ -107,9 +126,7 @@ fn render_benchmark(
     // Get time in milliseconds for better random seed
     let time_ms = (time.elapsed_secs() * 1000.0) as u32;
 
-    terminal_res
-        .terminal
-        .draw_and_render(&render_device, &render_queue, &mut images, |frame| {
+    term.draw(|frame| {
             let area = frame.area();
 
             // Mode display

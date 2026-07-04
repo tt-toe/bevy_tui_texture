@@ -177,7 +177,11 @@ impl TerminalBuilder {
     ///
     /// This is synchronous (unlike the original async Builder).
     /// Device and Queue are borrowed, not owned.
-    pub fn build(self, device: &Device, _queue: &Queue) -> Result<BevyTerminalBackend, String> {
+    pub fn build(
+        self,
+        device: &Device,
+        _queue: &Queue,
+    ) -> Result<BevyTerminalBackend, crate::TerminalError> {
         use crate::backend::{
             build_text_bg_compositor, build_text_fg_compositor, build_wgpu_state, CACHE_HEIGHT,
             CACHE_WIDTH,
@@ -356,8 +360,11 @@ impl BevyTerminalBackend {
     ///
     /// # Returns
     /// * `Ok(())` on success
-    /// * `Err(String)` if any glyph fails to render
-    pub fn populate_programmatic_glyphs(&mut self, queue: &Queue) -> Result<(), String> {
+    /// * `Err(TerminalError::GlyphPopulation)` if any glyph fails to render
+    pub fn populate_programmatic_glyphs(
+        &mut self,
+        queue: &Queue,
+    ) -> Result<(), crate::TerminalError> {
         use crate::backend::programmatic_glyphs::{
             all_programmatic_glyphs, render_programmatic_glyph,
         };
@@ -473,8 +480,6 @@ impl BevyTerminalBackend {
     /// **IMPORTANT**: `flush()` must be called before this method to prepare vertex data.
     pub fn render_to_texture(&mut self, device: &Device, queue: &Queue, target: &TextureView) {
         use ratatui::backend::Backend;
-        use std::mem::size_of;
-        use std::num::NonZeroU64;
         use wgpu::util::{BufferInitDescriptor, DeviceExt};
         use wgpu::{
             BufferUsages, CommandEncoderDescriptor, IndexFormat, LoadOp, Operations,
@@ -527,22 +532,19 @@ impl BevyTerminalBackend {
         }
 
         if !self.text_vertices.is_empty() {
-            // Update screen size uniform
-            {
-                let mut uniforms = queue
-                    .write_buffer_with(
-                        &self.text_screen_size_buffer,
-                        0,
-                        NonZeroU64::new(size_of::<[f32; 4]>() as u64).unwrap(),
-                    )
-                    .unwrap();
-                uniforms.copy_from_slice(bytemuck::cast_slice(&[
+            // Update screen size uniform. `write_buffer` (not
+            // `write_buffer_with`) avoids the `Option`/`NonZeroU64` dance -
+            // it takes the bytes directly and cannot fail at this call site.
+            queue.write_buffer(
+                &self.text_screen_size_buffer,
+                0,
+                bytemuck::cast_slice(&[
                     bounds.width as f32 * self.fonts.min_width_px() as f32,
                     bounds.height as f32 * self.fonts.height_px() as f32,
                     0.0,
                     0.0,
-                ]));
-            }
+                ]),
+            );
 
             // Create vertex and index buffers
             let bg_vertices = device.create_buffer_init(&BufferInitDescriptor {

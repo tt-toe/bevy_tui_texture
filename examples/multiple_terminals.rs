@@ -39,10 +39,11 @@
 //!
 //! ## Architecture Highlights
 //!
-//! - Uses `SimpleTerminal2D::create_and_spawn()` for each terminal
-//! - Demonstrates entity-based terminal identification
+//! - Uses `TerminalBundle::ui()` for each terminal - each terminal is a
+//!   `Tui` Component on its own entity, no wrapping Resource
+//! - Demonstrates entity-based terminal identification via marker components
 //! - Shows how to route `TerminalEvent` to specific terminals
-//! - Illustrates proper resource management for multiple terminals
+//! - Each terminal's draw system takes zero render-resource parameters
 
 use bevy::prelude::*;
 use bevy::render::renderer::{RenderDevice, RenderQueue};
@@ -69,22 +70,18 @@ fn main() {
         .add_plugins(TerminalPlugin::default())
         .add_systems(Startup, setup_terminals)
         .add_systems(Update, handle_events.in_set(TerminalSystemSet::UserUpdate))
-        .add_systems(Update, update_terminals.in_set(TerminalSystemSet::Render))
+        .add_systems(
+            Update,
+            (
+                update_interactive,
+                update_log,
+                update_status,
+                update_overlap_back,
+                update_overlap_front,
+            )
+                .in_set(TerminalSystemSet::Render),
+        )
         .run();
-}
-
-// Resource to hold all terminal states
-#[derive(Resource)]
-struct TerminalSet {
-    // Interactive terminal
-    interactive: SimpleTerminal2D,
-    // Display-only log terminal
-    log: SimpleTerminal2D,
-    // Status terminal
-    status: SimpleTerminal2D,
-    // Overlapping terminals (bottom-right)
-    overlap_back: SimpleTerminal2D,
-    overlap_front: SimpleTerminal2D,
 }
 
 // App state for interactive terminal
@@ -116,6 +113,8 @@ fn setup_terminals(
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
     mut images: ResMut<Assets<Image>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     info!("Setting up multiple terminals with easy setup API...");
 
@@ -156,105 +155,140 @@ fn setup_terminals(
     // Create camera FIRST
     commands.spawn(Camera2d);
 
+    let mut ctx = TerminalSpawnCtx {
+        render_device: &render_device,
+        render_queue: &render_queue,
+        images: &mut images,
+        meshes: &mut meshes,
+        materials: &mut materials,
+    };
+
     // Create interactive terminal (top-left) with full input
-    let interactive = SimpleTerminal2D::create_and_spawn(
+    let interactive_bundle = TerminalBundle::ui(
         INTERACTIVE_COL,
         INTERACTIVE_ROW,
         fonts.clone(),
-        interactive_pos,
-        true, // Enable programmatic glyphs
-        true, // Enable keyboard
-        true, // Enable mouse
-        &mut commands,
-        &render_device,
-        &render_queue,
-        &mut images,
+        TerminalConfig {
+            programmatic_glyphs: true,
+            keyboard: true,
+            mouse: true,
+            ..default()
+        },
+        &mut ctx,
     )
     .expect("Failed to create interactive terminal");
-    commands
-        .entity(interactive.entity())
-        .insert(InteractiveTerminal);
+    commands.spawn((
+        interactive_bundle,
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px(interactive_pos.0),
+            top: Val::Px(interactive_pos.1),
+            ..default()
+        },
+        InteractiveTerminal,
+    ));
 
     // Create log terminal (top-right) with mouse input only
-    let log = SimpleTerminal2D::create_and_spawn(
+    let log_bundle = TerminalBundle::ui(
         LOG_COL,
         LOG_ROW,
         fonts.clone(),
-        log_pos,
-        false, // No programmatic glyphs needed
-        false, // No keyboard
-        true,  // Enable mouse
-        &mut commands,
-        &render_device,
-        &render_queue,
-        &mut images,
+        TerminalConfig {
+            programmatic_glyphs: false,
+            keyboard: false,
+            mouse: true,
+            ..default()
+        },
+        &mut ctx,
     )
     .expect("Failed to create log terminal");
-    commands.entity(log.entity()).insert(LogTerminal);
+    commands.spawn((
+        log_bundle,
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px(log_pos.0),
+            top: Val::Px(log_pos.1),
+            ..default()
+        },
+        LogTerminal,
+    ));
 
     // Create status terminal (bottom-left) with mouse input
-    let status = SimpleTerminal2D::create_and_spawn(
+    let status_bundle = TerminalBundle::ui(
         STATUS_COL,
         STATUS_ROW,
         fonts.clone(),
-        status_pos,
-        false, // No programmatic glyphs needed
-        false, // No keyboard
-        true,  // Enable mouse
-        &mut commands,
-        &render_device,
-        &render_queue,
-        &mut images,
+        TerminalConfig {
+            programmatic_glyphs: false,
+            keyboard: false,
+            mouse: true,
+            ..default()
+        },
+        &mut ctx,
     )
     .expect("Failed to create status terminal");
-    commands.entity(status.entity()).insert(StatusTerminal);
+    commands.spawn((
+        status_bundle,
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px(status_pos.0),
+            top: Val::Px(status_pos.1),
+            ..default()
+        },
+        StatusTerminal,
+    ));
 
     // Create overlapping back terminal (lower z-index)
-    let overlap_back = SimpleTerminal2D::create_and_spawn(
+    let overlap_back_bundle = TerminalBundle::ui(
         40,
         12,
         fonts.clone(),
-        overlap_back_pos,
-        false, // No programmatic glyphs
-        false, // No keyboard
-        true,  // Enable mouse
-        &mut commands,
-        &render_device,
-        &render_queue,
-        &mut images,
+        TerminalConfig {
+            programmatic_glyphs: false,
+            keyboard: false,
+            mouse: true,
+            ..default()
+        },
+        &mut ctx,
     )
     .expect("Failed to create overlap back terminal");
-    commands
-        .entity(overlap_back.entity())
-        .insert((OverlapBackTerminal, ZIndex(0)));
+    commands.spawn((
+        overlap_back_bundle,
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px(overlap_back_pos.0),
+            top: Val::Px(overlap_back_pos.1),
+            ..default()
+        },
+        ZIndex(0),
+        OverlapBackTerminal,
+    ));
 
     // Create overlapping front terminal (higher z-index)
-    let overlap_front = SimpleTerminal2D::create_and_spawn(
+    let overlap_front_bundle = TerminalBundle::ui(
         40,
         12,
         fonts.clone(),
-        overlap_front_pos,
-        false, // No programmatic glyphs
-        false, // No keyboard
-        true,  // Enable mouse
-        &mut commands,
-        &render_device,
-        &render_queue,
-        &mut images,
+        TerminalConfig {
+            programmatic_glyphs: false,
+            keyboard: false,
+            mouse: true,
+            ..default()
+        },
+        &mut ctx,
     )
     .expect("Failed to create overlap front terminal");
-    commands
-        .entity(overlap_front.entity())
-        .insert((OverlapFrontTerminal, ZIndex(10)));
-
-    // Store terminal states
-    commands.insert_resource(TerminalSet {
-        interactive,
-        log,
-        status,
-        overlap_back,
-        overlap_front,
-    });
+    commands.spawn((
+        overlap_front_bundle,
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px(overlap_front_pos.0),
+            top: Val::Px(overlap_front_pos.1),
+            ..default()
+        },
+        ZIndex(10),
+        OverlapFrontTerminal,
+    ));
 
     // Initialize app state
     let mut app_state = AppState::default();
@@ -395,197 +429,206 @@ fn handle_events(
     }
 }
 
-fn update_terminals(
-    mut terminal_set: ResMut<TerminalSet>,
+/// Zero render-resource parameters: `gpu_flush_system` (registered by
+/// `TerminalPlugin`) owns the GPU render + async copy for every
+/// `Tui`-carrying entity, so each of these five systems only needs its own
+/// marker-filtered query plus whatever gameplay state it renders.
+fn update_interactive(
+    mut screens: Query<&mut Tui, With<InteractiveTerminal>>,
     app_state: Res<AppState>,
-    render_device: Res<RenderDevice>,
-    render_queue: Res<RenderQueue>,
-    mut images: ResMut<Assets<Image>>,
+) {
+    let Ok(mut term) = screens.single_mut() else {
+        return;
+    };
+    let selected_item = app_state.selected_item;
+    term.draw(|frame| {
+        let area = frame.area();
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(0),
+                Constraint::Length(3),
+            ])
+            .split(area);
+
+        // Title
+        let title = Paragraph::new("Interactive Terminal")
+            .style(Style::default().fg(RatatuiColor::Yellow).bold())
+            .block(Block::bordered());
+        frame.render_widget(title, chunks[0]);
+
+        // Selectable list
+        let items: Vec<ListItem> = (0..5)
+            .map(|i| ListItem::new(format!("Item {} - Click or use arrows", i)))
+            .collect();
+
+        let mut list_state = ListState::default().with_selected(Some(selected_item));
+        let list = List::new(items)
+            .block(Block::bordered().title("Select an item"))
+            .highlight_style(
+                Style::default()
+                    .bg(RatatuiColor::Cyan)
+                    .fg(RatatuiColor::Black)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol(">> ");
+
+        frame.render_stateful_widget(list, chunks[1], &mut list_state);
+
+        // Instructions
+        let help = Paragraph::new(vec![Line::from("↑/↓: Move  Enter: Select  C: Counter")])
+            .style(Style::default().fg(RatatuiColor::DarkGray))
+            .block(Block::bordered());
+        frame.render_widget(help, chunks[2]);
+    });
+}
+
+fn update_log(mut screens: Query<&mut Tui, With<LogTerminal>>, app_state: Res<AppState>) {
+    let Ok(mut term) = screens.single_mut() else {
+        return;
+    };
+    let log_messages = &app_state.log_messages;
+    term.draw(|frame| {
+        let area = frame.area();
+
+        let recent_logs: Vec<Line> = log_messages
+            .iter()
+            .rev()
+            .take(12)
+            .rev()
+            .enumerate()
+            .map(|(i, msg)| {
+                let style = if i == log_messages.len().saturating_sub(1) {
+                    Style::default().fg(RatatuiColor::Green)
+                } else {
+                    Style::default().fg(RatatuiColor::Gray)
+                };
+                Line::from(format!("• {}", msg)).style(style)
+            })
+            .collect();
+
+        let logs = Paragraph::new(recent_logs)
+            .block(Block::bordered().title("Log Terminal (Click to test!)"))
+            .wrap(Wrap { trim: true });
+
+        frame.render_widget(logs, area);
+    });
+}
+
+fn update_status(
+    mut screens: Query<&mut Tui, With<StatusTerminal>>,
+    app_state: Res<AppState>,
     time: Res<Time>,
 ) {
+    let Ok(mut term) = screens.single_mut() else {
+        return;
+    };
     let counter = app_state.counter;
-    let selected_item = app_state.selected_item;
-    let log_messages = &app_state.log_messages;
     let elapsed = time.elapsed_secs();
     let fps = 1.0 / time.delta_secs();
+    term.draw(|frame| {
+        let area = frame.area();
 
-    // Update interactive terminal
-    terminal_set
-        .interactive
-        .draw_and_render(&render_device, &render_queue, &mut images, |frame| {
-            let area = frame.area();
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(0)])
+            .split(area);
 
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(3),
-                    Constraint::Min(0),
-                    Constraint::Length(3),
-                ])
-                .split(area);
+        let title = Paragraph::new("Status Terminal")
+            .style(Style::default().fg(RatatuiColor::Magenta).bold())
+            .block(Block::bordered());
+        frame.render_widget(title, chunks[0]);
 
-            // Title
-            let title = Paragraph::new("Interactive Terminal")
-                .style(Style::default().fg(RatatuiColor::Yellow).bold())
-                .block(Block::bordered());
-            frame.render_widget(title, chunks[0]);
+        let gauge_value = ((elapsed.sin() + 1.0) * 50.0) as u16;
+        let status_line = format!(
+            "Counter: {}  |  FPS: {:.1}  |  Uptime: {:.1}s",
+            counter, fps, elapsed
+        );
 
-            // Selectable list
-            let items: Vec<ListItem> = (0..5)
-                .map(|i| ListItem::new(format!("Item {} - Click or use arrows", i)))
-                .collect();
+        let gauge = Gauge::default()
+            .block(Block::bordered().title("Activity (Click to add +10!)"))
+            .gauge_style(Style::default().fg(RatatuiColor::Cyan))
+            .percent(gauge_value.min(100));
 
-            let mut list_state = ListState::default().with_selected(Some(selected_item));
-            let list = List::new(items)
-                .block(Block::bordered().title("Select an item"))
-                .highlight_style(
-                    Style::default()
-                        .bg(RatatuiColor::Cyan)
-                        .fg(RatatuiColor::Black)
-                        .add_modifier(Modifier::BOLD),
-                )
-                .highlight_symbol(">> ");
+        let status = Paragraph::new(status_line);
 
-            frame.render_stateful_widget(list, chunks[1], &mut list_state);
+        let inner_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Length(3)])
+            .split(chunks[1]);
 
-            // Instructions
-            let help = Paragraph::new(vec![Line::from("↑/↓: Move  Enter: Select  C: Counter")])
-                .style(Style::default().fg(RatatuiColor::DarkGray))
-                .block(Block::bordered());
-            frame.render_widget(help, chunks[2]);
-        });
+        frame.render_widget(status, inner_chunks[0]);
+        frame.render_widget(gauge, inner_chunks[1]);
+    });
+}
 
-    // Update log terminal
-    terminal_set
-        .log
-        .draw_and_render(&render_device, &render_queue, &mut images, |frame| {
-            let area = frame.area();
+fn update_overlap_back(mut screens: Query<&mut Tui, With<OverlapBackTerminal>>) {
+    let Ok(mut term) = screens.single_mut() else {
+        return;
+    };
+    term.draw(|frame| {
+        let area = frame.area();
 
-            let recent_logs: Vec<Line> = log_messages
-                .iter()
-                .rev()
-                .take(12)
-                .rev()
-                .enumerate()
-                .map(|(i, msg)| {
-                    let style = if i == log_messages.len().saturating_sub(1) {
-                        Style::default().fg(RatatuiColor::Green)
-                    } else {
-                        Style::default().fg(RatatuiColor::Gray)
-                    };
-                    Line::from(format!("• {}", msg)).style(style)
-                })
-                .collect();
+        let text = vec![
+            Line::from(""),
+            Line::from("Overlap BACK Terminal")
+                .style(Style::default().fg(RatatuiColor::Red).bold()),
+            Line::from("ZIndex = 0"),
+            Line::from(""),
+            Line::from("This terminal is BEHIND")
+                .style(Style::default().fg(RatatuiColor::Yellow)),
+            Line::from("the front terminal."),
+            Line::from(""),
+            Line::from("Click in the overlap area"),
+            Line::from("to test z-ordering!"),
+        ];
 
-            let logs = Paragraph::new(recent_logs)
-                .block(Block::bordered().title("Log Terminal (Click to test!)"))
-                .wrap(Wrap { trim: true });
+        let para = Paragraph::new(text)
+            .block(Block::bordered().title("BACK"))
+            .alignment(Alignment::Center);
 
-            frame.render_widget(logs, area);
-        });
+        frame.render_widget(para, area);
+    });
+}
 
-    // Update status terminal
-    terminal_set
-        .status
-        .draw_and_render(&render_device, &render_queue, &mut images, |frame| {
-            let area = frame.area();
+fn update_overlap_front(
+    mut screens: Query<&mut Tui, With<OverlapFrontTerminal>>,
+    time: Res<Time>,
+) {
+    let Ok(mut term) = screens.single_mut() else {
+        return;
+    };
+    let elapsed = time.elapsed_secs();
+    term.draw(|frame| {
+        let area = frame.area();
 
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(3), Constraint::Min(0)])
-                .split(area);
+        let pulse = ((elapsed * 2.0).sin() + 1.0) / 2.0;
+        let color = if pulse > 0.5 {
+            RatatuiColor::Green
+        } else {
+            RatatuiColor::Cyan
+        };
 
-            let title = Paragraph::new("Status Terminal")
-                .style(Style::default().fg(RatatuiColor::Magenta).bold())
-                .block(Block::bordered());
-            frame.render_widget(title, chunks[0]);
+        let text = vec![
+            Line::from(""),
+            Line::from("Overlap FRONT Terminal").style(Style::default().fg(color).bold()),
+            Line::from("ZIndex = 10"),
+            Line::from(""),
+            Line::from("This terminal is ON TOP")
+                .style(Style::default().fg(RatatuiColor::Yellow)),
+            Line::from("of the back terminal."),
+            Line::from(""),
+            Line::from("Clicks here should show")
+                .style(Style::default().fg(RatatuiColor::Magenta)),
+            Line::from("[FRONT] in the log!").style(Style::default().fg(RatatuiColor::Magenta)),
+        ];
 
-            let gauge_value = ((elapsed.sin() + 1.0) * 50.0) as u16;
-            let status_line = format!(
-                "Counter: {}  |  FPS: {:.1}  |  Uptime: {:.1}s",
-                counter, fps, elapsed
-            );
+        let para = Paragraph::new(text)
+            .block(Block::bordered().title("FRONT"))
+            .alignment(Alignment::Center);
 
-            let gauge = Gauge::default()
-                .block(Block::bordered().title("Activity (Click to add +10!)"))
-                .gauge_style(Style::default().fg(RatatuiColor::Cyan))
-                .percent(gauge_value.min(100));
-
-            let status = Paragraph::new(status_line);
-
-            let inner_chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(1), Constraint::Length(3)])
-                .split(chunks[1]);
-
-            frame.render_widget(status, inner_chunks[0]);
-            frame.render_widget(gauge, inner_chunks[1]);
-        });
-
-    // Update overlap back terminal
-    terminal_set.overlap_back.draw_and_render(
-        &render_device,
-        &render_queue,
-        &mut images,
-        |frame| {
-            let area = frame.area();
-
-            let text = vec![
-                Line::from(""),
-                Line::from("Overlap BACK Terminal")
-                    .style(Style::default().fg(RatatuiColor::Red).bold()),
-                Line::from("ZIndex = 0"),
-                Line::from(""),
-                Line::from("This terminal is BEHIND")
-                    .style(Style::default().fg(RatatuiColor::Yellow)),
-                Line::from("the front terminal."),
-                Line::from(""),
-                Line::from("Click in the overlap area"),
-                Line::from("to test z-ordering!"),
-            ];
-
-            let para = Paragraph::new(text)
-                .block(Block::bordered().title("BACK"))
-                .alignment(Alignment::Center);
-
-            frame.render_widget(para, area);
-        },
-    );
-
-    // Update overlap front terminal
-    terminal_set.overlap_front.draw_and_render(
-        &render_device,
-        &render_queue,
-        &mut images,
-        |frame| {
-            let area = frame.area();
-
-            let pulse = ((elapsed * 2.0).sin() + 1.0) / 2.0;
-            let color = if pulse > 0.5 {
-                RatatuiColor::Green
-            } else {
-                RatatuiColor::Cyan
-            };
-
-            let text = vec![
-                Line::from(""),
-                Line::from("Overlap FRONT Terminal").style(Style::default().fg(color).bold()),
-                Line::from("ZIndex = 10"),
-                Line::from(""),
-                Line::from("This terminal is ON TOP")
-                    .style(Style::default().fg(RatatuiColor::Yellow)),
-                Line::from("of the back terminal."),
-                Line::from(""),
-                Line::from("Clicks here should show")
-                    .style(Style::default().fg(RatatuiColor::Magenta)),
-                Line::from("[FRONT] in the log!").style(Style::default().fg(RatatuiColor::Magenta)),
-            ];
-
-            let para = Paragraph::new(text)
-                .block(Block::bordered().title("FRONT"))
-                .alignment(Alignment::Center);
-
-            frame.render_widget(para, area);
-        },
-    );
+        frame.render_widget(para, area);
+    });
 }

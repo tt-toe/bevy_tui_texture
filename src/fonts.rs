@@ -41,7 +41,11 @@
 use std::hash::BuildHasher;
 use std::hash::Hasher;
 use std::hash::RandomState;
+use std::sync::Arc;
 
+use bevy::asset::io::Reader;
+use bevy::asset::{Asset, AssetLoader, LoadContext};
+use bevy::reflect::TypePath;
 use tracing::warn;
 use ratatui::buffer::Cell;
 use rustybuzz::Face;
@@ -136,6 +140,43 @@ impl Font {
     }
 }
 
+/// Font bytes loadable via the `AssetServer` - `Font::from_vec` +
+/// `std::fs::read` doesn't work on Wasm, so this is the Wasm-safe path.
+/// Carries only the raw TTF bytes; convert to `Arc<Fonts>` synchronously
+/// once loaded via [`Fonts::from_asset`] - there is deliberately no
+/// "waiting for font" spawn state, so a terminal's spawn APIs keep taking
+/// `Arc<Fonts>` directly.
+#[derive(Asset, TypePath)]
+pub struct TerminalFontAsset {
+    bytes: Vec<u8>,
+}
+
+/// Loads `.ttf` files as [`TerminalFontAsset`]. Registered automatically by
+/// `TerminalPlugin`.
+#[derive(Default, TypePath)]
+pub(crate) struct TerminalFontAssetLoader;
+
+impl AssetLoader for TerminalFontAssetLoader {
+    type Asset = TerminalFontAsset;
+    type Settings = ();
+    type Error = std::io::Error;
+
+    async fn load(
+        &self,
+        reader: &mut dyn Reader,
+        _settings: &Self::Settings,
+        _load_context: &mut LoadContext<'_>,
+    ) -> Result<Self::Asset, Self::Error> {
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await?;
+        Ok(TerminalFontAsset { bytes })
+    }
+
+    fn extensions(&self) -> &[&str] {
+        &["ttf"]
+    }
+}
+
 /// A collection of fonts to use for rendering. Supports font fallback.
 pub struct Fonts {
     char_width: u32,
@@ -167,6 +208,23 @@ impl Fonts {
             italic: vec![],
             bold_italic: vec![],
         }
+    }
+
+    /// Build from a loaded [`TerminalFontAsset`].
+    /// Synchronous - call once `Assets<TerminalFontAsset>::get` returns
+    /// `Some` for the handle you loaded via `asset_server.load(...)`, the
+    /// same "wait until loaded, then use" pattern every bevy user already
+    /// writes for glTF. `size_px` stays a parameter here rather than living
+    /// on the asset, since spawn APIs take the resulting `Arc<Fonts>`
+    /// directly (already sized) and would have nowhere to put a
+    /// per-asset size.
+    pub fn from_asset(
+        asset: &TerminalFontAsset,
+        size_px: u32,
+    ) -> Result<Arc<Fonts>, crate::TerminalError> {
+        let font = Font::from_vec(asset.bytes.clone())
+            .ok_or_else(|| crate::TerminalError::Font("failed to parse font data".to_string()))?;
+        Ok(Arc::new(Fonts::new(font, size_px)))
     }
 
     /// The height (in pixels) of all fonts.

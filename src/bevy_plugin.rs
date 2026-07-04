@@ -1,15 +1,14 @@
 // This module provides a Bevy plugin that integrates BevyTerminalBackend
 // into Bevy applications.
 
+use bevy::pbr::{Material, StandardMaterial};
 use bevy::prelude::*;
 use bevy::render::renderer::{RenderDevice, RenderQueue};
-use bevy::sprite_render::{ColorMaterial, MeshMaterial2d};
-use ratatui::Terminal;
-use tracing::info;
+use tracing::{info, warn};
 use wgpu;
 
-use crate::BevyTerminalBackend;
 use crate::input::*;
+use crate::setup::{Tui, TuiSurface};
 
 /// System sets for organizing terminal systems.
 ///
@@ -98,6 +97,10 @@ impl TerminalPlugin {
 
 impl Plugin for TerminalPlugin {
     fn build(&self, app: &mut App) {
+        // Fonts loadable via the AssetServer.
+        app.init_asset::<crate::fonts::TerminalFontAsset>()
+            .init_asset_loader::<crate::fonts::TerminalFontAssetLoader>();
+
         // Register messages (events)
         app.add_message::<TerminalEvent>();
 
@@ -153,13 +156,22 @@ impl Plugin for TerminalPlugin {
             info!("Auto-focus (Tab cycling) enabled");
         }
 
+        // Plugin-owned GPU plumbing for the `Tui` component: collects
+        // pending async copies, starts new renders, and touches
+        // StandardMaterial - all so user drawing systems can take zero
+        // render-resource parameters.
+        app.add_systems(Update, gpu_flush_system.in_set(TerminalSystemSet::Render));
+
+        // Attaching a Tui to an existing mesh. Runs early so the same-frame
+        // Render pass sees the swapped material.
+        app.add_systems(
+            Update,
+            crate::setup::attach_terminal_system.in_set(TerminalSystemSet::Input),
+        );
+
         info!("TerminalPlugin initialized with input handling");
     }
 }
-
-/// Component marker for terminal UI entities.
-#[derive(Component)]
-pub struct TerminalComponent;
 
 /// Terminal dimensions component.
 ///
@@ -173,26 +185,134 @@ pub struct TerminalDimensions {
     pub char_height_px: u32,
 }
 
-/// Resource that holds the terminal instance.
+// ============================================================================
+// `Tui` GPU plumbing
+// ============================================================================
+
+/// Implemented for material types that can display a terminal texture, so
+/// [`TerminalMaterialPlugin`] knows how to re-point (or just touch) the
+/// material at the `Tui`'s image handle when it changes. This is required
+/// because 3D materials do not observe `Image` asset mutations on their own
+/// (see CLAUDE.md "Common Gotchas" #1) - `Assets::get_mut` must be called
+/// with a real field write to reliably mark the asset changed.
+pub trait TerminalMaterial: Material {
+    /// Point (or re-point) this material at the terminal's texture.
+    fn set_terminal_texture(&mut self, image: &Handle<Image>);
+}
+
+impl TerminalMaterial for StandardMaterial {
+    fn set_terminal_texture(&mut self, image: &Handle<Image>) {
+        self.base_color_texture = Some(image.clone());
+    }
+}
+
+/// Blanket impl for any `ExtendedMaterial<StandardMaterial, E>` (e.g.
+/// retro_crt's `CrtMaterial`). This must live here, in the crate that
+/// defines `TerminalMaterial`: `ExtendedMaterial` is a foreign type, so
+/// downstream crates cannot write this impl themselves (orphan rules only
+/// permit implementing a *local* trait for a foreign type, not the reverse).
+/// Because of this blanket impl, users get `TerminalMaterialPlugin` support
+/// for any `ExtendedMaterial<StandardMaterial, _>` for free - no manual
+/// `TerminalMaterial` impl needed.
+impl<E: bevy::pbr::MaterialExtension> TerminalMaterial
+    for bevy::pbr::ExtendedMaterial<StandardMaterial, E>
+{
+    fn set_terminal_texture(&mut self, image: &Handle<Image>) {
+        self.base.base_color_texture = Some(image.clone());
+    }
+}
+
+/// Plugin-owned GPU flush for every [`Tui`](crate::setup::Tui) entity.
+/// Registered automatically by [`TerminalPlugin`] in
+/// `TerminalSystemSet::Render`. For each `Tui`:
 ///
-/// This resource is initialized during startup and provides access to
-/// the terminal for rendering TUI content.
+/// 1. If a pending async copy exists: poll it; if ready, copy into the
+///    `Image` asset and unmap. Runs regardless of whether `draw()` was
+///    called this frame, so static content completes without the user
+///    calling `draw()` again.
+/// 2. If dirty and no pending copy: render to the GPU texture and start a
+///    new async copy; clear dirty.
+/// 3. If the `Image` was updated this frame, touch `StandardMaterial` for
+///    every [`TuiSurface`](crate::setup::TuiSurface) pointing at this `Tui`.
+///    This is hardcoded here (not through the generic
+///    [`TerminalMaterialPlugin`] mechanism) because `StandardMaterial` is
+///    the overwhelmingly common case, and a direct touch avoids the
+///    scheduling overhead of a separate per-type system. Custom/extended
+///    material types opt in via `TerminalMaterialPlugin::<M>`.
+pub fn gpu_flush_system(
+    mut terminals: Query<(Entity, &mut Tui)>,
+    surfaces: Query<(&TuiSurface, &MeshMaterial3d<StandardMaterial>)>,
+    render_device: Res<RenderDevice>,
+    render_queue: Res<RenderQueue>,
+    mut images: ResMut<Assets<Image>>,
+    mut std_materials: ResMut<Assets<StandardMaterial>>,
+) {
+    for (entity, mut tui) in &mut terminals {
+        let applied = tui.flush(&render_device, &render_queue, &mut images);
+        if !applied {
+            continue;
+        }
+
+        for (surface, material_handle) in &surfaces {
+            if surface.tui != entity {
+                continue;
+            }
+            if let Some(mut material) = std_materials.get_mut(&material_handle.0) {
+                material.set_terminal_texture(tui.image_handle());
+            }
+        }
+    }
+}
+
+/// Generic per-material-type touch system for [`Tui`] surfaces using a
+/// custom material (e.g. an `ExtendedMaterial`-based shader). Register once
+/// per material type:
 ///
-/// Note: The backend is owned by the Terminal, access it via terminal.backend_mut()
-#[derive(Resource)]
-pub struct TerminalResource {
-    /// The ratatui Terminal instance with BevyTerminalBackend
-    pub terminal: Terminal<BevyTerminalBackend>,
+/// ```ignore
+/// app.add_plugins(TerminalMaterialPlugin::<CrtMaterial>::default());
+/// ```
+///
+/// Do not register this for `StandardMaterial` - [`gpu_flush_system`]
+/// already handles it directly (see its doc comment for the performance
+/// rationale). Doing so anyway is harmless (the asset is simply touched
+/// twice); a warning is logged when the plugin is built.
+pub struct TerminalMaterialPlugin<M: TerminalMaterial>(std::marker::PhantomData<M>);
 
-    /// GPU texture for rendering terminal output
-    pub texture: wgpu::Texture,
+impl<M: TerminalMaterial> Default for TerminalMaterialPlugin<M> {
+    fn default() -> Self {
+        Self(std::marker::PhantomData)
+    }
+}
 
-    /// Handle to the Bevy Image for display
-    pub image_handle: Handle<Image>,
+impl<M: TerminalMaterial> Plugin for TerminalMaterialPlugin<M> {
+    fn build(&self, app: &mut App) {
+        if std::any::TypeId::of::<M>() == std::any::TypeId::of::<StandardMaterial>() {
+            warn!(
+                "TerminalMaterialPlugin::<StandardMaterial> registered explicitly; \
+                 gpu_flush_system already touches StandardMaterial directly, so this \
+                 will touch it a second time (harmless, just wasted work)."
+            );
+        }
+        app.add_systems(
+            Update,
+            touch_terminal_material_system::<M>.in_set(TerminalSystemSet::Render),
+        );
+    }
+}
 
-    /// Texture dimensions
-    pub width: u32,
-    pub height: u32,
+fn touch_terminal_material_system<M: TerminalMaterial>(
+    terminals: Query<&Tui>,
+    surfaces: Query<(&TuiSurface, &MeshMaterial3d<M>)>,
+    mut materials: ResMut<Assets<M>>,
+) {
+    for (surface, material_handle) in &surfaces {
+        let Ok(tui) = terminals.get(surface.tui) else {
+            continue;
+        };
+        if let Some(mut material) = materials.get_mut(&material_handle.0) {
+            material.set_terminal_texture(tui.image_handle());
+        }
+    }
 }
 
 /// Copy GPU texture to Bevy Image with proper padding alignment.
@@ -291,171 +411,3 @@ pub fn update_terminal_texture(
     }
 }
 
-/// Complete terminal update: render to GPU, copy to Image, and update material.
-///
-/// Call after `terminal.draw()` to handle all three update steps in one function.
-#[allow(clippy::too_many_arguments)]
-pub fn update_terminal_and_material<T: Component>(
-    terminal: &mut ratatui::Terminal<BevyTerminalBackend>,
-    texture: &wgpu::Texture,
-    image_handle: &Handle<Image>,
-    width: u32,
-    height: u32,
-    render_device: &RenderDevice,
-    render_queue: &RenderQueue,
-    images: &mut Assets<Image>,
-    materials: &mut Assets<ColorMaterial>,
-    query: &Query<(&MeshMaterial2d<ColorMaterial>, &T)>,
-) {
-    // 1. Render to GPU texture
-    let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-    terminal.backend_mut().render_to_texture(
-        render_device.wgpu_device(),
-        render_queue.0.as_ref(),
-        &texture_view,
-    );
-
-    // 2. Copy GPU texture to Bevy Image
-    update_terminal_texture(
-        texture,
-        image_handle,
-        width,
-        height,
-        render_device,
-        render_queue,
-        images,
-    );
-
-    // 3. Trigger material change detection
-    update_material_texture(materials, query, image_handle);
-}
-
-/// Update material texture to trigger Bevy's change detection.
-///
-/// Generic over marker component type `T` for flexible querying.
-pub fn update_material_texture<T: Component>(
-    materials: &mut Assets<ColorMaterial>,
-    query: &Query<(&MeshMaterial2d<ColorMaterial>, &T)>,
-    image_handle: &Handle<Image>,
-) {
-    for (material_handle, _) in query.iter() {
-        if let Some(mut material) = materials.get_mut(&material_handle.0) {
-            material.texture = Some(image_handle.clone());
-        }
-    }
-}
-
-/// Placeholder system for terminal updates. Implement your own with `terminal.draw()`.
-pub fn update_terminal_content_system(_terminal_res: ResMut<TerminalResource>) {
-    // Placeholder - user should implement their own update logic
-}
-
-// ============================================================================
-// Helper Functions for Spawning Terminals
-// ============================================================================
-
-/// Spawn interactive terminal entity with keyboard and mouse input.
-///
-/// **Use Case**: Manual [`TerminalTexture`](crate::setup::TerminalTexture) management with automatic entity setup.
-/// For full automation, use [`SimpleTerminal2D`](crate::setup::SimpleTerminal2D).
-pub fn spawn_interactive_terminal(
-    commands: &mut Commands,
-    image_handle: Handle<Image>,
-    size: Vec2,
-    position: Vec3,
-) -> Entity {
-    commands
-        .spawn((
-            ImageNode::new(image_handle),
-            Node {
-                width: Val::Px(size.x),
-                height: Val::Px(size.y),
-                ..default()
-            },
-            Transform::from_translation(position),
-            TerminalComponent,
-            TerminalInput::default(), // Enable both keyboard and mouse
-        ))
-        .id()
-}
-
-/// Spawn display-only terminal without input (for logs, status panels).
-///
-/// **Use Case**: Manual [`TerminalTexture`](crate::setup::TerminalTexture) for static displays.
-/// For full automation, use [`SimpleTerminal2D`](crate::setup::SimpleTerminal2D) with input disabled.
-pub fn spawn_display_terminal(
-    commands: &mut Commands,
-    image_handle: Handle<Image>,
-    size: Vec2,
-    position: Vec3,
-) -> Entity {
-    commands
-        .spawn((
-            ImageNode::new(image_handle),
-            Node {
-                width: Val::Px(size.x),
-                height: Val::Px(size.y),
-                ..default()
-            },
-            Transform::from_translation(position),
-            TerminalComponent,
-            // No TerminalInput = display-only
-        ))
-        .id()
-}
-
-/// Spawn absolutely-positioned terminal for tiled layouts with z-index support.
-///
-/// **Use Case**: Manual [`TerminalTexture`](crate::setup::TerminalTexture) with absolute positioning.
-/// For full automation, use [`SimpleTerminal2D`](crate::setup::SimpleTerminal2D).
-#[allow(clippy::too_many_arguments)]
-pub fn spawn_positioned_terminal(
-    commands: &mut Commands,
-    image_handle: Handle<Image>,
-    cols: u16,
-    rows: u16,
-    char_width_px: u32,
-    char_height_px: u32,
-    left: f32,
-    top: f32,
-    z_index: Option<i32>,
-    enable_input: bool,
-) -> Entity {
-    let width = cols as f32 * char_width_px as f32;
-    let height = rows as f32 * char_height_px as f32;
-
-    info!(
-        "Spawning positioned terminal: {}x{} chars, {}x{} px, pos=({}, {}), z={:?}, input={}",
-        cols, rows, width, height, left, top, z_index, enable_input
-    );
-
-    let mut entity_commands = commands.spawn((
-        ImageNode::new(image_handle),
-        Node {
-            width: Val::Px(width),
-            height: Val::Px(height),
-            position_type: bevy::ui::PositionType::Absolute,
-            left: Val::Px(left),
-            top: Val::Px(top),
-            ..default()
-        },
-        Transform::default(),
-        TerminalComponent,
-        TerminalDimensions {
-            cols,
-            rows,
-            char_width_px,
-            char_height_px,
-        },
-    ));
-
-    if enable_input {
-        entity_commands.insert(TerminalInput::default());
-    }
-
-    if let Some(z) = z_index {
-        entity_commands.insert(bevy::ui::ZIndex(z));
-    }
-
-    entity_commands.id()
-}

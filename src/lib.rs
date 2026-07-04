@@ -160,43 +160,60 @@ pub use backend::{Dimensions, Viewport};
 
 // Re-export font types
 #[cfg(feature = "ratatui_backend")]
-pub use fonts::{Font, Fonts};
+pub use fonts::{Font, Fonts, TerminalFontAsset};
 
 // Re-export bevy plugin types
 #[cfg(feature = "ratatui_backend")]
-pub use bevy_plugin::{TerminalComponent, TerminalDimensions, TerminalPlugin, TerminalResource};
+pub use bevy_plugin::{TerminalDimensions, TerminalMaterial, TerminalMaterialPlugin, TerminalPlugin};
+
+// Re-export the ECS-native terminal API
+#[cfg(feature = "ratatui_backend")]
+pub use setup::{
+    AttachMaterial, AttachTerminal, HitRegions, TerminalBundle, TerminalConfig, TerminalSpawnCtx,
+    Tui, TuiSurface, TuiUi,
+};
 
 // Error types
 
-/// Represents the various errors that can occur during operation.
-#[derive(Debug)]
-pub enum Error {
+/// Errors that can occur creating or operating a terminal. Replaces the
+/// previous `Result<_, String>` used throughout `setup`/`backend` - callers
+/// can now match on a specific variant or chain `source()` instead of
+/// parsing a message string.
+#[derive(thiserror::Error, Debug)]
+pub enum TerminalError {
     /// Backend creation failed because the device request failed.
+    #[error("device request failed: {0}")]
     DeviceRequestFailed(wgpu::RequestDeviceError),
     /// Backend creation failed because creating the surface failed.
+    #[error("surface creation failed: {0}")]
     SurfaceCreationFailed(wgpu::CreateSurfaceError),
     /// Backend creation failed because wgpu didn't provide an
     /// [`Adapter`](wgpu::Adapter)
+    #[error("adapter request failed: {0}")]
     AdapterRequestFailed(wgpu::RequestAdapterError),
     /// Backend creation failed because the default surface configuration
     /// couldn't be loaded.
+    #[error("failed to get default Surface configuration from wgpu")]
     SurfaceConfigurationRequestFailed,
+
+    /// Building the wgpu-backed ratatui backend failed (texture/buffer/
+    /// sampler creation).
+    #[error("failed to build terminal backend: {0}")]
+    BackendBuild(String),
+    /// Pre-populating programmatic glyphs (box-drawing, braille, powerline)
+    /// failed.
+    #[error("failed to populate programmatic glyphs: {0}")]
+    GlyphPopulation(String),
+    /// ratatui's own `Terminal::new()` failed.
+    #[error("ratatui terminal initialization failed: {0}")]
+    Backend(#[from] std::io::Error),
+
+    /// Font data failed to parse (see [`fonts::Fonts::from_asset`]).
+    #[error("invalid font data: {0}")]
+    Font(String),
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::DeviceRequestFailed(e) => write!(f, "{}", e),
-            Error::SurfaceCreationFailed(e) => write!(f, "{}", e),
-            Error::AdapterRequestFailed(e) => write!(f, "{}", e),
-            Error::SurfaceConfigurationRequestFailed => {
-                write!(f, "Failed to get default Surface configuration from wgpu.")
-            }
-        }
-    }
-}
-
-pub type Result<T> = ::std::result::Result<T, Error>;
+pub type Result<T> = ::std::result::Result<T, TerminalError>;
 
 type RandomState = std::hash::RandomState;
 
@@ -205,16 +222,20 @@ type RandomState = std::hash::RandomState;
 pub mod prelude {
     // Plugin and components
     pub use crate::bevy_plugin::{
-        TerminalComponent, TerminalDimensions, TerminalPlugin, TerminalResource, TerminalSystemSet,
-        spawn_display_terminal, spawn_interactive_terminal, spawn_positioned_terminal,
-        update_material_texture, update_terminal_and_material, update_terminal_texture,
+        TerminalDimensions, TerminalMaterial, TerminalMaterialPlugin, TerminalPlugin,
+        TerminalSystemSet, update_terminal_texture,
     };
 
-    // Simplified terminal API
-    pub use crate::setup::{SimpleTerminal2D, SimpleTerminal3D, TerminalTexture, WorldTerminal3D};
+    pub use crate::setup::TerminalTexture;
+
+    // ECS-native terminal API
+    pub use crate::setup::{
+        AttachMaterial, AttachTerminal, HitRegions, TerminalBundle, TerminalConfig,
+        TerminalSpawnCtx, Tui, TuiSurface, TuiUi,
+    };
 
     // Backend and builders
-    pub use crate::{BevyTerminalBackend, Font, Fonts, TerminalBuilder};
+    pub use crate::{BevyTerminalBackend, Font, Fonts, TerminalBuilder, TerminalFontAsset};
 
     // Input handling
     pub use crate::input::{

@@ -54,8 +54,6 @@ fn main() {
 /// UI state for tracking interactions
 #[derive(Resource)]
 struct WidgetCatalogState {
-    terminal: SimpleTerminal3D,
-
     selected_tab: usize,
     list_state: ListState,
     selected_button: Option<usize>,
@@ -111,32 +109,40 @@ fn setup_terminal(
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.5, -0.5, 0.0)),
     ));
 
-    // Create 3D terminal with easy setup API
-    let terminal = SimpleTerminal3D::create_and_spawn(
+    // Create 3D terminal with the new bundle API. `world_quad`'s mesh already
+    // faces +Z at rest (see `rotate_plane`'s comment for why this changes
+    // the seesaw rotation formula vs. the old Y-normal `SimpleTerminal3D`
+    // plane). height chosen to match the original pixel-sized plane
+    // (ROWS * char_height_px) so the on-screen scale is unchanged.
+    let char_height_px = fonts.height_px();
+    let mut ctx = TerminalSpawnCtx {
+        render_device: &render_device,
+        render_queue: &render_queue,
+        images: &mut images,
+        meshes: &mut meshes,
+        materials: &mut materials,
+    };
+    let bundle = TerminalBundle::world_quad(
         COLS,
         ROWS,
         fonts,
-        Vec3::ZERO,                                          // Position at origin
-        Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2), // Face camera
-        Vec3::ONE,                                           // Normal scale
-        RotatingPlane,                                       // Marker component
-        true,                                                // Enable programmatic glyphs
-        true,                                                // Enable keyboard
-        true,                                                // Enable mouse
-        &mut commands,
-        &mut meshes,
-        &mut materials,
-        &render_device,
-        &render_queue,
-        &mut images,
+        ROWS as f32 * char_height_px as f32,
+        TerminalConfig {
+            programmatic_glyphs: true,
+            keyboard: true,
+            mouse: true,
+            ..default()
+        },
+        &mut ctx,
     )
     .expect("Failed to create 3D terminal");
 
-    let terminal_entity = terminal.entity();
+    let terminal_entity = commands
+        .spawn((bundle, Transform::from_translation(Vec3::ZERO), RotatingPlane))
+        .id();
 
-    // Create state with terminal and initial values
+    // Create state with initial values
     commands.insert_resource(WidgetCatalogState {
-        terminal,
         selected_tab: 0,
         list_state: ListState::default().with_selected(Some(0)),
         selected_button: None,
@@ -311,16 +317,17 @@ fn handle_terminal_events(
     }
 }
 
-/// Update terminal content and render to 3D mesh
+/// Update terminal content and render to 3D mesh. Zero render-resource
+/// parameters: `gpu_flush_system` (registered by `TerminalPlugin`) owns the
+/// GPU render + async copy + material touch.
 fn update_terminal_content(
+    mut screens: Query<&mut Tui, With<RotatingPlane>>,
     mut ui_state: ResMut<WidgetCatalogState>,
-    render_device: Res<RenderDevice>,
-    render_queue: Res<RenderQueue>,
-    mut images: ResMut<Assets<Image>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    marker_query: Query<&MeshMaterial3d<StandardMaterial>, With<RotatingPlane>>,
     time: Res<Time>,
 ) {
+    let Ok(mut term) = screens.single_mut() else {
+        return;
+    };
     // Update sparkline data with random values
     ui_state.sparkline_timer.tick(time.delta());
     if ui_state.sparkline_timer.just_finished() {
@@ -331,13 +338,16 @@ fn update_terminal_content(
         }
     }
 
-    let selected_tab = ui_state.selected_tab;
-    let selected_button = ui_state.selected_button;
-    let gauge_value = ui_state.gauge_value;
-    let counter = ui_state.counter;
-    let sparkline_data = ui_state.sparkline_data.clone();
-    let mut list_state = ui_state.list_state.clone();
-    let mouse_position = ui_state.mouse_position;
+    // Split into a plain `&mut` so `sparkline_data`/`list_state` below can
+    // be borrowed disjointly (one immutably, one mutably) instead of cloned -
+    // `ResMut::deref`/`deref_mut` can't be called twice at once, but a single
+    // `&mut WidgetCatalogState` splits into independent field borrows fine.
+    let state = &mut *ui_state;
+    let selected_tab = state.selected_tab;
+    let selected_button = state.selected_button;
+    let gauge_value = state.gauge_value;
+    let counter = state.counter;
+    let mouse_position = state.mouse_position;
 
     // Variables to capture layout rectangles
     let mut button_rects = Vec::new();
@@ -347,13 +357,7 @@ fn update_terminal_content(
 
     let rotation_angle = (time.elapsed_secs() * 0.8).sin() * 45.0;
 
-    ui_state.terminal.draw_and_render(
-        &render_device,
-        &render_queue,
-        &mut images,
-        &mut materials,
-        &marker_query,
-        |frame| {
+    term.draw(|frame| {
             let area = frame.area();
 
             let tabs = Tabs::new(vec!["Buttons", "Lists", "Charts", "Interactive", "Glyphs"])
@@ -378,7 +382,7 @@ fn update_terminal_content(
             let ruler = (0..100)
                 .map(|i| {
                     if i % 10 == 0 {
-                        (i / 10).to_string().chars().next().unwrap()
+                        char::from(b'0' + (i / 10) as u8)
                     } else if i % 5 == 0 {
                         '|'
                     } else {
@@ -401,9 +405,10 @@ fn update_terminal_content(
                     h_button_rects = h_btn_rects;
                 }
                 1 => {
-                    list_inner_rect = Some(draw_lists_tab(frame, chunks[2], &mut list_state));
+                    list_inner_rect =
+                        Some(draw_lists_tab(frame, chunks[2], &mut state.list_state));
                 }
-                2 => draw_charts_tab(frame, chunks[2], gauge_value, counter, &sparkline_data),
+                2 => draw_charts_tab(frame, chunks[2], gauge_value, counter, &state.sparkline_data),
                 3 => {
                     gauge_inner_rect = Some(draw_interactive_tab(frame, chunks[2], gauge_value));
                 }
@@ -437,15 +442,13 @@ fn update_terminal_content(
                 height: 1,
             };
             frame.render_widget(status, status_area);
-        },
-    );
+        });
 
     // Store captured layout rectangles for hit testing
-    ui_state.button_rects = button_rects;
-    ui_state.h_button_rects = h_button_rects;
-    ui_state.list_inner_rect = list_inner_rect;
-    ui_state.gauge_inner_rect = gauge_inner_rect;
-    ui_state.list_state = list_state;
+    state.button_rects = button_rects;
+    state.h_button_rects = h_button_rects;
+    state.list_inner_rect = list_inner_rect;
+    state.gauge_inner_rect = gauge_inner_rect;
 }
 
 fn draw_buttons_tab(
@@ -545,8 +548,8 @@ fn draw_buttons_tab(
 
     frame.render_widget(info, chunks[4]);
 
-    // Return button rectangles for hit testing
-    let button_rects = chunks.iter().take(3).cloned().collect();
+    // Return button rectangles for hit testing (`Rect` is `Copy`)
+    let button_rects = chunks.iter().take(3).copied().collect();
     let h_button_rects = h_chunks.to_vec();
 
     (button_rects, h_button_rects)
@@ -774,12 +777,16 @@ fn draw_glyphs_tab(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
     frame.render_widget(info, chunks[4]);
 }
 
-/// System that rotates the plane in seesaw motion for always-visible interaction
+/// System that rotates the plane in seesaw motion for always-visible interaction.
+///
+/// `TerminalBundle::world_quad`'s mesh already faces +Z at rest (unlike the
+/// old `SimpleTerminal3D`, whose `Plane3d::default()` faces +Y and needed an
+/// extra `Quat::from_rotation_x(FRAC_PI_2)` to face the camera) - so the
+/// seesaw here is a plain roll around Z, no base reorientation needed.
 fn rotate_plane(time: Res<Time>, mut query: Query<&mut Transform, With<RotatingPlane>>) {
     for mut transform in &mut query {
         // Seesaw rotation: oscillate ±45° around Z axis
         let angle = (time.elapsed_secs() * 0.8).sin() * std::f32::consts::FRAC_PI_4;
-        transform.rotation =
-            Quat::from_rotation_x(std::f32::consts::FRAC_PI_2) * Quat::from_rotation_z(angle);
+        transform.rotation = Quat::from_rotation_z(angle);
     }
 }

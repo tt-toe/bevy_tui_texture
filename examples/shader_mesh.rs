@@ -40,6 +40,10 @@ fn main() {
         }))
         .add_plugins(MaterialPlugin::<CrtMaterial>::default())
         .add_plugins(TerminalPlugin::default())
+        // Touches the ExtendedMaterial every frame after a Tui redraw - the
+        // library provides a blanket `TerminalMaterial` impl for
+        // `ExtendedMaterial<StandardMaterial, E>`.
+        .add_plugins(TerminalMaterialPlugin::<CrtMaterial>::default())
         .add_systems(Startup, setup)
         .add_systems(Update, handle_input.in_set(TerminalSystemSet::UserUpdate))
         .add_systems(Update, render_terminal.in_set(TerminalSystemSet::Render))
@@ -71,12 +75,6 @@ impl MaterialExtension for CrtExtension {
 
 // Convenient type alias for our extended material
 type CrtMaterial = ExtendedMaterial<StandardMaterial, CrtExtension>;
-
-#[derive(Resource)]
-struct TerminalState {
-    texture: TerminalTexture,
-    material_handle: Handle<CrtMaterial>,
-}
 
 #[derive(Resource)]
 struct AppState {
@@ -113,7 +111,7 @@ fn setup(
     let fonts = Arc::new(Fonts::new(font, 16));
 
     // Create terminal texture
-    let mut texture = TerminalTexture::create(
+    let mut texture_state = TerminalTexture::create(
         80,
         30,
         fonts,
@@ -124,11 +122,31 @@ fn setup(
     )
     .expect("Failed to create terminal");
 
+    // Initial synchronous render (prevents first-frame black texture).
+    texture_state.draw_sync(&render_device, &render_queue, &mut images, |frame| {
+        let area = frame.area();
+
+        // Clear with colorful background
+        let clear = Block::default().style(Style::default().bg(RatatuiColor::Rgb(10, 10, 30)));
+        frame.render_widget(clear, area);
+
+        let title = Paragraph::new("Shader with ExtendedMaterial - Loading...")
+            .style(
+                Style::default()
+                    .fg(RatatuiColor::Green)
+                    .bg(RatatuiColor::DarkGray)
+                    .bold(),
+            )
+            .alignment(Alignment::Center)
+            .block(Block::bordered().border_style(Style::default().fg(RatatuiColor::White)));
+        frame.render_widget(title, area);
+    });
+
     // Create ExtendedMaterial (KEY DIFFERENCE from standard material)
     let material = CrtMaterial {
         base: StandardMaterial {
             base_color: bevy::color::Color::WHITE, // CRITICAL: White to show texture colors accurately
-            base_color_texture: Some(texture.image_handle.clone()),
+            base_color_texture: Some(texture_state.image_handle()),
             unlit: false, // Must be false for pbr_input_from_standard_material to work
             alpha_mode: AlphaMode::Opaque,
             double_sided: true,
@@ -151,14 +169,22 @@ fn setup(
     let mesh_handle = meshes.add(mesh);
 
     // Spawn terminal entity
-    commands.spawn((
-        Mesh3d(mesh_handle),
-        MeshMaterial3d(material_handle.clone()),
-        Transform::from_xyz(0.0, 0.0, 0.0),
-        MainTerminal,
-        texture.dimensions(),
-        TerminalInput::default(),
-        TerminalComponent,
+    let dimensions = texture_state.dimensions();
+    let terminal_entity = commands
+        .spawn((
+            Mesh3d(mesh_handle),
+            MeshMaterial3d(material_handle),
+            Transform::from_xyz(0.0, 0.0, 0.0),
+            MainTerminal,
+            dimensions,
+            TerminalInput::default(),
+        ))
+        .id();
+    commands.entity(terminal_entity).insert((
+        Tui::from_texture_state(texture_state),
+        TuiSurface {
+            tui: terminal_entity,
+        },
     ));
 
     // Camera
@@ -177,55 +203,6 @@ fn setup(
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.5, -0.5, 0.0)),
     ));
 
-    // Initial synchronous render (prevents first-frame black texture)
-    {
-        use bevy_tui_texture::bevy_plugin::update_terminal_texture;
-
-        let _ = texture.terminal.draw(|frame| {
-            let area = frame.area();
-
-            // Clear with colorful background
-            let clear = Block::default().style(Style::default().bg(RatatuiColor::Rgb(10, 10, 30)));
-            frame.render_widget(clear, area);
-
-            let title = Paragraph::new("Shader with ExtendedMaterial - Loading...")
-                .style(
-                    Style::default()
-                        .fg(RatatuiColor::Green)
-                        .bg(RatatuiColor::DarkGray)
-                        .bold(),
-                )
-                .alignment(Alignment::Center)
-                .block(Block::bordered().border_style(Style::default().fg(RatatuiColor::White)));
-            frame.render_widget(title, area);
-        });
-
-        let texture_view = texture
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        texture.terminal.backend_mut().render_to_texture(
-            render_device.wgpu_device(),
-            render_queue.0.as_ref(),
-            &texture_view,
-        );
-
-        // Synchronous copy to populate Image immediately
-        update_terminal_texture(
-            &texture.texture,
-            &texture.image_handle,
-            texture.width,
-            texture.height,
-            &render_device,
-            &render_queue,
-            &mut images,
-        );
-    }
-
-    // Insert resources
-    commands.insert_resource(TerminalState {
-        texture,
-        material_handle,
-    });
     commands.insert_resource(AppState::default());
 }
 
@@ -252,30 +229,30 @@ fn handle_input(
 
 fn update_crt_uniforms(
     mut materials: ResMut<Assets<CrtMaterial>>,
-    terminal_state: Res<TerminalState>,
+    terminal: Query<&MeshMaterial3d<CrtMaterial>, With<MainTerminal>>,
     app_state: Res<AppState>,
     time: Res<Time>,
 ) {
-    if let Some(mut material) = materials.get_mut(&terminal_state.material_handle) {
+    let Ok(material_handle) = terminal.single() else {
+        return;
+    };
+    if let Some(mut material) = materials.get_mut(&material_handle.0) {
         material.extension.uniforms.effect_intensity =
             if app_state.effects_enabled { 1.0 } else { 0.0 };
         material.extension.uniforms.time = time.elapsed_secs();
     }
 }
 
-fn render_terminal(
-    mut terminal_state: ResMut<TerminalState>,
-    mut app_state: ResMut<AppState>,
-    render_device: Res<RenderDevice>,
-    render_queue: Res<RenderQueue>,
-    mut images: ResMut<Assets<Image>>,
-) {
+/// Zero render-resource parameters: `TerminalMaterialPlugin::<CrtMaterial>`
+/// (registered in `main`) touches the material every frame after
+/// `gpu_flush_system`'s GPU render.
+fn render_terminal(mut screens: Query<&mut Tui, With<MainTerminal>>, mut app_state: ResMut<AppState>) {
     app_state.frame_count += 1;
 
-    // Use async update for Bevy's material system
-    terminal_state
-        .texture
-        .update(&render_device, &render_queue, &mut images, |frame| {
+    let Ok(mut term) = screens.single_mut() else {
+        return;
+    };
+    term.draw(|frame| {
             let area = frame.area();
 
             // Title

@@ -1592,6 +1592,7 @@ dependencies = [
  "raqote",
  "ratatui",
  "rustybuzz",
+ "thiserror 2.0.18",
  "tiny-skia",
  "tiny_http",
  "tokio",
