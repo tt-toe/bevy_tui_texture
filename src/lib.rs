@@ -9,9 +9,8 @@
 //! | 0.19 | 0.30.2  | 29   | 0.3              |
 //!
 //! The `wgpu` dependency version must exactly match the one pinned inside
-//! this bevy version (raw `wgpu` types cross the public API, e.g.
-//! [`Tui::wgpu_texture`](setup::Tui::wgpu_texture)) - see the comment above
-//! the `wgpu` dependency in `Cargo.toml`.
+//! this bevy version - see the comment above the `wgpu` dependency in
+//! `Cargo.toml`.
 //!
 //! ## Features
 //!
@@ -28,7 +27,6 @@
 //!
 //! ```no_run
 //! use bevy::prelude::*;
-//! use bevy::render::renderer::{RenderDevice, RenderQueue};
 //! use bevy_tui_texture::prelude::*;
 //! use bevy_tui_texture::Font as TerminalFont;
 //! use font_kit::family_name::FamilyName;
@@ -51,14 +49,9 @@
 //!         .run();
 //! }
 //!
-//! fn setup(
-//!     mut commands: Commands,
-//!     render_device: Res<RenderDevice>,
-//!     render_queue: Res<RenderQueue>,
-//!     mut images: ResMut<Assets<Image>>,
-//!     mut meshes: ResMut<Assets<Mesh>>,
-//!     mut materials: ResMut<Assets<StandardMaterial>>,
-//! ) {
+//! /// No render resources anywhere in this signature - spawn a
+//! /// `TuiRequest` and the plugin materializes it next frame.
+//! fn setup(mut commands: Commands) {
 //!     let fonts = {
 //!         let font_data = SystemSource::new()
 //!             .select_best_match(&[FamilyName::Monospace], &Properties::new())
@@ -74,23 +67,15 @@
 //!         ))
 //!     };
 //!
-//!     let mut ctx = TerminalSpawnCtx {
-//!         render_device: &render_device,
-//!         render_queue: &render_queue,
-//!         images: &mut images,
-//!         meshes: &mut meshes,
-//!         materials: &mut materials,
-//!     };
-//!     let bundle = TerminalBundle::ui(
-//!         80,
-//!         25,
-//!         fonts,
-//!         TerminalConfig { keyboard: false, mouse: false, ..default() },
-//!         &mut ctx,
-//!     )
-//!     .expect("Failed to create terminal");
-//!
-//!     commands.spawn((bundle, Node::default(), HelloTerminal));
+//!     commands.spawn((
+//!         TuiRequest::ui(80, 25, fonts).with_config(TerminalConfig {
+//!             keyboard: false,
+//!             mouse: false,
+//!             ..default()
+//!         }),
+//!         Node::default(),
+//!         HelloTerminal,
+//!     ));
 //!     commands.spawn(Camera2d);
 //! }
 //!
@@ -112,13 +97,18 @@
 //!
 //! - `helloworld` - Minimal 2D terminal
 //! - `widget_catalog_2d` / `widget_catalog_3d` - ratatui widgets, mouse hit-testing, CJK
-//! - `world_terminal` - World-unit-sized in-game screen (`TerminalBundle::world_quad`)
+//! - `world_terminal` - World-unit-sized in-game screen (`TuiRequest::world_quad`
+//!   + `TuiFontSource::Asset` font loading)
 //! - `multiple_terminals` - Several terminals + Tab focus cycling
 //! - `shader_mesh` - `ExtendedMaterial` CRT shader effects
 //! - `retro_crt` - glTF model + shader + overlay UI + camera modes
 //! - `tui_component` - Manual entity spawning with `TerminalTexture`
+//! - `resize` - `Tui::request_resize` following the window size live
+//! - `transparent_world_quad` - HUD-style see-through screen
+//!   (`transparent_reset_bg` + `AlphaMode::Blend`)
 //! - `benchmark` - Rendering throughput
-//! - `wasm_demo` / `wasm_serve` - WASM build and local server
+//! - `wasm_demo` - the retro CRT scene running in a browser (WebGL2); see
+//!   `docs/README.md` for build/deploy/preview instructions
 //!
 //! ## Architecture
 //!
@@ -134,15 +124,54 @@
 //!
 //! 1. [`setup::TerminalTexture`] + [`setup::Tui::from_texture_state`] - manual
 //!    entity spawning, maximum flexibility (see `examples/tui_component.rs`).
-//! 2. [`setup::TerminalBundle::ui`] / [`setup::TerminalBundle::world_quad`]
-//!    (feature `2d`/`3d`) - thin spawn helpers returning a `Bundle`.
+//! 2. [`setup::TuiRequest`] - declarative spawning: spawn the request
+//!    component ([`setup::TuiKind::Ui`] / `WorldQuad` / `Headless`), the
+//!    plugin materializes the terminal - no render resources in user code.
 //! 3. [`setup::AttachTerminal`] (feature `3d`) - attach a `Tui` to an
-//!    *existing* mesh (e.g. a glTF primitive) instead of spawning one.
+//!    *existing* mesh (e.g. a glTF primitive) instead of spawning one
+//!    (combine with a `Headless` request for the `Tui` itself).
+//!
+//! ### Runtime Resize
+//!
+//! [`setup::Tui::request_resize`] changes a terminal's grid size live - no
+//! despawn/respawn, no GPU work at the call site (applied on the next
+//! frame's flush; `ImageNode`/materials keep pointing at the same
+//! `Handle<Image>`, recreated in place). There is deliberately no
+//! auto-fit-to-window helper - the recipe (see `examples/resize.rs`):
+//!
+//! ```ignore
+//! fn handle_resize(
+//!     mut events: MessageReader<TerminalEvent>,
+//!     fonts: Res<MyFontsResource>, // whatever holds the Arc<Fonts> the terminal uses
+//!     mut terminals: Query<&mut Tui, With<MyTerminalMarker>>,
+//! ) {
+//!     let Ok(mut term) = terminals.single_mut() else { return };
+//!     for event in events.read() {
+//!         if let TerminalEventType::Resize { new_size } = &event.event {
+//!             let cols = (new_size.0 / fonts.0.min_width_px()).max(1) as u16;
+//!             let rows = (new_size.1 / fonts.0.height_px()).max(1) as u16;
+//!             term.request_resize(cols, rows);
+//!         }
+//!     }
+//! }
+//! ```
+//!
+//! ### Transparency
+//!
+//! [`setup::TerminalConfig::transparent_reset_bg`] makes cells with no
+//! explicit background (`ratatui::style::Color::Reset`, ratatui's own
+//! default) render with alpha 0 instead of an opaque fill - combine with
+//! [`setup::TerminalConfig::alpha_mode`]` = AlphaMode::Blend` on a
+//! `TuiKind::WorldQuad` for a HUD-style screen the scene shows through (see
+//! `examples/transparent_world_quad.rs`). Cells with an explicit background
+//! color are unaffected - only `Reset` becomes transparent.
+//! [`setup::TerminalConfig::initial_fill`] controls the color shown before
+//! any content has been drawn (default opaque black).
 //!
 //! ## Feature Flags
 //!
-//! - `2d` (default) - 2D UI terminals ([`setup::TuiUi`], `TerminalBundle::ui`)
-//! - `3d` (default) - 3D mesh terminals (`TerminalBundle::world_quad`,
+//! - `2d` (default) - 2D UI terminals ([`setup::TuiUi`], [`setup::TuiKind::Ui`])
+//! - `3d` (default) - 3D mesh terminals (`TuiKind::WorldQuad`,
 //!   [`setup::AttachTerminal`], mesh raycasting)
 //! - `keyboard_input` (default) - Enable keyboard event handling
 //! - `mouse_input` (default) - Enable mouse event handling for both 2D UI and 3D mesh terminals
@@ -182,13 +211,11 @@ pub use fonts::{Font, Fonts, TerminalFontAsset};
 pub use bevy_plugin::{TerminalDimensions, TerminalPlugin};
 
 // Re-export the ECS-native terminal API
-pub use setup::{HitRegions, TerminalConfig, Tui, TuiSurface};
+pub use setup::{TuiFontSource, HitRegions, TerminalConfig, Tui, TuiKind, TuiRequest, TuiSurface};
 #[cfg(feature = "2d")]
 pub use setup::TuiUi;
 #[cfg(feature = "3d")]
 pub use setup::{AttachMaterial, AttachTerminal};
-#[cfg(all(feature = "2d", feature = "3d"))]
-pub use setup::{TerminalBundle, TerminalSpawnCtx};
 
 // Error types
 
@@ -198,21 +225,6 @@ pub use setup::{TerminalBundle, TerminalSpawnCtx};
 /// parsing a message string.
 #[derive(thiserror::Error, Debug)]
 pub enum TerminalError {
-    /// Backend creation failed because the device request failed.
-    #[error("device request failed: {0}")]
-    DeviceRequestFailed(wgpu::RequestDeviceError),
-    /// Backend creation failed because creating the surface failed.
-    #[error("surface creation failed: {0}")]
-    SurfaceCreationFailed(wgpu::CreateSurfaceError),
-    /// Backend creation failed because wgpu didn't provide an
-    /// [`Adapter`](wgpu::Adapter)
-    #[error("adapter request failed: {0}")]
-    AdapterRequestFailed(wgpu::RequestAdapterError),
-    /// Backend creation failed because the default surface configuration
-    /// couldn't be loaded.
-    #[error("failed to get default Surface configuration from wgpu")]
-    SurfaceConfigurationRequestFailed,
-
     /// ratatui's own `Terminal::new()` failed.
     #[error("ratatui terminal initialization failed: {0}")]
     Backend(#[from] std::io::Error),
@@ -229,20 +241,18 @@ type RandomState = std::hash::RandomState;
 // Convenience prelude for common imports
 pub mod prelude {
     // Plugin and components
-    pub use crate::bevy_plugin::{
-        TerminalDimensions, TerminalPlugin, TerminalSystemSet, update_terminal_texture,
-    };
+    pub use crate::bevy_plugin::{TerminalDimensions, TerminalPlugin, TerminalSystemSet};
 
     pub use crate::setup::TerminalTexture;
 
     // ECS-native terminal API
-    pub use crate::setup::{HitRegions, TerminalConfig, Tui, TuiSurface};
+    pub use crate::setup::{
+        TuiFontSource, HitRegions, TerminalConfig, Tui, TuiKind, TuiRequest, TuiSurface,
+    };
     #[cfg(feature = "2d")]
     pub use crate::setup::TuiUi;
     #[cfg(feature = "3d")]
     pub use crate::setup::{AttachMaterial, AttachTerminal};
-    #[cfg(all(feature = "2d", feature = "3d"))]
-    pub use crate::setup::{TerminalBundle, TerminalSpawnCtx};
 
     // Backend and builders
     pub use crate::{BevyTerminalBackend, Font, Fonts, TerminalBuilder, TerminalFontAsset};

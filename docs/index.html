@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:,"><!-- silence the favicon request -->
+  <title>bevy_tui_texture — retro CRT demo (WASM)</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #101014;
+    }
+    /* The demo renders into this canvas (Window.canvas = "#bevy") and
+       follows its parent's size (fit_canvas_to_parent = true). */
+    canvas#bevy {
+      display: block;
+      width: 100%;
+      height: 100%;
+      outline: none;
+    }
+    #loading {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 0.6em;
+      color: #7fbf7f;
+      font-family: monospace;
+      font-size: 1.1em;
+      pointer-events: none;
+      text-align: center;
+      padding: 0 1em;
+    }
+    #progress-track {
+      width: min(320px, 80vw);
+      height: 10px;
+      border: 1px solid #7fbf7f;
+      padding: 1px;
+      overflow: hidden; /* clip the fill even if a computed width ever exceeds 100% */
+    }
+    #progress-fill {
+      height: 100%;
+      width: 0%;
+      background: #7fbf7f;
+      transition: width 0.15s linear;
+    }
+    /* Indeterminate state (no Content-Length to compute a real percentage):
+       a sliding stripe instead of a stalled full/empty bar. */
+    #progress-fill.indeterminate {
+      width: 30% !important;
+      animation: indeterminate-slide 1.2s ease-in-out infinite;
+    }
+    @keyframes indeterminate-slide {
+      0%   { margin-left: 0%; }
+      50%  { margin-left: 70%; }
+      100% { margin-left: 0%; }
+    }
+  </style>
+</head>
+<body>
+  <div id="loading">
+    <div id="loading-text">loading wasm_demo_bg.wasm …</div>
+    <div id="progress-track"><div id="progress-fill"></div></div>
+  </div>
+  <canvas id="bevy"></canvas>
+  <script type="module">
+    // Cache-busting query param, appended to every fetched build artifact
+    // below. `wasm_demo.js` and `wasm_demo_bg.wasm` are matched pairs from
+    // the SAME build - if a browser's HTTP cache (GitHub Pages sends
+    // `cache-control: max-age=600`) has one of the two but not the other
+    // from a previous deploy, `WebAssembly.instantiate` fails with a
+    // `LinkError` ("function import requires a callable") because the
+    // mismatched JS glue and wasm binary disagree on import/export names.
+    // Bump ASSET_VERSION (see docs/README.md's rebuild steps) every time
+    // wasm_demo.js/wasm_demo_bg.wasm are regenerated, so browsers that
+    // cached an older pair are forced to re-fetch both together instead of
+    // silently mixing old and new.
+    const ASSET_VERSION = '2026-07-07-2';
+
+    const textEl = document.getElementById('loading-text');
+    const fillEl = document.getElementById('progress-fill');
+    const status = (msg) => {
+      if (textEl) textEl.textContent = msg;
+    };
+
+    // Fetches `url` while reporting download progress through `onProgress`
+    // (called with bytes loaded and total, total=0 if the server didn't
+    // send Content-Length). Returns a real `Response` so wasm-bindgen's
+    // `init()` can still use `WebAssembly.instantiateStreaming` (parses
+    // while downloading) instead of buffering the whole multi-MB body
+    // first.
+    async function fetchWithProgress(url, onProgress) {
+      const response = await fetch(url);
+      if (!response.ok) {
+        throw new Error(`fetch ${url} failed: ${response.status} ${response.statusText}`);
+      }
+      const total = Number(response.headers.get('Content-Length')) || 0;
+      if (!response.body) {
+        return response; // ReadableStream unsupported - no progress, just pass through
+      }
+      const reader = response.body.getReader();
+      let loaded = 0;
+      const stream = new ReadableStream({
+        async pull(controller) {
+          const { done, value } = await reader.read();
+          if (done) {
+            controller.close();
+            return;
+          }
+          loaded += value.byteLength;
+          onProgress(loaded, total);
+          controller.enqueue(value);
+        },
+        cancel(reason) {
+          reader.cancel(reason);
+        },
+      });
+      // Content-Type must survive (wasm-bindgen/instantiateStreaming checks
+      // for "application/wasm"); status/statusText don't matter past `ok`.
+      return new Response(stream, { headers: response.headers });
+    }
+
+    // `Content-Length` is the size ON THE WIRE. A CDN that gzip/br-encodes
+    // the response (GitHub Pages does) reports the COMPRESSED size there,
+    // but `fetch()` transparently decompresses the body, so the stream
+    // delivers more bytes than that - `loaded` overtakes `total` partway
+    // through and a naive percentage blows past 100%, overflowing the bar
+    // out of its track. There's no way to read the true decompressed size
+    // up front (`Accept-Encoding` can't be overridden from JS), so once a
+    // mismatch is caught, `total` is treated as unreliable for the rest of
+    // this load and the bar falls back to the indeterminate animation.
+    let totalUnreliable = false;
+    function reportProgress(loaded, total) {
+      if (loaded > total) totalUnreliable = true;
+      if (total > 0 && !totalUnreliable) {
+        fillEl.classList.remove('indeterminate');
+        fillEl.style.width = `${Math.min(100, Math.round((loaded / total) * 100))}%`;
+        status(`loading wasm_demo_bg.wasm … ${(loaded / 1e6).toFixed(1)} / ${(total / 1e6).toFixed(1)} MB`);
+      } else {
+        fillEl.classList.add('indeterminate');
+        status(`loading wasm_demo_bg.wasm … ${(loaded / 1e6).toFixed(1)} MB`);
+      }
+    }
+
+    // WebGL2 availability probe on a THROWAWAY canvas (probing #bevy would
+    // take its context and break the demo's own getContext later). If
+    // WebGL2 is unavailable (unsupported browser, or blocked - e.g. by
+    // Brave's fingerprinting shields), report and stop BEFORE fetching the
+    // multi-MB wasm.
+    if (!document.createElement('canvas').getContext('webgl2')) {
+      document.getElementById('progress-track')?.remove();
+      status('WebGL2 is not available in this browser (unsupported, or blocked '
+        + 'by the browser’s settings/shields). This demo cannot run.');
+    } else {
+      const { default: init } = await import(`./wasm_demo.js?v=${ASSET_VERSION}`);
+      try {
+        const wasmResponse = await fetchWithProgress(
+          `./wasm_demo_bg.wasm?v=${ASSET_VERSION}`,
+          reportProgress,
+        );
+        status('compiling / starting …');
+        // Passing the Response directly (not wrapped in an options object)
+        // hits wasm-bindgen's deprecated call convention: init() checks
+        // `Object.getPrototypeOf(x) === Object.prototype` to decide whether
+        // `x` is a `{module_or_path, ...}` options object; a Response's
+        // prototype is Response.prototype, not Object.prototype, so it fell
+        // through to the deprecated branch and just warned (harmlessly) -
+        // the current convention wraps it explicitly instead.
+        await init({ module_or_path: wasmResponse });
+        document.getElementById('loading')?.remove();
+      } catch (e) {
+        // winit's control-flow exception is expected on startup, not an error.
+        if (`${e}`.includes('Using exceptions for control flow')) {
+          document.getElementById('loading')?.remove();
+        } else {
+          status(`failed to start: ${e}`);
+          throw e;
+        }
+      }
+    }
+  </script>
+</body>
+</html>

@@ -17,7 +17,7 @@
 //!   already samples.
 //!
 //! See also `world_terminal.rs`, which uses the same zero-render-resource
-//! pattern for a single in-world screen built via `TerminalBundle::world_quad`.
+//! pattern for a single in-world screen spawned via `TuiRequest::world_quad`.
 //! Here, `update_screen_a`/`update_screen_b` take only what they actually
 //! need for gameplay logic - no `render_device`, `render_queue`, `images`,
 //! or `materials` in either signature.
@@ -27,7 +27,6 @@
 use bevy::pbr::{ExtendedMaterial, MaterialExtension};
 use bevy::prelude::*;
 use bevy::render::render_resource::AsBindGroup;
-use bevy::render::renderer::{RenderDevice, RenderQueue};
 use bevy_tui_texture::prelude::*;
 use bevy_tui_texture::Font as TerminalFont;
 use ratatui::style::{Color as TuiColor, Modifier, Style};
@@ -90,8 +89,6 @@ struct ClickCounts {
 
 fn setup(
     mut commands: Commands,
-    render_device: Res<RenderDevice>,
-    render_queue: Res<RenderQueue>,
     mut images: ResMut<Assets<Image>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut std_materials: ResMut<Assets<StandardMaterial>>,
@@ -114,16 +111,8 @@ fn setup(
     let fonts = Arc::new(Fonts::new(font, 24));
 
     // --- Screen A: StandardMaterial, no plugin registration needed ---
-    let texture_a = TerminalTexture::create(
-        24,
-        8,
-        fonts.clone(),
-        true,
-        &render_device,
-        &render_queue,
-        &mut images,
-    )
-    .expect("failed to create terminal texture (screen A)");
+    let texture_a = TerminalTexture::create(24, 8, fonts.clone(), true, false, [0, 0, 0, 255], &mut images)
+        .expect("failed to create terminal texture (screen A)");
     let aspect_a = texture_a.width as f32 / texture_a.height as f32;
     let mesh_a = meshes.add(Plane3d::new(Vec3::Z, Vec2::new(1.2 * aspect_a, 1.2)));
     let material_a = std_materials.add(StandardMaterial {
@@ -149,16 +138,8 @@ fn setup(
     ));
 
     // --- Screen B: custom ExtendedMaterial, updated via the render-world copy ---
-    let texture_b = TerminalTexture::create(
-        24,
-        8,
-        fonts,
-        true,
-        &render_device,
-        &render_queue,
-        &mut images,
-    )
-    .expect("failed to create terminal texture (screen B)");
+    let texture_b = TerminalTexture::create(24, 8, fonts, true, false, [0, 0, 0, 255], &mut images)
+        .expect("failed to create terminal texture (screen B)");
     let aspect_b = texture_b.width as f32 / texture_b.height as f32;
     let mesh_b = meshes.add(Plane3d::new(Vec3::Z, Vec2::new(1.2 * aspect_b, 1.2)));
     let material_b = ext_materials.add(ScreenBMaterial {

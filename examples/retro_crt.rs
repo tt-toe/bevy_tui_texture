@@ -8,18 +8,27 @@
 // - Extending with custom uniforms at binding 100
 // - Letting Bevy's PBR system handle texture sampling
 //
+// examples/wasm_demo.rs includes this file as a module (`#[path =
+// "retro_crt.rs"] mod retro_crt;`) rather than duplicating it, so both
+// binaries share one scene. The few wasm32/WebGL2 differences (OIT
+// skipped, tonemapping without LUTs, canvas config) live inline behind
+// `#[cfg(target_arch = "wasm32")]` right here - `main` is `pub` so
+// wasm_demo.rs's shim can call `retro_crt::main()`.
+//
 // Press SPACE to toggle CRT effects
 // Press LEFT/RIGHT (or click the tab bar) to switch tabs on the CRT screen
-// Press ESC to quit
+// Press ESC to quit (native only)
 
 use bevy::app::AppExit;
+#[cfg(not(target_arch = "wasm32"))]
 use bevy::core_pipeline::oit::OrderIndependentTransparencySettings;
+#[cfg(target_arch = "wasm32")]
+use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::gltf::Gltf;
 use bevy::pbr::{ExtendedMaterial, MaterialExtension};
 use bevy::prelude::*;
 use bevy::reflect::Reflect;
 use bevy::render::render_resource::{AsBindGroup, ShaderType};
-use bevy::render::renderer::{RenderDevice, RenderQueue};
 use bevy::shader::ShaderRef;
 use bevy::window::WindowResolution;
 // bevy 0.19: glTF scenes are WorldAssets, spawned via WorldAssetRoot.
@@ -34,17 +43,48 @@ use unicode_width::UnicodeWidthStr;
 use bevy_tui_texture::prelude::*;
 use bevy_tui_texture::Font as TerminalFont;
 
-fn main() {
-    App::new()
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "CRT Effect with Mesh3d".to_string(),
-                resolution: WindowResolution::new(1024, 768),
-                ..default()
-            }),
+pub fn main() {
+    let window_plugin = WindowPlugin {
+        primary_window: Some(Window {
+            title: "CRT Effect with Mesh3d".to_string(),
+            resolution: WindowResolution::new(1024, 768),
+            // Ignored on native; on wasm, render into the page's
+            // <canvas id="bevy"> and follow its parent's size (see
+            // wasm_demo.rs / docs/index.html).
+            canvas: Some("#bevy".to_string()),
+            fit_canvas_to_parent: true,
+            prevent_default_event_handling: false,
             ..default()
-        }))
-        .add_plugins(MaterialPlugin::<CrtMaterial>::default())
+        }),
+        ..default()
+    };
+
+    let mut app = App::new();
+    #[cfg(not(target_arch = "wasm32"))]
+    app.add_plugins(DefaultPlugins.set(window_plugin));
+    // `WgpuSettings::default()`'s `priority` is `Functionality`, which makes
+    // `bevy_render::renderer::initialize_renderer` DISCARD the safe
+    // `downlevel_webgl2_defaults()` limits it already computed and replace
+    // them with `adapter.limits()`/`adapter.features()` queried directly
+    // from the browser's WebGL2 adapter - together with an unconditional
+    // `unsafe { wgpu::ExperimentalFeatures::enabled() }` on every device
+    // request, this device descriptor has caused an unrecoverable hang
+    // (not just a clean panic) on wasm32/WebGL2 in testing. Forcing
+    // `WgpuSettingsPriority::WebGL2` keeps the conservative, known-safe
+    // downlevel limits/features instead of trusting the adapter's raw
+    // report.
+    #[cfg(target_arch = "wasm32")]
+    app.add_plugins(DefaultPlugins.set(window_plugin).set(bevy::render::RenderPlugin {
+        render_creation: bevy::render::settings::RenderCreation::Automatic(Box::new(
+            bevy::render::settings::WgpuSettings {
+                priority: bevy::render::settings::WgpuSettingsPriority::WebGL2,
+                ..default()
+            },
+        )),
+        ..default()
+    }));
+
+    app.add_plugins(MaterialPlugin::<CrtMaterial>::default())
         .add_plugins(MaterialPlugin::<BlurMaterial>::default())
         .add_plugins(TerminalPlugin::default())
         .add_systems(Startup, setup)
@@ -112,7 +152,6 @@ struct BlurMaterial {
     #[texture(1)]
     #[sampler(2)]
     pub base_color_texture: Option<Handle<Image>>,
-    pub alpha_mode: AlphaMode,
 }
 
 impl Material for BlurMaterial {
@@ -124,7 +163,6 @@ impl Material for BlurMaterial {
     }
 
     fn alpha_mode(&self) -> AlphaMode {
-        // self.alpha_mode
         AlphaMode::Add
     }
     fn specialize(
@@ -153,22 +191,20 @@ impl Material for BlurMaterial {
 
         // Explicit additive blend state
         if let Some(fragment) = &mut descriptor.fragment {
-            for target in fragment.targets.iter_mut() {
-                if let Some(color_target) = target {
-                    // Additive blending
-                    color_target.blend = Some(bevy::render::render_resource::BlendState {
-                        color: bevy::render::render_resource::BlendComponent {
-                            src_factor: bevy::render::render_resource::BlendFactor::One,
-                            dst_factor: bevy::render::render_resource::BlendFactor::One,
-                            operation: bevy::render::render_resource::BlendOperation::Add,
-                        },
-                        alpha: bevy::render::render_resource::BlendComponent {
-                            src_factor: bevy::render::render_resource::BlendFactor::One,
-                            dst_factor: bevy::render::render_resource::BlendFactor::One,
-                            operation: bevy::render::render_resource::BlendOperation::Add,
-                        },
-                    });
-                }
+            for color_target in fragment.targets.iter_mut().flatten() {
+                // Additive blending
+                color_target.blend = Some(bevy::render::render_resource::BlendState {
+                    color: bevy::render::render_resource::BlendComponent {
+                        src_factor: bevy::render::render_resource::BlendFactor::One,
+                        dst_factor: bevy::render::render_resource::BlendFactor::One,
+                        operation: bevy::render::render_resource::BlendOperation::Add,
+                    },
+                    alpha: bevy::render::render_resource::BlendComponent {
+                        src_factor: bevy::render::render_resource::BlendFactor::One,
+                        dst_factor: bevy::render::render_resource::BlendFactor::One,
+                        operation: bevy::render::render_resource::BlendOperation::Add,
+                    },
+                });
             }
         }
 
@@ -226,6 +262,8 @@ enum Hit {
     CrtCheckbox,
     ShadowsCheckbox,
     CameraRadio(u8),
+    /// The overlay panel's title bar - click to toggle `panel_collapsed`.
+    PanelTitleBar,
 }
 
 impl From<Hit> for u64 {
@@ -237,6 +275,7 @@ impl From<Hit> for u64 {
             Hit::CrtCheckbox => 0x04_00,
             Hit::ShadowsCheckbox => 0x05_00,
             Hit::CameraRadio(i) => 0x06_00 | i as u64,
+            Hit::PanelTitleBar => 0x07_00,
         }
     }
 }
@@ -251,10 +290,17 @@ impl TryFrom<u64> for Hit {
             0x04_00 => Ok(Hit::CrtCheckbox),
             0x05_00 => Ok(Hit::ShadowsCheckbox),
             0x06_00 => Ok(Hit::CameraRadio((v & 0xff) as u8)),
+            0x07_00 => Ok(Hit::PanelTitleBar),
             _ => Err(()),
         }
     }
 }
+
+/// Overlay panel grid: 32 cols always; 21 rows expanded, 1 row (title bar
+/// only) when collapsed by clicking the title bar.
+const OVERLAY_COLS: u16 = 32;
+const OVERLAY_ROWS: u16 = 21;
+const OVERLAY_ROWS_COLLAPSED: u16 = 1;
 
 #[derive(Resource)]
 struct AppState {
@@ -270,6 +316,8 @@ struct AppState {
     selected_tab: usize,
     // TABLE tab: mouse-selectable diagnostics table
     table_state: TableState,
+    // Overlay panel folded down to just its title bar (click to toggle)
+    panel_collapsed: bool,
 }
 
 impl Default for AppState {
@@ -282,10 +330,11 @@ impl Default for AppState {
             button_click_count: 0,
             // Dim ambient light so the CRT screen (unlit + emissive) stands out
             light_illuminance: 1500.0,
-            shadows_enabled: true, // shadows on by default
+            shadows_enabled: true,          // shadows on by default
             camera_mode: CameraMode::Orbit, // default: orbiting camera
             selected_tab: 0,
             table_state: TableState::default(),
+            panel_collapsed: false,
         }
     }
 }
@@ -323,9 +372,6 @@ struct GltfSpawned;
 
 fn setup(
     mut commands: Commands,
-    render_device: Res<RenderDevice>,
-    render_queue: Res<RenderQueue>,
-    mut images: ResMut<Assets<Image>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut standard_materials: ResMut<Assets<StandardMaterial>>,
     asset_server: Res<AssetServer>,
@@ -338,27 +384,31 @@ fn setup(
     let font = TerminalFont::new(font_data).expect("Failed to load font");
     let fonts = Arc::new(Fonts::new(font, 16));
 
-    // Create main terminal texture
-    let texture = TerminalTexture::create(
-        32,
-        24,
-        fonts.clone(),
-        true,
-        &render_device,
-        &render_queue,
-        &mut images,
-    )
-    .expect("Failed to create main terminal");
-    let mut main_tui = Tui::from_texture_state(texture);
-
-    // Camera with Order Independent Transparency (MSAA disabled for OIT compatibility)
-    commands.spawn((
-        Camera3d::default(),
-        Transform::from_xyz(0.0, 0.5, 1.2).looking_at(Vec3::new(0.0, 0.1, 0.0), Vec3::Y),
-        OrderIndependentTransparencySettings::default(), // OIT enabled
-        Msaa::Off,                                       // OIT is incompatible with MSAA
-        OrbitCamera,
-    ));
+    // Camera. On native, Order Independent Transparency is enabled (MSAA
+    // disabled for OIT compatibility); on wasm/WebGL2, OIT is skipped - it
+    // needs storage buffers, which WebGL2 does not have. The additive
+    // reflection still renders without it, just without order-independent
+    // sorting of overlapping transparent surfaces.
+    let camera = commands
+        .spawn((
+            Camera3d::default(),
+            Transform::from_xyz(0.0, 0.5, 1.2).looking_at(Vec3::new(0.0, 0.1, 0.0), Vec3::Y),
+            Msaa::Off,
+            OrbitCamera,
+        ))
+        .id();
+    #[cfg(not(target_arch = "wasm32"))]
+    commands
+        .entity(camera)
+        .insert(OrderIndependentTransparencySettings::default());
+    // Camera3d's default Tonemapping (TonyMcMapface) requires the
+    // `tonemapping_luts` bevy feature, which the wasm build disables for
+    // binary size (see Cargo.toml). KhronosPbrNeutral needs no LUT and is
+    // still a modern, mild tonemapper - not just Tonemapping::None.
+    #[cfg(target_arch = "wasm32")]
+    commands
+        .entity(camera)
+        .insert(Tonemapping::KhronosPbrNeutral);
 
     // Note: Materials are now created dynamically when needed
     // (CrtMaterial for Object_2 and ReflectionMaterial for Monitor_Reflection)
@@ -429,48 +479,14 @@ fn setup(
     let gltf_handle: Handle<Gltf> = asset_server.load("models/retro_crt.glb");
     commands.spawn((GltfAsset(gltf_handle), GltfModel));
 
-    // Initial draw for the main terminal - the zero-latency flush shows
-    // this on the first presented frame, no synchronous GPU call needed.
-    main_tui.draw(|frame| {
-        let area = frame.area();
-
-        // Clear with colorful background
-        let clear = Block::default().style(Style::default().bg(RatatuiColor::Rgb(10, 10, 30)));
-        frame.render_widget(clear, area);
-
-        let title = Paragraph::new("Shader with ExtendedMaterial - Loading...")
-            .style(
-                Style::default()
-                    .fg(RatatuiColor::Green)
-                    .bg(RatatuiColor::DarkGray)
-                    .bold(),
-            )
-            .alignment(Alignment::Center)
-            .block(Block::bordered().border_style(Style::default().fg(RatatuiColor::White)));
-        frame.render_widget(title, area);
-    });
-
-    // Overlay terminal: a `Tui` entity, top-right anchored via `Val::Px`
-    // alone — no px-estimate math, no resize system needed; bevy_ui
-    // re-anchors `right`/`top` automatically.
-    let mut ctx = TerminalSpawnCtx {
-        render_device: &render_device,
-        render_queue: &render_queue,
-        images: &mut images,
-        meshes: &mut meshes,
-        materials: &mut standard_materials,
-    };
-    let overlay_bundle = TerminalBundle::ui(
-        32, // columns (slightly smaller)
-        21, // rows (control UI + model credit lines)
-        fonts.clone(),
-        TerminalConfig::default(),
-        &mut ctx,
-    )
-    .expect("Failed to create overlay terminal");
-
+    // Overlay terminal: a declarative `TuiRequest`, top-right anchored via
+    // `Val::Px` alone — no px-estimate math, no resize system needed;
+    // bevy_ui re-anchors `right`/`top` automatically. Starts expanded;
+    // render_overlay_terminal folds it down to its title bar on click via
+    // `Tui::request_resize` (the Node itself follows the texture's new
+    // pixel size automatically - no separate Node-size bookkeeping).
     commands.spawn((
-        overlay_bundle,
+        TuiRequest::ui(OVERLAY_COLS, OVERLAY_ROWS, fonts.clone()),
         Node {
             position_type: PositionType::Absolute,
             right: Val::Px(20.0),
@@ -480,11 +496,38 @@ fn setup(
         OverlayScreen,
     ));
 
-    // The main CRT screen's terminal is a `Tui` entity, not a Resource.
-    // Object_2's mesh attaches to it via `AttachTerminal` once the glTF
-    // loads (claim_object2_screen below), found by querying the
-    // `MainScreen` marker rather than a resource.
-    commands.spawn((main_tui, MainScreen));
+    // The main CRT screen: a headless `TuiRequest` - no surface components
+    // of its own; Object_2's mesh attaches to it via `AttachTerminal` once
+    // the glTF loads (claim_object2_screen below), found by querying the
+    // `MainScreen` marker rather than a resource. `initial_draw` shows a
+    // loading splash until the per-frame draw system takes over.
+    commands.spawn((
+        TuiRequest::headless(32, 24, fonts).with_config(TerminalConfig {
+            initial_draw: Some(Box::new(|frame| {
+                let area = frame.area();
+
+                // Clear with colorful background
+                let clear =
+                    Block::default().style(Style::default().bg(RatatuiColor::Rgb(10, 10, 30)));
+                frame.render_widget(clear, area);
+
+                let title = Paragraph::new("Shader with ExtendedMaterial - Loading...")
+                    .style(
+                        Style::default()
+                            .fg(RatatuiColor::Green)
+                            .bg(RatatuiColor::DarkGray)
+                            .bold(),
+                    )
+                    .alignment(Alignment::Center)
+                    .block(
+                        Block::bordered().border_style(Style::default().fg(RatatuiColor::White)),
+                    );
+                frame.render_widget(title, area);
+            })),
+            ..default()
+        }),
+        MainScreen,
+    ));
     commands.insert_resource(AppState::default());
 }
 
@@ -562,7 +605,10 @@ fn claim_object2_screen(
             continue;
         };
 
-        info!("Found Object_2 (Monitor Glass): '{}' - attaching Tui", name.as_str());
+        info!(
+            "Found Object_2 (Monitor Glass): '{}' - attaching Tui",
+            name.as_str()
+        );
 
         // Captured for the material factory below - the glTF material's own
         // double_sided/cull_mode should carry over even though everything
@@ -634,7 +680,10 @@ fn claim_monitor_reflection(
             continue;
         }
 
-        info!("Found Monitor_Reflection: '{}' - attaching BlurMaterial", name_str);
+        info!(
+            "Found Monitor_Reflection: '{}' - attaching BlurMaterial",
+            name_str
+        );
 
         let blur_material_handle = blur_materials.add(BlurMaterial {
             uniforms: BlurUniforms {
@@ -644,7 +693,6 @@ fn claim_monitor_reflection(
                 blur_samples: 5.0,     // 5x5 kernel
             },
             base_color_texture: Some(main_tui.image_handle().clone()),
-            alpha_mode: AlphaMode::Add, // additive blending
         });
 
         // Vertex colors already come from the model (the GLB's COLOR_0):
@@ -732,8 +780,7 @@ fn handle_terminal_events(
                     _ => {}
                 }
             }
-        } else if let Some((_, overlay_tui)) =
-            overlay.filter(|(entity, _)| *entity == event.target)
+        } else if let Some((_, overlay_tui)) = overlay.filter(|(entity, _)| *entity == event.target)
         {
             // Overlay terminal events - hit-tested via HitRegions, not
             // parallel Rect bookkeeping.
@@ -776,6 +823,17 @@ fn handle_terminal_events(
                             app_state.camera_mode = new_mode;
                             info!("🎯 Camera: {:?}", new_mode);
                         }
+                    }
+                    Some(Hit::PanelTitleBar) => {
+                        app_state.panel_collapsed = !app_state.panel_collapsed;
+                        info!(
+                            "🎯 Panel {}",
+                            if app_state.panel_collapsed {
+                                "collapsed"
+                            } else {
+                                "expanded"
+                            }
+                        );
                     }
                     _ => {}
                 }
@@ -849,7 +907,7 @@ fn render_terminal(
     }
 
     // Button click animation (resets after 1 second)
-    if app_state.button_clicked && app_state.frame_count % 60 == 0 {
+    if app_state.button_clicked && app_state.frame_count.is_multiple_of(60) {
         app_state.button_clicked = false;
     }
 
@@ -858,47 +916,46 @@ fn render_terminal(
     if std::env::var("CRT_CALIBRATE").is_ok() {
         let count = app_state.frame_count / 10;
         term.draw(|frame| {
-                let a = frame.area();
-                let (hw, hh) = (a.width / 2, a.height / 2);
-                let quads = [
-                    (0, 0, hw, hh, RatatuiColor::Red, "R-TL"),
-                    (hw, 0, a.width - hw, hh, RatatuiColor::Green, "G-TR"),
-                    (0, hh, hw, a.height - hh, RatatuiColor::Blue, "B-BL"),
-                    (
-                        hw,
-                        hh,
-                        a.width - hw,
-                        a.height - hh,
-                        RatatuiColor::Yellow,
-                        "Y-BR",
-                    ),
-                ];
-                for (x, y, w, h, color, label) in quads {
-                    frame.render_widget(
-                        Paragraph::new(label)
-                            .style(Style::default().fg(RatatuiColor::Black).bg(color)),
-                        ratatui::layout::Rect {
-                            x,
-                            y,
-                            width: w,
-                            height: h,
-                        },
-                    );
-                }
+            let a = frame.area();
+            let (hw, hh) = (a.width / 2, a.height / 2);
+            let quads = [
+                (0, 0, hw, hh, RatatuiColor::Red, "R-TL"),
+                (hw, 0, a.width - hw, hh, RatatuiColor::Green, "G-TR"),
+                (0, hh, hw, a.height - hh, RatatuiColor::Blue, "B-BL"),
+                (
+                    hw,
+                    hh,
+                    a.width - hw,
+                    a.height - hh,
+                    RatatuiColor::Yellow,
+                    "Y-BR",
+                ),
+            ];
+            for (x, y, w, h, color, label) in quads {
                 frame.render_widget(
-                    Paragraph::new(format!("{count:^10}")).style(
-                        Style::default()
-                            .fg(RatatuiColor::White)
-                            .bg(RatatuiColor::Black),
-                    ),
+                    Paragraph::new(label).style(Style::default().fg(RatatuiColor::Black).bg(color)),
                     ratatui::layout::Rect {
-                        x: a.width / 2 - 5,
-                        y: hh,
-                        width: 10,
-                        height: 1,
+                        x,
+                        y,
+                        width: w,
+                        height: h,
                     },
                 );
-            });
+            }
+            frame.render_widget(
+                Paragraph::new(format!("{count:^10}")).style(
+                    Style::default()
+                        .fg(RatatuiColor::White)
+                        .bg(RatatuiColor::Black),
+                ),
+                ratatui::layout::Rect {
+                    x: a.width / 2 - 5,
+                    y: hh,
+                    width: 10,
+                    height: 1,
+                },
+            );
+        });
         return;
     }
 
@@ -907,139 +964,139 @@ fn render_terminal(
     // leaves a 30x22 interior, split into a Ratatui logo banner, a rule,
     // a switchable Tabs bar, 17 rows of tab content, and a marquee footer.
     term.draw_with_hits(|frame, hits| {
-            let area = frame.area();
+        let area = frame.area();
 
-            let outer = Block::bordered()
-                .border_style(Style::default().fg(RatatuiColor::Cyan))
-                .style(Style::default().bg(RatatuiColor::Black))
-                .title(Line::styled(
-                    " TERMINAL-32 ",
-                    Style::default().fg(RatatuiColor::Magenta).bold(),
-                ))
-                .title_bottom(Line::styled(
-                    "SPACE:FX CLICK:SELECT ESC:QUIT",
-                    Style::default().fg(RatatuiColor::Gray),
-                ));
-            let interior = outer.inner(area);
-            frame.render_widget(outer, area);
+        let outer = Block::bordered()
+            .border_style(Style::default().fg(RatatuiColor::Cyan))
+            .style(Style::default().bg(RatatuiColor::Black))
+            .title(Line::styled(
+                " TERMINAL-32 ",
+                Style::default().fg(RatatuiColor::Magenta).bold(),
+            ))
+            .title_bottom(Line::styled(
+                "SPACE:FX CLICK:SELECT ESC:QUIT",
+                Style::default().fg(RatatuiColor::Gray),
+            ));
+        let interior = outer.inner(area);
+        frame.render_widget(outer, area);
 
-            let sections = Layout::vertical([
-                Constraint::Length(2),  // banner: RatatuiLogo::small()
-                Constraint::Length(1),  // separator rule
-                Constraint::Length(1),  // blank (above tabs bar)
-                Constraint::Length(1),  // tabs bar
-                Constraint::Length(1),  // blank (below tabs bar)
-                Constraint::Length(15), // tab content
-                Constraint::Length(1),  // marquee footer
-            ])
-            .split(interior);
-            let (banner_area, rule_area, tabs_area, content_area, marquee_area) = (
-                sections[0],
-                sections[1],
-                sections[3],
-                sections[5],
-                sections[6],
-            );
+        let sections = Layout::vertical([
+            Constraint::Length(2),  // banner: RatatuiLogo::small()
+            Constraint::Length(1),  // separator rule
+            Constraint::Length(1),  // blank (above tabs bar)
+            Constraint::Length(1),  // tabs bar
+            Constraint::Length(1),  // blank (below tabs bar)
+            Constraint::Length(15), // tab content
+            Constraint::Length(1),  // marquee footer
+        ])
+        .split(interior);
+        let (banner_area, rule_area, tabs_area, content_area, marquee_area) = (
+            sections[0],
+            sections[1],
+            sections[3],
+            sections[5],
+            sections[6],
+        );
 
-            // --- Banner: the official Ratatui logo, in retro rainbow bands ---
-            let banner_cols = Layout::horizontal([
-                Constraint::Fill(1),
-                Constraint::Length(27),
-                Constraint::Fill(1),
-            ])
-            .split(banner_area);
-            let logo_rect = banner_cols[1];
-            let band_colors = [
-                RatatuiColor::Magenta,
-                RatatuiColor::Cyan,
-                RatatuiColor::Yellow,
-            ];
-            let band_w = logo_rect.width / band_colors.len() as u16;
-            for (i, color) in band_colors.iter().enumerate() {
-                let w = if i == band_colors.len() - 1 {
-                    logo_rect.width - band_w * (band_colors.len() as u16 - 1)
-                } else {
-                    band_w
-                };
-                let band = ratatui::layout::Rect {
-                    x: logo_rect.x + band_w * i as u16,
-                    y: logo_rect.y,
-                    width: w,
-                    height: logo_rect.height,
-                };
-                // A plain color fill; RatatuiLogo's glyphs are drawn with
-                // Style::default() (no fg/bg set), so they inherit whatever
-                // color is already in each cell - giving a banded rainbow.
-                frame.render_widget(
-                    Block::default().style(Style::default().bg(RatatuiColor::Black).fg(*color)),
-                    band,
-                );
-            }
-            frame.render_widget(RatatuiLogo::small(), logo_rect);
-
-            // --- Separator rule ---
+        // --- Banner: the official Ratatui logo, in retro rainbow bands ---
+        let banner_cols = Layout::horizontal([
+            Constraint::Fill(1),
+            Constraint::Length(27),
+            Constraint::Fill(1),
+        ])
+        .split(banner_area);
+        let logo_rect = banner_cols[1];
+        let band_colors = [
+            RatatuiColor::Magenta,
+            RatatuiColor::Cyan,
+            RatatuiColor::Yellow,
+        ];
+        let band_w = logo_rect.width / band_colors.len() as u16;
+        for (i, color) in band_colors.iter().enumerate() {
+            let w = if i == band_colors.len() - 1 {
+                logo_rect.width - band_w * (band_colors.len() as u16 - 1)
+            } else {
+                band_w
+            };
+            let band = ratatui::layout::Rect {
+                x: logo_rect.x + band_w * i as u16,
+                y: logo_rect.y,
+                width: w,
+                height: logo_rect.height,
+            };
+            // A plain color fill; RatatuiLogo's glyphs are drawn with
+            // Style::default() (no fg/bg set), so they inherit whatever
+            // color is already in each cell - giving a banded rainbow.
             frame.render_widget(
-                Paragraph::new("═".repeat(rule_area.width as usize))
-                    .style(Style::default().fg(RatatuiColor::DarkGray)),
-                rule_area,
+                Block::default().style(Style::default().bg(RatatuiColor::Black).fg(*color)),
+                band,
             );
+        }
+        frame.render_widget(RatatuiLogo::small(), logo_rect);
 
-            // --- Tabs bar: https://ratatui.rs/examples/widgets/tabs/ ---
-            // Switchable by mouse click (hit-tested below) or Left/Right arrow keys.
-            const TAB_DIVIDER: &str = "|";
-            const TAB_PAD: &str = " ";
-            let tabs = Tabs::new(TAB_TITLES)
-                .style(
-                    Style::default()
-                        .fg(RatatuiColor::Gray)
-                        .bg(RatatuiColor::Black),
-                )
-                .highlight_style(
-                    Style::default()
-                        .fg(RatatuiColor::Black)
-                        .bg(RatatuiColor::Magenta)
-                        .bold(),
-                )
-                .select(app_state.selected_tab)
-                .divider(TAB_DIVIDER)
-                .padding(TAB_PAD, TAB_PAD);
-            frame.render_widget(tabs, tabs_area);
+        // --- Separator rule ---
+        frame.render_widget(
+            Paragraph::new("═".repeat(rule_area.width as usize))
+                .style(Style::default().fg(RatatuiColor::DarkGray)),
+            rule_area,
+        );
 
-            // Click zones sized to each title's actual rendered width (padding
-            // + label text), matching how Tabs itself lays the header out
-            // left-to-right, so hit-testing tracks the real glyph boundaries
-            // rather than an equal three-way split.
-            let pad_w = TAB_PAD.width() as u16;
-            let divider_w = TAB_DIVIDER.width() as u16;
-            let mut x = tabs_area.x;
-            for (i, title) in TAB_TITLES.iter().enumerate() {
-                let seg_w = pad_w + title.width() as u16 + pad_w;
-                let clamped_w = seg_w.min(tabs_area.right().saturating_sub(x));
-                hits.add(
-                    Hit::Tab(i as u8),
-                    ratatui::layout::Rect {
-                        x,
-                        y: tabs_area.y,
-                        width: clamped_w,
-                        height: tabs_area.height,
-                    },
-                );
-                x += seg_w + divider_w;
-            }
+        // --- Tabs bar: https://ratatui.rs/examples/widgets/tabs/ ---
+        // Switchable by mouse click (hit-tested below) or Left/Right arrow keys.
+        const TAB_DIVIDER: &str = "|";
+        const TAB_PAD: &str = " ";
+        let tabs = Tabs::new(TAB_TITLES)
+            .style(
+                Style::default()
+                    .fg(RatatuiColor::Gray)
+                    .bg(RatatuiColor::Black),
+            )
+            .highlight_style(
+                Style::default()
+                    .fg(RatatuiColor::Black)
+                    .bg(RatatuiColor::Magenta)
+                    .bold(),
+            )
+            .select(app_state.selected_tab)
+            .divider(TAB_DIVIDER)
+            .padding(TAB_PAD, TAB_PAD);
+        frame.render_widget(tabs, tabs_area);
 
-            // --- Tab content ---
-            match app_state.selected_tab {
-                0 => render_status_tab(frame, content_area, &app_state, hits),
-                1 => render_effects_tab(frame, content_area),
-                _ => render_table_tab(frame, content_area, &mut app_state, hits),
-            }
-
-            // --- Marquee footer: classic BBS "chasing lights" scroller (edge animation) ---
-            frame.render_widget(
-                marquee_line(app_state.frame_count, marquee_area.width),
-                marquee_area,
+        // Click zones sized to each title's actual rendered width (padding
+        // + label text), matching how Tabs itself lays the header out
+        // left-to-right, so hit-testing tracks the real glyph boundaries
+        // rather than an equal three-way split.
+        let pad_w = TAB_PAD.width() as u16;
+        let divider_w = TAB_DIVIDER.width() as u16;
+        let mut x = tabs_area.x;
+        for (i, title) in TAB_TITLES.iter().enumerate() {
+            let seg_w = pad_w + title.width() as u16 + pad_w;
+            let clamped_w = seg_w.min(tabs_area.right().saturating_sub(x));
+            hits.add(
+                Hit::Tab(i as u8),
+                ratatui::layout::Rect {
+                    x,
+                    y: tabs_area.y,
+                    width: clamped_w,
+                    height: tabs_area.height,
+                },
             );
-        });
+            x += seg_w + divider_w;
+        }
+
+        // --- Tab content ---
+        match app_state.selected_tab {
+            0 => render_status_tab(frame, content_area, &app_state, hits),
+            1 => render_effects_tab(frame, content_area),
+            _ => render_table_tab(frame, content_area, &mut app_state, hits),
+        }
+
+        // --- Marquee footer: classic BBS "chasing lights" scroller (edge animation) ---
+        frame.render_widget(
+            marquee_line(app_state.frame_count, marquee_area.width),
+            marquee_area,
+        );
+    });
 }
 
 /// STATUS tab: the interactive button (click to increment) + a live status readout.
@@ -1268,7 +1325,7 @@ fn marquee_line(frame_count: u32, width: u16) -> Line<'static> {
     let spans: Vec<Span<'static>> = (0..width as usize)
         .map(|i| {
             let c = chars[(offset + i) % len];
-            let lit = (i as u32 + frame_count / 4) % 4 == 0;
+            let lit = (i as u32 + frame_count / 4).is_multiple_of(4);
             let style = if lit {
                 Style::default()
                     .fg(RatatuiColor::Black)
@@ -1295,147 +1352,184 @@ fn render_overlay_terminal(
     let Ok(mut term) = screens.single_mut() else {
         return;
     };
+
+    // Folded down to just the title bar when collapsed - `request_resize`
+    // is a no-op once already at the target size, so calling it every
+    // frame is cheap. The Node's on-screen size follows the texture's new
+    // pixel size automatically (bevy_ui remeasures the image every frame).
+    let target_rows = if app_state.panel_collapsed {
+        OVERLAY_ROWS_COLLAPSED
+    } else {
+        OVERLAY_ROWS
+    };
+    term.request_resize(OVERLAY_COLS, target_rows);
+
     term.draw_with_hits(|frame, hits| {
         let area = frame.area();
 
-            // Simplified status display
-            let status_lines = vec![
-                Line::from(""),
-                Line::from(vec![
-                    checkbox_span(app_state.effects_enabled),
-                    Span::raw(" FX  "),
-                    checkbox_span(app_state.shadows_enabled),
-                    Span::raw(" Shadow "),
-                    Span::styled(
-                        format!("{:.0} FPS", app_state.fps),
-                        Style::default().fg(RatatuiColor::Cyan),
-                    ),
-                ]),
-                Line::from(""),
-                Line::from(vec![
-                    Span::raw("Light:"),
-                    Span::styled(
-                        format!("{:.0}k", app_state.light_illuminance / 1000.0),
-                        Style::default().fg(RatatuiColor::Yellow).bold(),
-                    ),
-                ]),
-                Line::from(""),
-                Line::from(vec![
-                    radio_span(app_state.camera_mode == CameraMode::MouseFollow),
-                    Span::raw(" Mouse Follow"),
-                ]),
-                Line::from(vec![
-                    radio_span(app_state.camera_mode == CameraMode::Fixed),
-                    Span::raw(" Fixed Front"),
-                ]),
-                Line::from(vec![
-                    radio_span(app_state.camera_mode == CameraMode::Orbit),
-                    Span::raw(" Auto Orbit"),
-                ]),
-                Line::from(""),
-                Line::from(vec![
-                    Span::raw("Clicks:"),
-                    Span::styled(
-                        app_state.button_click_count.to_string(),
-                        Style::default().fg(RatatuiColor::Yellow).bold(),
-                    ),
-                ]),
-                // Model credit
-                Line::from(""),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "Original PC model by",
-                    Style::default().fg(RatatuiColor::Gray),
-                )),
-                Line::from(Span::styled(
-                    "CrazyDrPants, CC 4.0 Int'l",
-                    Style::default().fg(RatatuiColor::Gray),
-                )),
-                Line::from(Span::styled(
-                    " https://crazydrpants.itch.io/",
-                    Style::default().fg(RatatuiColor::DarkGray),
-                )),
-                Line::from(Span::styled(
-                    "           retro-crt-computer/",
-                    Style::default().fg(RatatuiColor::DarkGray),
-                )),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "Arranged by TTT",
-                    Style::default().fg(RatatuiColor::Gray),
-                )),
-            ];
+        // Title bar is always row 0 spanning the full width, in both the
+        // collapsed and expanded layouts - click it to toggle collapse.
+        hits.add(
+            Hit::PanelTitleBar,
+            ratatui::layout::Rect {
+                x: area.x,
+                y: area.y,
+                width: area.width,
+                height: 1,
+            },
+        );
 
-            let content = Paragraph::new(status_lines)
-                .style(Style::default().bg(RatatuiColor::Rgb(15, 5, 15)))
-                .block(
-                    Block::bordered()
-                        .title(Line::styled(
-                            " Control Panel ",
-                            Style::default().fg(RatatuiColor::Magenta).bold(),
-                        ))
-                        .border_style(Style::default().fg(RatatuiColor::Gray))
-                        .style(Style::default().bg(RatatuiColor::Rgb(10, 5, 10))),
-                );
+        if app_state.panel_collapsed {
+            frame.render_widget(
+                Paragraph::new(Line::styled(
+                    "  > bevy_tui_texture Demo",
+                    Style::default().fg(RatatuiColor::Magenta).bold(),
+                ))
+                .alignment(Alignment::Left)
+                .style(Style::default().bg(RatatuiColor::Rgb(10, 5, 10))),
+                area,
+            );
+            return;
+        }
 
-            frame.render_widget(content, area);
+        // Simplified status display
+        let status_lines = vec![
+            Line::from(""),
+            Line::from(vec![
+                checkbox_span(app_state.effects_enabled),
+                Span::raw(" FX  "),
+                checkbox_span(app_state.shadows_enabled),
+                Span::raw(" Shadow "),
+                Span::styled(
+                    format!("{:.0} FPS", app_state.fps),
+                    Style::default().fg(RatatuiColor::Cyan),
+                ),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::raw("Light:"),
+                Span::styled(
+                    format!("{:.0}k", app_state.light_illuminance / 1000.0),
+                    Style::default().fg(RatatuiColor::Yellow).bold(),
+                ),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                radio_span(app_state.camera_mode == CameraMode::MouseFollow),
+                Span::raw(" Mouse Follow"),
+            ]),
+            Line::from(vec![
+                radio_span(app_state.camera_mode == CameraMode::Fixed),
+                Span::raw(" Fixed Front"),
+            ]),
+            Line::from(vec![
+                radio_span(app_state.camera_mode == CameraMode::Orbit),
+                Span::raw(" Auto Orbit"),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::raw("Clicks:"),
+                Span::styled(
+                    app_state.button_click_count.to_string(),
+                    Style::default().fg(RatatuiColor::Yellow).bold(),
+                ),
+            ]),
+            // Model credit
+            Line::from(""),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Original PC model by",
+                Style::default().fg(RatatuiColor::Gray),
+            )),
+            Line::from(Span::styled(
+                "CrazyDrPants, CC 4.0 Int'l",
+                Style::default().fg(RatatuiColor::Gray),
+            )),
+            Line::from(Span::styled(
+                " https://crazydrpants.itch.io/",
+                Style::default().fg(RatatuiColor::DarkGray),
+            )),
+            Line::from(Span::styled(
+                "           retro-crt-computer/",
+                Style::default().fg(RatatuiColor::DarkGray),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Arranged by TTT",
+                Style::default().fg(RatatuiColor::Gray),
+            )),
+        ];
 
-            // Register checkbox / radio button hit regions right next to
-            // the content that draws them - replaces the parallel Rect
-            // bookkeeping this used to do in AppState.
-            let inner_area = Block::bordered().inner(area);
-
-            // CRT checkbox (row 0, start)
-            hits.add(
-                Hit::CrtCheckbox,
-                ratatui::layout::Rect {
-                    x: inner_area.x,
-                    y: inner_area.y + 1,
-                    width: 8, // width of "[X]CRT "
-                    height: 1,
-                },
+        let content = Paragraph::new(status_lines)
+            .style(Style::default().bg(RatatuiColor::Rgb(15, 5, 15)))
+            .block(
+                Block::bordered()
+                    .title(Line::styled(
+                        " v bevy_tui_texture Demo ",
+                        Style::default().fg(RatatuiColor::Magenta).bold(),
+                    ))
+                    .border_style(Style::default().fg(RatatuiColor::Gray))
+                    .style(Style::default().bg(RatatuiColor::Rgb(10, 5, 10))),
             );
 
-            // Shadows checkbox (row 0, middle)
-            hits.add(
-                Hit::ShadowsCheckbox,
-                ratatui::layout::Rect {
-                    x: inner_area.x + 8, // after "[X]CRT "
-                    y: inner_area.y + 1,
-                    width: 10, // width of "[X]Shadow"
-                    height: 1,
-                },
-            );
+        frame.render_widget(content, area);
 
-            // Camera mode radio buttons (rows 5-7)
-            hits.add(
-                Hit::CameraRadio(0), // MouseFollow
-                ratatui::layout::Rect {
-                    x: inner_area.x,
-                    y: inner_area.y + 5,
-                    width: 18, // width of "(o)Mouse Follow"
-                    height: 1,
-                },
-            );
-            hits.add(
-                Hit::CameraRadio(1), // Fixed
-                ratatui::layout::Rect {
-                    x: inner_area.x,
-                    y: inner_area.y + 6,
-                    width: 16, // width of "( )Fixed Front"
-                    height: 1,
-                },
-            );
-            hits.add(
-                Hit::CameraRadio(2), // Orbit
-                ratatui::layout::Rect {
-                    x: inner_area.x,
-                    y: inner_area.y + 7,
-                    width: 16, // width of "( )Auto Orbit"
-                    height: 1,
-                },
-            );
-        });
+        // Register checkbox / radio button hit regions right next to
+        // the content that draws them - replaces the parallel Rect
+        // bookkeeping this used to do in AppState.
+        let inner_area = Block::bordered().inner(area);
+
+        // CRT checkbox (row 0, start)
+        hits.add(
+            Hit::CrtCheckbox,
+            ratatui::layout::Rect {
+                x: inner_area.x,
+                y: inner_area.y + 1,
+                width: 8, // width of "[X]CRT "
+                height: 1,
+            },
+        );
+
+        // Shadows checkbox (row 0, middle)
+        hits.add(
+            Hit::ShadowsCheckbox,
+            ratatui::layout::Rect {
+                x: inner_area.x + 8, // after "[X]CRT "
+                y: inner_area.y + 1,
+                width: 10, // width of "[X]Shadow"
+                height: 1,
+            },
+        );
+
+        // Camera mode radio buttons (rows 5-7)
+        hits.add(
+            Hit::CameraRadio(0), // MouseFollow
+            ratatui::layout::Rect {
+                x: inner_area.x,
+                y: inner_area.y + 5,
+                width: 18, // width of "(o)Mouse Follow"
+                height: 1,
+            },
+        );
+        hits.add(
+            Hit::CameraRadio(1), // Fixed
+            ratatui::layout::Rect {
+                x: inner_area.x,
+                y: inner_area.y + 6,
+                width: 16, // width of "( )Fixed Front"
+                height: 1,
+            },
+        );
+        hits.add(
+            Hit::CameraRadio(2), // Orbit
+            ratatui::layout::Rect {
+                x: inner_area.x,
+                y: inner_area.y + 7,
+                width: 16, // width of "( )Auto Orbit"
+                height: 1,
+            },
+        );
+    });
 }
 
 fn update_camera_rotation(

@@ -1,813 +1,173 @@
-//! WASM Browser Demo - Widget Catalog 3D in Browser
-//!
-//! This example demonstrates running Bevy + ratatui widget catalog in the browser with WebAssembly.
-//!
+// WASM Browser Demo - a thin wasm-bindgen shim around the retro CRT scene.
+//
+// Reuses examples/retro_crt.rs's code directly (`#[path = "retro_crt.rs"]
+// mod retro_crt;` below) instead of duplicating it - the scene, its wasm32/
+// WebGL2-specific branches (canvas config, OIT skipped, tonemapping without
+// LUTs), and `pub fn main()` all live in that one file. This file only adds
+// what's specific to being loaded as a browser module:
+// - `#[wasm_bindgen(start)]` entry + `console_error_panic_hook`,
+// - a WebGL2 availability probe (see docs/index.html for the matching JS
+//   probe, which runs first and avoids fetching the wasm at all if it fails).
+//
+// Build the browser-ready site into docs/ (see docs/README.md for local
+// preview instructions):
+//   cargo build --example wasm_demo --target wasm32-unknown-unknown --profile wasm-release
+//   wasm-bindgen --target web --no-typescript --out-dir docs \
+//     target/wasm32-unknown-unknown/wasm-release/examples/wasm_demo.wasm
+//   wasm-opt -Oz --strip-debug --strip-producers --enable-nontrapping-float-to-int \
+//     --enable-bulk-memory --enable-sign-ext --enable-mutable-globals \
+//     --enable-simd --enable-reference-types \
+//     -o docs/wasm_demo_bg.wasm docs/wasm_demo_bg.wasm
 
-use std::sync::Arc;
-use std::time::Duration;
-
-use bevy::pbr::StandardMaterial;
-use bevy::prelude::*;
-use bevy::render::renderer::{RenderDevice, RenderQueue};
-use ratatui::prelude::*;
-use ratatui::style::Color as RatatuiColor;
-use ratatui::widgets::*;
-use unicode_width::UnicodeWidthStr;
-
-use bevy_tui_texture::Font as TerminalFont;
-use bevy_tui_texture::prelude::*;
+#[path = "retro_crt.rs"]
+mod retro_crt;
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
-#[cfg(target_arch = "wasm32")]
-macro_rules! console_log {
-    ($($t:tt)*) => (web_sys::console::log_1(&format!($($t)*).into()))
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-macro_rules! console_log {
-    ($($t:tt)*) => (println!($($t)*))
-}
-
-// Terminal dimensions
-const COLS: u16 = 100;
-const ROWS: u16 = 30;
-
-// WASM entry point
+// WASM entry point - invoked by the JS glue's `init()` (see docs/index.html).
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen(start)]
 pub fn wasm_main() {
     console_error_panic_hook::set_once();
-    console_log!("WASM main started, calling main()...");
-    main();
-}
 
-fn main() {
-    console_log!("main() called");
-    let mut app = App::new();
-    console_log!("App created");
-
-    app.add_plugins(DefaultPlugins.set(WindowPlugin {
-        primary_window: Some(Window {
-            title: "bevy_tui_texture - Widget Catalog 3D (WASM)".to_string(),
-            canvas: Some("#bevy".to_string()),
-            fit_canvas_to_parent: true,
-            prevent_default_event_handling: false,
-            ..default()
-        }),
-        ..default()
-    }))
-    .add_plugins(TerminalPlugin::default());
-    console_log!("Plugins added");
-
-    app.add_systems(Startup, setup_terminal)
-        .add_systems(
-            Update,
-            handle_terminal_events.in_set(TerminalSystemSet::UserUpdate),
-        )
-        .add_systems(Update, (update_terminal_content, rotate_plane));
-    console_log!("Systems added, calling app.run()...");
-
-    app.run();
-    console_log!("app.run() returned (should not see this in WASM)");
-}
-
-/// UI state for tracking interactions
-#[derive(Resource)]
-struct WidgetCatalogState {
-    selected_tab: usize,
-    list_state: ListState,
-    selected_button: Option<usize>,
-    gauge_value: u16,
-    sparkline_data: Vec<u64>,
-    sparkline_timer: Timer,
-    counter: usize,
-    mouse_position: Option<(u16, u16)>,
-
-    // Store layout rectangles for accurate hit testing
-    button_rects: Vec<ratatui::layout::Rect>,
-    h_button_rects: Vec<ratatui::layout::Rect>,
-    list_inner_rect: Option<ratatui::layout::Rect>,
-    gauge_inner_rect: Option<ratatui::layout::Rect>,
-}
-
-/// Marker component for the rotating plane
-#[derive(Component)]
-struct RotatingPlane;
-
-fn setup_terminal(
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    render_device: Res<RenderDevice>,
-    render_queue: Res<RenderQueue>,
-    mut images: ResMut<Assets<Image>>,
-) {
-    console_log!("Setting up 3D widget catalog terminal...");
-
-    // Load font
-    let font_data = include_bytes!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/assets/fonts/Mplus1Code-Regular.ttf"
-    ));
-    console_log!("Font data loaded: {} bytes", font_data.len());
-
-    let font = TerminalFont::new(font_data).expect("Failed to load font");
-    let fonts = Arc::new(Fonts::new(font, 16));
-    console_log!("Fonts created");
-
-    // Spawn 3D camera
-    commands.spawn((
-        Camera3d::default(),
-        Transform::from_xyz(0.0, 0.0, 800.0).looking_at(Vec3::ZERO, Vec3::Y),
-    ));
-    console_log!("Camera spawned");
-
-    // Add directional light
-    commands.spawn((
-        DirectionalLight {
-            illuminance: 5000.0,
-            shadow_maps_enabled: false,
-            ..default()
-        },
-        Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.5, -0.5, 0.0)),
-    ));
-    console_log!("Ambient light added");
-
-    // Create 3D terminal with the new bundle API. `world_quad`'s mesh already
-    // faces +Z at rest (see `rotate_plane`'s comment for why this changes
-    // the seesaw rotation formula vs. the old Y-normal `SimpleTerminal3D`
-    // plane). height chosen to match the original pixel-sized plane
-    // (ROWS * char_height_px) so the on-screen scale is unchanged.
-    console_log!("Creating 3D terminal...");
-    let char_height_px = fonts.height_px();
-    let mut ctx = TerminalSpawnCtx {
-        render_device: &render_device,
-        render_queue: &render_queue,
-        images: &mut images,
-        meshes: &mut meshes,
-        materials: &mut materials,
-    };
-    let bundle = TerminalBundle::world_quad(
-        COLS,
-        ROWS,
-        fonts,
-        ROWS as f32 * char_height_px as f32,
-        TerminalConfig {
-            programmatic_glyphs: true,
-            keyboard: true,
-            mouse: true,
-            ..default()
-        },
-        &mut ctx,
-    )
-    .expect("Failed to create 3D terminal");
-    console_log!("3D terminal created successfully!");
-
-    let terminal_entity = commands
-        .spawn((bundle, Transform::from_translation(Vec3::ZERO), RotatingPlane))
-        .id();
-
-    // Create state with initial values
-    commands.insert_resource(WidgetCatalogState {
-        selected_tab: 0,
-        list_state: ListState::default().with_selected(Some(0)),
-        selected_button: None,
-        gauge_value: 60,
-        sparkline_data: vec![2, 5, 3, 8, 6, 9, 4, 7, 5, 8, 6, 10, 8, 6, 9, 11],
-        sparkline_timer: Timer::new(Duration::from_millis(100), TimerMode::Repeating),
-        counter: 0,
-        mouse_position: None,
-        button_rects: Vec::new(),
-        h_button_rects: Vec::new(),
-        list_inner_rect: None,
-        gauge_inner_rect: None,
-    });
-
-    console_log!(
-        "3D widget catalog setup complete! Terminal entity: {:?}",
-        terminal_entity
-    );
-}
-
-/// Handle terminal input events (mouse clicks, hover, etc.)
-fn handle_terminal_events(
-    mut events: MessageReader<TerminalEvent>,
-    mut ui_state: ResMut<WidgetCatalogState>,
-    query: Query<Entity, With<RotatingPlane>>,
-) {
-    let terminal_entity = match query.single() {
-        Ok(entity) => entity,
-        Err(_) => return,
-    };
-
-    for event in events.read().filter(|e| e.target == terminal_entity) {
-        match &event.event {
-            TerminalEventType::MouseMove { position } => {
-                ui_state.mouse_position = Some(*position);
-            }
-
-            TerminalEventType::MousePress { position, .. } => {
-                let (col, row) = *position;
-                let pos = ratatui::layout::Position { x: col, y: row };
-
-                console_log!(
-                    "3D Mouse Press: col={}, row={}, target={:?}",
-                    col,
-                    row,
-                    event.target
-                );
-
-                // Tab detection (manual calculation as tabs are not stored)
-                let chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(1),
-                        Constraint::Length(3),
-                        Constraint::Min(0),
-                    ])
-                    .split(ratatui::layout::Rect {
-                        x: 0,
-                        y: 0,
-                        width: COLS,
-                        height: ROWS,
-                    });
-
-                if row >= chunks[1].y && row < chunks[1].y + chunks[1].height {
-                    let tab_labels = ["Buttons", "Lists", "Charts", "Interactive", "Glyphs"];
-                    let mut col_pos = 2;
-
-                    for (i, label) in tab_labels.iter().enumerate() {
-                        let label_width = label.width();
-                        let start = col_pos;
-                        let end = col_pos + label_width - 1;
-
-                        if col >= start as u16 && col <= end as u16 {
-                            ui_state.selected_tab = i;
-                            break;
-                        }
-
-                        col_pos = col_pos + label_width + 3;
-                    }
-                }
-
-                // Buttons tab (0)
-                if ui_state.selected_tab == 0 {
-                    // Vertical buttons
-                    for (i, rect) in ui_state.button_rects.iter().enumerate() {
-                        if rect.contains(pos) {
-                            ui_state.selected_button = Some(i);
-                            match i {
-                                0 => ui_state.counter += 1,
-                                1 => ui_state.gauge_value = (ui_state.gauge_value + 10).min(100),
-                                2 => ui_state.gauge_value = ui_state.gauge_value.saturating_sub(10),
-                                _ => {}
-                            }
-                            break;
-                        }
-                    }
-
-                    // Horizontal buttons
-                    for (i, rect) in ui_state.h_button_rects.iter().enumerate() {
-                        if rect.contains(pos) {
-                            ui_state.selected_button = Some(i + 3);
-                            ui_state.counter += 1;
-                            break;
-                        }
-                    }
-                }
-
-                // Lists tab (1)
-                if ui_state.selected_tab == 1
-                    && let Some(inner) = ui_state.list_inner_rect
-                    && inner.contains(pos)
-                {
-                    let index = (row - inner.y) as usize;
-                    ui_state.list_state.select(Some(index.min(9)));
-                }
-
-                // Interactive tab (3)
-                if ui_state.selected_tab == 3
-                    && let Some(inner) = ui_state.gauge_inner_rect
-                    && inner.contains(pos)
-                {
-                    let percentage =
-                        ((col - inner.x) as f32 / inner.width as f32 * 100.0) as u16;
-                    ui_state.gauge_value = percentage.min(100);
-                }
-            }
-
-            TerminalEventType::KeyPress { key, .. } => {
-                use KeyCode::*;
-                match key {
-                    Tab => {
-                        ui_state.selected_tab = (ui_state.selected_tab + 1) % 5;
-                    }
-                    ArrowUp => {
-                        if ui_state.selected_tab == 1 {
-                            let i = ui_state.list_state.selected().unwrap_or(0);
-                            ui_state.list_state.select(Some(i.saturating_sub(1)));
-                        }
-                    }
-                    ArrowDown => {
-                        if ui_state.selected_tab == 1 {
-                            let i = ui_state.list_state.selected().unwrap_or(0);
-                            ui_state.list_state.select(Some((i + 1).min(9)));
-                        }
-                    }
-                    ArrowLeft => {
-                        ui_state.gauge_value = ui_state.gauge_value.saturating_sub(5);
-                    }
-                    ArrowRight => {
-                        ui_state.gauge_value = (ui_state.gauge_value + 5).min(100);
-                    }
-                    _ => {}
-                }
-            }
-
-            _ => {}
-        }
+    // WebGL2 availability probe, on a THROWAWAY canvas - probing #bevy
+    // itself would take its context and break wgpu's own getContext later
+    // ("canvas already in use"). Without this guard, an unsupported/blocked
+    // WebGL2 (e.g. Brave with aggressive fingerprinting shields, software-
+    // rendering-only environments) panics deep inside wgpu surface
+    // creation; per the demo's contract we instead report and exit.
+    // (index.html performs the same probe before even fetching the wasm -
+    // this is the defense for hosts that serve the module differently.)
+    let webgl2_available = (|| {
+        use wasm_bindgen::JsCast;
+        let canvas = web_sys::window()?
+            .document()?
+            .create_element("canvas")
+            .ok()?
+            .dyn_into::<web_sys::HtmlCanvasElement>()
+            .ok()?;
+        canvas.get_context("webgl2").ok().flatten()
+    })()
+    .is_some();
+    if !webgl2_available {
+        web_sys::console::error_1(
+            &"bevy_tui_texture wasm_demo: WebGL2 is not available in this browser \
+              (unsupported, or blocked - e.g. by Brave's fingerprinting shields). \
+              The demo cannot run; exiting."
+                .into(),
+        );
+        return;
     }
+
+    suppress_canvas_escape_key();
+    clamp_canvas_to_safe_texture_size();
+    retro_crt::main();
 }
 
-/// Update terminal content and render to 3D mesh. Zero render-resource
-/// parameters: `gpu_flush_system` (registered by `TerminalPlugin`) owns the
-/// GPU render + async copy + material touch.
-fn update_terminal_content(
-    mut screens: Query<&mut Tui, With<RotatingPlane>>,
-    mut ui_state: ResMut<WidgetCatalogState>,
-    time: Res<Time>,
-) {
-    let Ok(mut term) = screens.single_mut() else {
+// retro_crt.rs's `Window { canvas: "#bevy", fit_canvas_to_parent: true, .. }`
+// resizes the canvas to its parent's CSS size. `WgpuSettingsPriority::WebGL2`
+// (also in retro_crt.rs) caps `max_texture_dimension_2d` at 2048 - on a
+// HiDPI/Retina display (e.g. Apple Silicon Macs) even a modest ~1160
+// CSS-px-wide browser window already produces a >2048 PHYSICAL-pixel
+// surface, which fails `Surface::configure`'s validation and - per bevy
+// 0.19's fatal render-error policy - silently quits the app to a black
+// screen (observed on macOS Brave: "Requested was (2312, 810), maximum
+// extent for either dimension is 2048").
+//
+// An earlier version of this function tried to fix that by overriding
+// `window.devicePixelRatio` to always read `1.0` (same DOM-spoofing trick as
+// `suppress_canvas_escape_key` below). That does NOT work: winit's actual
+// resize/scale detection (see
+// `winit::platform_impl::web::web_sys::resize_scaling::ResizeScaleInternal`)
+// watches the canvas with a `ResizeObserver` requesting
+// `ResizeObserverBoxOptions::DevicePixelContentBox` wherever the browser
+// supports it (Chromium/Brave and modern Firefox both do - only Safali
+// lacks it) - that API reports the browser's own device-pixel measurement
+// of the canvas's box directly from the compositor, which is NOT the same
+// thing as the JS-visible `devicePixelRatio` property and can't be spoofed
+// by redefining it (verified: overriding the property to `2` on a real
+// devicePixelRatio-1 display left the canvas's actual backing-buffer width
+// completely unaffected).
+//
+// The only thing that actually changes what `ResizeObserver` reports is the
+// canvas's own CSS layout box, so this instead reads the REAL (unspoofed)
+// `devicePixelRatio` and clamps the canvas's CSS size with `max-width`/
+// `max-height` such that `css_size * devicePixelRatio` never exceeds 2048 -
+// CSS `max-width` wins over whatever width winit's `fit_canvas_to_parent`
+// sets, so this is a hard, permanent ceiling regardless of the parent's
+// size. retro_crt.rs is shared with the native binary, so - same reasoning
+// as `suppress_canvas_escape_key` - this stays purely in this wasm-only
+// file rather than adding a wasm32 branch there.
+#[cfg(target_arch = "wasm32")]
+fn clamp_canvas_to_safe_texture_size() {
+    const MAX_PHYSICAL_PX: f64 = 2048.0;
+
+    let Some(window) = web_sys::window() else {
         return;
     };
-    // Update sparkline data with time-based pseudo-random values
-    ui_state.sparkline_timer.tick(time.delta());
-    if ui_state.sparkline_timer.just_finished() {
-        // Use multiple sine waves at different frequencies for pseudo-random effect
-        let t = time.elapsed_secs();
-        let new_value = ((t * 3.7).sin() * 4.0
-            + (t * 7.3).sin() * 3.0
-            + (t * 11.1).sin() * 2.0
-            + 10.0) as u64;
-        ui_state.sparkline_data.push(new_value.clamp(1, 15));
-        if ui_state.sparkline_data.len() > 32 {
-            ui_state.sparkline_data.remove(0);
-        }
-    }
-
-    // Split into a plain `&mut` so `sparkline_data`/`list_state` below can
-    // be borrowed disjointly (one immutably, one mutably) instead of cloned -
-    // `ResMut::deref`/`deref_mut` can't be called twice at once, but a single
-    // `&mut WidgetCatalogState` splits into independent field borrows fine.
-    let state = &mut *ui_state;
-    let selected_tab = state.selected_tab;
-    let selected_button = state.selected_button;
-    let gauge_value = state.gauge_value;
-    let counter = state.counter;
-    let mouse_position = state.mouse_position;
-
-    // Variables to capture layout rectangles
-    let mut button_rects = Vec::new();
-    let mut h_button_rects = Vec::new();
-    let mut list_inner_rect = None;
-    let mut gauge_inner_rect = None;
-
-    let rotation_angle = (time.elapsed_secs() * 0.8).sin() * 45.0;
-
-    term.draw(|frame| {
-            let area = frame.area();
-
-            let tabs = Tabs::new(vec!["Buttons", "Lists", "Charts", "Interactive", "Glyphs"])
-                .block(
-                    Block::bordered()
-                        .title(format!("WASM Widget Catalog | Rot: {:.1}deg", rotation_angle)),
-                )
-                .style(Style::default().fg(RatatuiColor::White))
-                .highlight_style(Style::default().fg(RatatuiColor::Yellow).bold())
-                .select(selected_tab)
-                .divider("|");
-
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(1),
-                    Constraint::Length(3),
-                    Constraint::Min(0),
-                ])
-                .split(area);
-
-            let ruler = (0..100)
-                .map(|i| {
-                    if i % 10 == 0 {
-                        char::from(b'0' + (i / 10) as u8)
-                    } else if i % 5 == 0 {
-                        '|'
-                    } else {
-                        '.'
-                    }
-                })
-                .collect::<String>();
-            frame.render_widget(
-                Paragraph::new(ruler).style(Style::default().fg(RatatuiColor::DarkGray)),
-                chunks[0],
-            );
-
-            frame.render_widget(tabs, chunks[1]);
-
-            match selected_tab {
-                0 => {
-                    let (btn_rects, h_btn_rects) =
-                        draw_buttons_tab(frame, chunks[2], selected_button, counter, gauge_value);
-                    button_rects = btn_rects;
-                    h_button_rects = h_btn_rects;
-                }
-                1 => {
-                    list_inner_rect =
-                        Some(draw_lists_tab(frame, chunks[2], &mut state.list_state));
-                }
-                2 => draw_charts_tab(frame, chunks[2], gauge_value, counter, &state.sparkline_data),
-                3 => {
-                    gauge_inner_rect = Some(draw_interactive_tab(frame, chunks[2], gauge_value));
-                }
-                4 => draw_glyphs_tab(frame, chunks[2]),
-                _ => {}
-            }
-
-            let mouse_info = if let Some((col, row)) = mouse_position {
-                format!(" Mouse: col={}, row={}", col, row)
-            } else {
-                " Mouse: -".to_string()
-            };
-
-            let status = Paragraph::new(format!(
-                " Counter: {} | Gauge: {}% | Tab: {} |{} | WASM 3D Rotating!",
-                counter,
-                gauge_value,
-                selected_tab + 1,
-                mouse_info
-            ))
-            .style(
-                Style::default()
-                    .bg(RatatuiColor::Green)
-                    .fg(RatatuiColor::Black),
-            );
-
-            let status_area = ratatui::layout::Rect {
-                x: area.x,
-                y: area.bottom().saturating_sub(1),
-                width: area.width,
-                height: 1,
-            };
-            frame.render_widget(status, status_area);
-        });
-
-    // Store captured layout rectangles for hit testing
-    state.button_rects = button_rects;
-    state.h_button_rects = h_button_rects;
-    state.list_inner_rect = list_inner_rect;
-    state.gauge_inner_rect = gauge_inner_rect;
+    let Some(canvas) = window
+        .document()
+        .and_then(|d| d.get_element_by_id("bevy"))
+    else {
+        return;
+    };
+    let dpr = window.device_pixel_ratio();
+    let max_css_px = (MAX_PHYSICAL_PX / dpr).floor();
+    let Ok(style) = canvas.dyn_into::<web_sys::HtmlElement>().map(|e| e.style()) else {
+        return;
+    };
+    let _ = style.set_property("max-width", &format!("{max_css_px}px"));
+    let _ = style.set_property("max-height", &format!("{max_css_px}px"));
 }
 
-fn draw_buttons_tab(
-    frame: &mut ratatui::Frame,
-    area: ratatui::layout::Rect,
-    selected_button: Option<usize>,
-    counter: usize,
-    gauge_value: u16,
-) -> (Vec<ratatui::layout::Rect>, Vec<ratatui::layout::Rect>) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Length(5),
-            Constraint::Min(0),
-        ])
-        .margin(1)
-        .split(area);
+// retro_crt.rs's `handle_input` unconditionally sends `AppExit` on Escape
+// (its doc comment claims "native only", but the system isn't actually
+// cfg-gated) - that file is shared with the native binary, so editing it to
+// add a wasm32 cfg would touch shared/native-tested code just for a
+// wasm-only quirk. Instead, disable it purely at the DOM level, from this
+// wasm-only file: winit registers its own "keydown" listener on the `#bevy`
+// canvas lazily, inside `retro_crt::main()`'s `App::run()` (WinitPlugin's
+// window creation). Registering OUR "keydown" listener on that same canvas
+// element *before* calling `retro_crt::main()` guarantees ours runs first -
+// per the DOM spec, listeners on the event's own target (not an ancestor)
+// fire in REGISTRATION ORDER regardless of the capture flag - so calling
+// `stop_immediate_propagation()` here for Escape means winit's listener
+// never sees that keydown at all, `ButtonInput<KeyCode>` never marks
+// `KeyCode::Escape` pressed, and `handle_input`'s `AppExit` branch never
+// fires. Native is untouched: this function is wasm32-only and the canvas
+// doesn't exist there.
+#[cfg(target_arch = "wasm32")]
+fn suppress_canvas_escape_key() {
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen::closure::Closure;
 
-    let button_labels = ["Increment Counter", "Increase Gauge", "Decrease Gauge"];
-
-    for (i, label) in button_labels.iter().enumerate() {
-        let is_selected = selected_button == Some(i);
-        let style = if is_selected {
-            Style::default()
-                .bg(RatatuiColor::Yellow)
-                .fg(RatatuiColor::Black)
-                .bold()
-        } else {
-            Style::default()
-                .bg(RatatuiColor::DarkGray)
-                .fg(RatatuiColor::White)
-        };
-
-        let button = Paragraph::new(format!("  {}  ", label))
-            .style(style)
-            .block(Block::bordered());
-
-        frame.render_widget(button, chunks[i]);
-    }
-
-    let horizontal_area = chunks[3];
-    let h_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(20),
-            Constraint::Percentage(20),
-            Constraint::Percentage(20),
-            Constraint::Percentage(20),
-            Constraint::Percentage(20),
-        ])
-        .split(horizontal_area);
-
-    let h_labels = ["Button 1", "ボタン 2", "按鈕 3", "botón 4", "düğme 5"];
-    for (i, label) in h_labels.iter().enumerate() {
-        let is_selected = selected_button == Some(i + 3);
-        let style = if is_selected {
-            Style::default()
-                .bg(RatatuiColor::Cyan)
-                .fg(RatatuiColor::Black)
-                .bold()
-        } else {
-            Style::default()
-                .bg(RatatuiColor::Blue)
-                .fg(RatatuiColor::White)
-        };
-
-        let button = Paragraph::new(format!(" {} ", label))
-            .style(style)
-            .alignment(Alignment::Center)
-            .block(Block::bordered());
-
-        frame.render_widget(button, h_chunks[i]);
-    }
-
-    let selected_info = if let Some(idx) = selected_button {
-        if idx < 3 {
-            format!("Last: Vertical button {}", idx + 1)
-        } else {
-            format!("Last: Horizontal button {}", idx - 2)
-        }
-    } else {
-        "Last: None".to_string()
+    let Some(canvas) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id("bevy"))
+    else {
+        return;
     };
 
-    let info = Paragraph::new(vec![
-        Line::from(""),
-        Line::from("Click buttons with mouse on rotating 3D plane!")
-            .style(Style::default().fg(RatatuiColor::Cyan)),
-        Line::from(format!("Current counter: {}", counter)),
-        Line::from(format!("Current gauge: {}%", gauge_value)),
-        Line::from(selected_info).style(Style::default().fg(RatatuiColor::Yellow)),
-    ])
-    .block(Block::bordered().title("Info"));
-
-    frame.render_widget(info, chunks[4]);
-
-    // Return button rectangles for hit testing (`Rect` is `Copy`)
-    let button_rects = chunks.iter().take(3).copied().collect();
-    let h_button_rects = h_chunks.to_vec();
-
-    (button_rects, h_button_rects)
+    // Leaked deliberately (`forget`): this listener must outlive the
+    // function and live for the rest of the page's life, exactly like
+    // wasm-bindgen's own generated glue does for its callbacks.
+    let closure = Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(
+        |event: web_sys::KeyboardEvent| {
+            if event.key() == "Escape" {
+                event.stop_immediate_propagation();
+                event.prevent_default();
+            }
+        },
+    );
+    let _ = canvas.add_event_listener_with_callback("keydown", closure.as_ref().unchecked_ref());
+    closure.forget();
 }
 
-fn draw_lists_tab(
-    frame: &mut ratatui::Frame,
-    area: ratatui::layout::Rect,
-    list_state: &mut ListState,
-) -> ratatui::layout::Rect {
-    let items: Vec<ListItem> = (0..10)
-        .map(|i| {
-            let content = format!("Item {} - Click to select", i + 1);
-            ListItem::new(content)
-        })
-        .collect();
-
-    let list = List::new(items)
-        .block(Block::bordered().title("Selectable List"))
-        .highlight_style(
-            Style::default()
-                .bg(RatatuiColor::Yellow)
-                .fg(RatatuiColor::Black)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol(">> ");
-
-    frame.render_stateful_widget(list, area, list_state);
-
-    // Return inner area for hit testing
-    ratatui::layout::Rect {
-        x: area.x + 1,
-        y: area.y + 1,
-        width: area.width.saturating_sub(2),
-        height: area.height.saturating_sub(2),
-    }
-}
-
-fn draw_charts_tab(
-    frame: &mut ratatui::Frame,
-    area: ratatui::layout::Rect,
-    gauge_value: u16,
-    counter: usize,
-    sparkline_data: &[u64],
-) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .margin(1)
-        .split(area);
-
-    let data = [
-        ("Counter", counter as u64),
-        ("Gauge", gauge_value as u64),
-        ("Items", 10),
-        ("Tabs", 4),
-    ];
-
-    let barchart = BarChart::default()
-        .block(Block::bordered().title("Bar Chart"))
-        .data(
-            BarGroup::default().bars(
-                &data
-                    .iter()
-                    .map(|(label, value)| Bar::default().value(*value).label(*label))
-                    .collect::<Vec<_>>(),
-            ),
-        )
-        .bar_width(9)
-        .bar_gap(2)
-        .bar_style(Style::default().fg(RatatuiColor::Yellow))
-        .value_style(
-            Style::default()
-                .fg(RatatuiColor::Black)
-                .bg(RatatuiColor::Yellow),
-        );
-
-    frame.render_widget(barchart, chunks[0]);
-
-    let sparkline = Sparkline::default()
-        .block(Block::bordered().title("Sparkline (Auto-scrolling)"))
-        .data(sparkline_data)
-        .style(Style::default().fg(RatatuiColor::Green));
-
-    frame.render_widget(sparkline, chunks[1]);
-}
-
-fn draw_interactive_tab(
-    frame: &mut ratatui::Frame,
-    area: ratatui::layout::Rect,
-    gauge_value: u16,
-) -> ratatui::layout::Rect {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(5),
-            Constraint::Length(5),
-            Constraint::Min(0),
-        ])
-        .margin(1)
-        .split(area);
-
-    let gauge = Gauge::default()
-        .block(Block::bordered().title("Interactive Gauge (Click to adjust)"))
-        .gauge_style(
-            Style::default()
-                .fg(RatatuiColor::Cyan)
-                .bg(RatatuiColor::Black),
-        )
-        .percent(gauge_value);
-
-    frame.render_widget(gauge, chunks[0]);
-
-    let line_gauge = LineGauge::default()
-        .block(Block::bordered().title("Line Gauge"))
-        .filled_style(Style::default().fg(RatatuiColor::Magenta))
-        .filled_symbol(symbols::line::THICK.horizontal)
-        .unfilled_symbol(" ")
-        .ratio(gauge_value as f64 / 100.0);
-
-    frame.render_widget(line_gauge, chunks[1]);
-
-    let instructions = Paragraph::new(vec![
-        Line::from(""),
-        Line::from("Mouse Controls (3D Ray Casting):")
-            .style(Style::default().fg(RatatuiColor::Yellow).bold()),
-        Line::from("  - Click tabs to switch"),
-        Line::from("  - Click gauge bar to set value"),
-        Line::from("  - Click buttons to interact"),
-        Line::from("  - Click list items to select"),
-        Line::from(""),
-        Line::from("Keyboard Controls:").style(Style::default().fg(RatatuiColor::Yellow).bold()),
-        Line::from("  - Tab: Switch tabs"),
-        Line::from("  - Left/Right: Adjust gauge"),
-        Line::from("  - Up/Down: Navigate list (in Lists tab)"),
-    ])
-    .block(Block::bordered().title("Help"));
-
-    frame.render_widget(instructions, chunks[2]);
-
-    // Return gauge inner area for hit testing
-    ratatui::layout::Rect {
-        x: chunks[0].x + 1,
-        y: chunks[0].y + 1,
-        width: chunks[0].width.saturating_sub(2),
-        height: chunks[0].height.saturating_sub(2),
-    }
-}
-
-fn draw_glyphs_tab(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // Box Drawing
-            Constraint::Length(3), // Block Elements
-            Constraint::Length(5), // Braille
-            Constraint::Length(3), // Powerline
-            Constraint::Min(0),    // Info
-        ])
-        .margin(1)
-        .split(area);
-
-    // Box Drawing
-    let box_lines = vec![Line::from(vec![
-        Span::raw("Box: "),
-        Span::styled(
-            "─│┌┐└┘├┤┬┴┼ ━┃┏┓┗┛ ═║╔╗╚╝╠╣╦╩╬ ╭╮╯╰",
-            Style::default().fg(RatatuiColor::Cyan),
-        ),
-    ])];
-    let box_para = Paragraph::new(box_lines).block(Block::bordered().title("Box Drawing"));
-    frame.render_widget(box_para, chunks[0]);
-
-    // Block Elements
-    let block_lines = vec![Line::from(vec![
-        Span::raw("Block: "),
-        Span::styled(
-            "░▒▓█ ▀▄▌▐ ▁▂▃▄▅▆▇ ▏▎▍▊ ▖▗▘▝▚▞",
-            Style::default().fg(RatatuiColor::Green),
-        ),
-    ])];
-    let block_para = Paragraph::new(block_lines).block(Block::bordered().title("Block Elements"));
-    frame.render_widget(block_para, chunks[1]);
-
-    // Braille
-    let braille_lines = vec![
-        Line::from(vec![Span::styled(
-            "⠀⠁⠂⠃⠄⠅⠆⠇ ⠈⠉⠊⠋⠌⠍⠎⠏ ⠐⠑⠒⠓⠔⠕⠖⠗",
-            Style::default().fg(RatatuiColor::Magenta),
-        )]),
-        Line::from(vec![Span::styled(
-            "⠘⠙⠚⠛⠜⠝⠞⠟ ⠠⠡⠢⠣⠤⠥⠦⠧ ⡀⡁⡂⡃⡄⡅⡆⡇",
-            Style::default().fg(RatatuiColor::Magenta),
-        )]),
-        Line::from(vec![
-            Span::styled("⣿ ", Style::default().fg(RatatuiColor::Magenta)),
-            Span::raw("(All dots)"),
-        ]),
-    ];
-    let braille_para =
-        Paragraph::new(braille_lines).block(Block::bordered().title("Braille Patterns"));
-    frame.render_widget(braille_para, chunks[2]);
-
-    // Powerline
-    let powerline_lines = vec![Line::from(vec![
-        Span::raw("Powerline: "),
-        Span::styled(
-            "\u{E0B0}\u{E0B1}\u{E0B2}\u{E0B3} \u{E0B4}\u{E0B5}\u{E0B6}\u{E0B7} \u{E0B8}\u{E0B9}\u{E0BA}\u{E0BB}",
-            Style::default().fg(RatatuiColor::Blue),
-        ),
-    ])];
-    let powerline_para =
-        Paragraph::new(powerline_lines).block(Block::bordered().title("Powerline Symbols"));
-    frame.render_widget(powerline_para, chunks[3]);
-
-    // Info
-    let info = Paragraph::new(vec![
-        Line::from(""),
-        Line::from("All glyphs above are programmatically rendered")
-            .style(Style::default().fg(RatatuiColor::Yellow)),
-        Line::from("using tiny-skia and pre-baked into the texture atlas."),
-        Line::from(""),
-        Line::from("This provides pixel-perfect rendering with zero"),
-        Line::from("runtime overhead. Running in WebAssembly!"),
-    ])
-    .block(Block::bordered().title("Info"));
-    frame.render_widget(info, chunks[4]);
-}
-
-/// System that rotates the plane in seesaw motion for always-visible interaction.
-///
-/// `TerminalBundle::world_quad`'s mesh already faces +Z at rest (unlike the
-/// old `SimpleTerminal3D`, whose `Plane3d::default()` faces +Y and needed an
-/// extra `Quat::from_rotation_x(FRAC_PI_2)` to face the camera) - so the
-/// seesaw here is a plain roll around Z, no base reorientation needed.
-fn rotate_plane(time: Res<Time>, mut query: Query<&mut Transform, With<RotatingPlane>>) {
-    for mut transform in &mut query {
-        // Seesaw rotation: oscillate +/-45 degrees around Z axis
-        let angle = (time.elapsed_secs() * 0.8).sin() * std::f32::consts::FRAC_PI_4;
-        transform.rotation = Quat::from_rotation_z(angle);
-    }
+// Always defined (not cfg-gated): rustc requires a crate-level `main` for
+// every target, wasm32 included - `wasm32-unknown-unknown` has no runtime
+// that calls it, though, so on wasm it's simply never invoked (the JS glue
+// calls the exported `__wbindgen_start`, i.e. `wasm_main` above, instead).
+fn main() {
+    retro_crt::main();
 }

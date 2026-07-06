@@ -2,7 +2,7 @@ use std::num::NonZeroUsize;
 use std::ops::Deref;
 
 use evictor::Lru;
-use tracing::debug;
+use tracing::info;
 use ratatui::style::Modifier;
 
 use crate::Fonts;
@@ -61,7 +61,9 @@ impl Atlas {
         let entry_width = fonts.min_width_px() * 2;
         let entry_height = fonts.height_px();
         let max_entries = ((width / entry_width) * (height / entry_height)).max(1);
-        debug!("Atlas with WxH {entry_width}x{entry_height} can hold {max_entries}");
+        info!(
+            "Glyph atlas: {width}x{height}px in use, entries {entry_width}x{entry_height}px, capacity {max_entries}"
+        );
 
         Atlas {
             lru: Lru::new(
@@ -82,9 +84,9 @@ impl Atlas {
         self.entry_height = fonts.height_px();
         self.max_entries = (self.width / self.entry_width) * (self.height / self.entry_height);
 
-        debug!(
-            "Atlas with WxH {}x{} can hold {}",
-            self.entry_width, self.entry_height, self.max_entries
+        info!(
+            "Glyph atlas: {}x{}px in use, entries {}x{}px, capacity {}",
+            self.width, self.height, self.entry_width, self.entry_height, self.max_entries
         );
     }
 

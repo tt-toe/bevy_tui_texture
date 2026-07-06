@@ -25,7 +25,7 @@ Thank you for your interest in contributing to bevy_tui_texture! This document p
 
 ### Prerequisites
 
-- Rust 1.75 or later (2024 edition)
+- Rust 1.95 or later (2024 edition)
 - A GPU with WGPU support
 - Basic familiarity with Bevy, ratatui, and WGPU
 
@@ -102,19 +102,6 @@ Example:
 pub fn create_terminal(cols: u16, rows: u16) -> Result<Terminal> {
     // ...
 }
-```
-
-### Commit Messages
-
-Follow the [Conventional Commits](https://www.conventionalcommits.org/) specification:
-
-```
-feat: add SimpleTerminal3D support for mesh materials
-fix: correct mouse coordinate mapping in 3D terminals
-docs: update README with new examples
-perf: optimize glyph cache eviction algorithm
-refactor: simplify terminal texture creation
-test: add tests for keyboard input handling
 ```
 
 ## Testing
@@ -223,8 +210,7 @@ bevy_tui_texture/
 │       ├── text_atlas.rs   # GPU glyph cache
 │       └── plan_cache.rs   # Text shaping cache
 ├── examples/               # Example applications
-├── assets/                 # Fonts and resources
-└── tests/                  # Integration tests
+└── assets/                 # Fonts and resources
 ```
 
 ## Performance Guidelines
@@ -261,24 +247,21 @@ perf report
 
 ### High Priority
 
-- [ ] WASM support improvements
-- [ ] More comprehensive test coverage
 - [ ] Performance optimizations for large terminals
 - [ ] Additional examples demonstrating advanced features
+- [ ] Precise programmatic glyph sets
 
 ### Medium Priority
 
 - [ ] Better error messages and debugging tools
 - [ ] Documentation improvements
 - [ ] CI/CD pipeline enhancements
-- [ ] Additional programmatic glyph sets
 
 ### Low Priority
 
 - [ ] Alternative font backends
 - [ ] Theme/color scheme presets
 - [ ] Animation utilities
-- [ ] Terminal recording/playback
 
 ## Questions or Issues?
 

@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Bevy/wgpu need a handful of native Linux dev packages to even compile on
+  # a stock runner (winit's x11 backend, ALSA/udev pulled in transitively
+  # even though this crate never uses audio/gamepad) - and a software
+  # Vulkan implementation (lavapipe, via mesa-vulkan-drivers) so wgpu can
+  # get a real (if slow) adapter. Without it, the one GPU-backed test
+  # (`flush_renders_drawn_content_synchronously`) would fall back to its
+  # "no adapter" skip path instead of actually running.
+  test:
+    name: cargo test (all features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev libudev-dev \
+            libx11-dev libxi-dev libxcursor-dev libxrandr-dev \
+            libwayland-dev libxkbcommon-dev \
+            mesa-vulkan-drivers libgl1-mesa-dri
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all-features
+
+  clippy:
+    name: cargo clippy -D warnings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev libudev-dev \
+            libx11-dev libxi-dev libxcursor-dev libxrandr-dev \
+            libwayland-dev libxkbcommon-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-features --all-targets -- -D warnings
+
+  doc:
+    name: cargo doc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev libudev-dev \
+            libx11-dev libxi-dev libxcursor-dev libxrandr-dev \
+            libwayland-dev libxkbcommon-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  # P0-1's feature matrix: the 2d/3d split must each build independently,
+  # and the crate must build with no display surface at all.
+  feature-matrix:
+    name: cargo check (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - "--no-default-features"
+          - "--no-default-features --features 2d"
+          - "--no-default-features --features 3d"
+          - "--no-default-features --features 3d,keyboard_input,mouse_input"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev libudev-dev \
+            libx11-dev libxi-dev libxcursor-dev libxrandr-dev \
+            libwayland-dev libxkbcommon-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.features }}
+      - run: cargo check --lib ${{ matrix.features }}
+
+  wasm:
+    name: cargo check (wasm32)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --target wasm32-unknown-unknown --example wasm_demo

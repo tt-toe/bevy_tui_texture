@@ -15,9 +15,7 @@ use std::time::Duration;
 use rand::Rng as _;
 use tracing::info;
 
-use bevy::pbr::StandardMaterial;
 use bevy::prelude::*;
-use bevy::render::renderer::{RenderDevice, RenderQueue};
 use bevy::window::WindowResolution;
 use ratatui::prelude::*;
 use ratatui::style::Color as RatatuiColor;
@@ -74,15 +72,8 @@ struct WidgetCatalogState {
 #[derive(Component)]
 struct RotatingPlane;
 
-fn setup_terminal(
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    render_device: Res<RenderDevice>,
-    render_queue: Res<RenderQueue>,
-    mut images: ResMut<Assets<Image>>,
-) {
-    info!("Setting up 3D widget catalog terminal with easy setup API...");
+fn setup_terminal(mut commands: Commands) {
+    info!("Setting up 3D widget catalog terminal with the declarative TuiRequest API...");
 
     // Load font
     let font_data = include_bytes!(concat!(
@@ -109,36 +100,18 @@ fn setup_terminal(
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.5, -0.5, 0.0)),
     ));
 
-    // Create 3D terminal with the new bundle API. `world_quad`'s mesh already
-    // faces +Z at rest (see `rotate_plane`'s comment for why this changes
-    // the seesaw rotation formula vs. the old Y-normal `SimpleTerminal3D`
-    // plane). height chosen to match the original pixel-sized plane
+    // Declarative 3D terminal. `world_quad`'s mesh already faces +Z at rest
+    // (see `rotate_plane`'s comment for why this changes the seesaw
+    // rotation formula vs. the old Y-normal `SimpleTerminal3D` plane).
+    // height chosen to match the original pixel-sized plane
     // (ROWS * char_height_px) so the on-screen scale is unchanged.
     let char_height_px = fonts.height_px();
-    let mut ctx = TerminalSpawnCtx {
-        render_device: &render_device,
-        render_queue: &render_queue,
-        images: &mut images,
-        meshes: &mut meshes,
-        materials: &mut materials,
-    };
-    let bundle = TerminalBundle::world_quad(
-        COLS,
-        ROWS,
-        fonts,
-        ROWS as f32 * char_height_px as f32,
-        TerminalConfig {
-            programmatic_glyphs: true,
-            keyboard: true,
-            mouse: true,
-            ..default()
-        },
-        &mut ctx,
-    )
-    .expect("Failed to create 3D terminal");
-
     let terminal_entity = commands
-        .spawn((bundle, Transform::from_translation(Vec3::ZERO), RotatingPlane))
+        .spawn((
+            TuiRequest::world_quad(COLS, ROWS, fonts, ROWS as f32 * char_height_px as f32),
+            Transform::from_translation(Vec3::ZERO),
+            RotatingPlane,
+        ))
         .id();
 
     // Create state with initial values
@@ -779,7 +752,7 @@ fn draw_glyphs_tab(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
 
 /// System that rotates the plane in seesaw motion for always-visible interaction.
 ///
-/// `TerminalBundle::world_quad`'s mesh already faces +Z at rest (unlike the
+/// `TuiKind::WorldQuad`'s mesh already faces +Z at rest (unlike the
 /// old `SimpleTerminal3D`, whose `Plane3d::default()` faces +Y and needed an
 /// extra `Quat::from_rotation_x(FRAC_PI_2)` to face the camera) - so the
 /// seesaw here is a plain roll around Z, no base reorientation needed.

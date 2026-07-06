@@ -2,7 +2,7 @@
 name = "bevy_tui_texture"
 version = "0.3.0"
 edition = "2024"
-rust-version = "1.92"
+rust-version = "1.95"
 authors = ["TTT"]
 autoexamples = false
 license = "MIT"
@@ -24,6 +24,10 @@ mouse_input = []
 bold_italic_fonts = []
 emoji = ["dep:unicode-properties"]
 
+# [profile.*] in a library manifest only affects builds *in this workspace*
+# (i.e. these examples/benchmarks) - Cargo ignores a dependency's own
+# profile tables entirely, so downstream binaries do NOT inherit LTO/strip/
+# etc. from us. Kept only to make running the examples reasonably fast.
 # for Native
 [profile.release]
 opt-level = 3      # Optimize for size (use "3" for speed)
@@ -61,6 +65,11 @@ bevy = { version = "0.19", default-features = false, features = [
     "bevy_core_pipeline",
 ]}
 ratatui = { version = "0.30.2", default-features = false }
+# Must match the wgpu version bevy 0.19 is pinned to (currently 29) - bump
+# together. `pub use wgpu;` in lib.rs re-exports this exact version so
+# downstream custom render passes (see `Tui::image_handle` +
+# render-world `GpuImage` lookup) can reference matching types without
+# separately pinning their own wgpu dependency.
 wgpu = { version = "29.0", default-features = false, features = ["wgsl", "webgl"] }
 rustybuzz = "0.20"
 raqote = { version = "0.8", default-features = false }
@@ -77,16 +86,22 @@ unicode-properties = { version = "0.1", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
-web-sys = { version = "0.3", features = ["Window", "Document", "HtmlCanvasElement", "console"] }
+web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlCanvasElement", "KeyboardEvent", "console"] }
+js-sys = "0.3"
 console_error_panic_hook = "0.1"
 getrandom = { version = "0.2", features = ["js"] }
 
 [dev-dependencies]
+rand = "0.8"
+
 # Extra bevy features for examples only (the lib's bevy is default-features=false):
 # - bevy_log: without it examples run silently — shader/asset errors invisible
 # - bevy_gltf/bevy_scene + png/jpeg: the retro_crt glTF model
-# - zstd_rust/tonemapping_luts: examples want full tonemapping; not needed by the lib itself
+# - zstd_rust/tonemapping_luts: full tonemapping (Camera3d's default Tonemapping,
+#   TonyMcMapface, needs its LUT texture — panics without this feature); not
+#   needed by the lib itself
 # - webgl2/x11: windowing/GPU backend choice belongs to the app, not the lib
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 bevy = { version = "0.19", default-features = false, features = [
     "bevy_log",
     "bevy_gltf",
@@ -100,20 +115,37 @@ bevy = { version = "0.19", default-features = false, features = [
     "webgl2",
     "x11",
 ] }
-winit = "0.30"
-env_logger = "0.11"
-futures-lite = "2.5"
-anyhow = "1.0"
-tokio = { version = "1.42", features = ["rt", "macros"] }
-pollster = "0.3"
-tiny_http = "0.12"
-rand = "0.8"
-
-[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
-wasm-bindgen-test = "0.3"
-
-[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 font-kit = "0.14"
+
+# wasm_demo's own bevy feature set, trimmed for binary size: no zstd_rust/
+# tonemapping_luts (the ~680KB embedded LUT textures + ktx2/zstd decoder;
+# wasm_demo.rs instead sets an explicit non-LUT Tonemapping on its camera),
+# no x11 (native-only windowing backend).
+#
+# bevy_winit is LOAD-BEARING here even though wasm has no "window": it is
+# the event-loop runner. On native the "x11" feature pulls it in
+# transitively (x11 = ["bevy_internal/x11"] = bevy_winit/x11), but dropping
+# x11 for wasm also dropped bevy_winit itself. Without WinitPlugin,
+# App::run() falls back to the run_once runner, whose
+# `while plugins_state() == Adding {}` wait-loop busy-spins the browser's
+# main thread forever: RenderPlugin::ready() can only flip once the
+# spawn_local'd renderer-init future runs on the JS microtask queue, which
+# never gets control back. Symptom: wasm loads, then the tab hard-hangs
+# with zero console output ("Script terminated by timeout" stack topping
+# out in bevy_app::App::plugins_state).
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+bevy = { version = "0.19", default-features = false, features = [
+    "bevy_log",
+    "bevy_winit",
+    "bevy_gltf",
+    "bevy_scene",
+    "bevy_world_serialization",
+    "reflect_auto_register",
+    "png",
+    "jpeg",
+    "webgl2",
+] }
+wasm-bindgen-test = "0.3"
 
 [lints.clippy]
 type_complexity = "allow"
@@ -140,9 +172,6 @@ path = "examples/shader_mesh.rs"
 name = "wasm_demo"
 path = "examples/wasm_demo.rs"
 [[example]]
-name = "wasm_serve"
-path = "examples/wasm_serve.rs"
-[[example]]
 name = "world_terminal"
 path = "examples/world_terminal.rs"
 [[example]]
@@ -151,3 +180,9 @@ path = "examples/tui_component.rs"
 [[example]]
 name = "retro_crt"
 path = "examples/retro_crt.rs"
+[[example]]
+name = "resize"
+path = "examples/resize.rs"
+[[example]]
+name = "transparent_world_quad"
+path = "examples/transparent_world_quad.rs"

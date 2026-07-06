@@ -1,16 +1,16 @@
-//! `TerminalBundle::world_quad` — world-unit-sized terminal screen inside a
-//! game scene, built on the `Tui` component.
+//! `TuiRequest::world_quad` — world-unit-sized terminal screen inside a
+//! game scene, spawned declaratively.
 //!
 //! - quad sized in **world units** (height; width follows the texture aspect),
 //! - orientation is an ordinary `Transform` in the spawn tuple (no `facing`
-//!   parameter — see `TerminalBundle::world_quad`'s doc comment),
-//! - `update_screen` below takes **zero render-resource parameters**;
-//!   `Tui::draw` only touches the ratatui buffer, and `TerminalPlugin`'s
-//!   `gpu_flush_system` owns the GPU render + async copy + material touch,
-//! - in-world mouse picking (click the screen; the hit cell is displayed),
-//! - the font is loaded through the `AssetServer` (works on native and Wasm
-//!   alike) via the same "wait until loaded, then spawn" pattern every bevy
-//!   user already writes for glTF.
+//!   parameter — see `TuiKind::WorldQuad`'s doc comment),
+//! - `update_screen` below takes **zero render-resource parameters**, and so
+//!   does `setup`: the screen is a single `TuiRequest` spawn; the plugin's
+//!   `materialize_tui_requests` system does all the resource work,
+//! - the font is loaded through the `AssetServer` via `TuiFontSource::Asset`
+//!   (works on native and Wasm alike) — the request simply stays pending
+//!   until the `.ttf` finishes loading, no hand-rolled waiting system,
+//! - in-world mouse picking (click the screen; the hit cell is displayed).
 //!
 //! Run with: `cargo run --example world_terminal`
 //! (use `cargo run`, not the bare binary: asset/font paths resolve via
@@ -30,7 +30,7 @@ fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
-                title: "TerminalBundle::world_quad — in-game screen".to_string(),
+                title: "TuiRequest::world_quad — in-game screen".to_string(),
                 ..default()
             }),
             ..default()
@@ -38,10 +38,6 @@ fn main() {
         .add_plugins(TerminalPlugin::default())
         .init_resource::<Clicks>()
         .add_systems(Startup, setup)
-        .add_systems(
-            Update,
-            spawn_screen_when_font_ready.run_if(resource_exists::<PendingFont>),
-        )
         .add_systems(Update, rotate_cube)
         .add_systems(
             Update,
@@ -54,11 +50,6 @@ fn main() {
 /// Marker for the in-world screen entity (its `Tui` is queried directly).
 #[derive(Component)]
 struct Screen;
-
-/// Font asset handle, kicked off in `setup` and polled by
-/// `spawn_screen_when_font_ready` - removed once the screen is spawned.
-#[derive(Resource)]
-struct PendingFont(Handle<TerminalFontAsset>);
 
 #[derive(Resource, Default)]
 struct Clicks {
@@ -97,50 +88,24 @@ fn setup(
         Spinning,
     ));
 
-    // Font: loaded through the AssetServer - works on native and Wasm
-    // alike. The screen itself is spawned once this finishes loading, by
-    // spawn_screen_when_font_ready below.
-    let font: Handle<TerminalFontAsset> = asset_server.load("fonts/Mplus1Code-Regular.ttf");
-    commands.insert_resource(PendingFont(font));
-}
-
-/// Waits for the font asset to finish loading, then spawns the in-world
-/// screen. Runs every frame (via `run_if(resource_exists::<PendingFont>)`)
-/// until it succeeds, then removes `PendingFont` so it stops running.
-fn spawn_screen_when_font_ready(
-    mut commands: Commands,
-    pending: Res<PendingFont>,
-    font_assets: Res<Assets<TerminalFontAsset>>,
-    render_device: Res<bevy::render::renderer::RenderDevice>,
-    render_queue: Res<bevy::render::renderer::RenderQueue>,
-    mut images: ResMut<Assets<Image>>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-) {
-    let Some(asset) = font_assets.get(&pending.0) else {
-        return; // still loading
-    };
-    let fonts = Fonts::from_asset(asset, 32).expect("invalid font");
-
-    let mut ctx = TerminalSpawnCtx {
-        render_device: &render_device,
-        render_queue: &render_queue,
-        images: &mut images,
-        meshes: &mut meshes,
-        materials: &mut materials,
-    };
-
     // The in-world screen: 2.2 world units tall, tilted toward the camera.
-    let bundle = TerminalBundle::world_quad(28, 10, fonts, 2.2, TerminalConfig::default(), &mut ctx)
-        .expect("terminal creation failed");
-
+    // The font loads through the AssetServer (works on native and Wasm
+    // alike); the request materializes automatically once it resolves - no
+    // hand-rolled "wait for the asset" system needed.
     commands.spawn((
-        bundle,
+        TuiRequest::world_quad(
+            28,
+            10,
+            TuiFontSource::Asset {
+                handle: asset_server.load("fonts/Mplus1Code-Regular.ttf"),
+                size_px: 32,
+            },
+            2.2,
+        ),
         Transform::from_translation(SCREEN_POS)
             .with_rotation(Quat::from_rotation_arc(Vec3::Z, CAMERA_POS - SCREEN_POS)),
         Screen,
     ));
-    commands.remove_resource::<PendingFont>();
 }
 
 fn rotate_cube(time: Res<Time>, mut cubes: Query<&mut Transform, With<Spinning>>) {
@@ -182,7 +147,7 @@ fn update_screen(
 
     term.draw(|frame| {
         let outer = Block::bordered()
-            .title(" TerminalBundle::world_quad ")
+            .title(" TuiRequest::world_quad ")
             .border_style(Style::default().fg(TuiColor::LightCyan));
         let inner = outer.inner(frame.area());
         frame.render_widget(outer, frame.area());

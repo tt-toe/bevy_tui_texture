@@ -33,7 +33,7 @@
 //!
 //! ## Architecture Highlights
 //!
-//! - Uses `TerminalBundle::ui()` - the terminal is a `Tui` Component on its
+//! - Uses `TuiRequest::ui` - the terminal is a `Tui` Component on its
 //!   own entity, queried directly (no wrapping Resource, zero
 //!   render-resource parameters in the draw system)
 //! - Uses `TerminalEvent` system for unified input handling
@@ -47,7 +47,6 @@ use tracing::info;
 use rand::Rng as _;
 
 use bevy::prelude::*;
-use bevy::render::renderer::{RenderDevice, RenderQueue};
 use bevy::window::WindowResolution;
 use ratatui::prelude::*;
 use ratatui::style::Color as RatatuiColor;
@@ -100,15 +99,8 @@ struct WidgetCatalogState {
     gauge_inner_rect: Option<ratatui::layout::Rect>,
 }
 
-fn setup_terminal(
-    mut commands: Commands,
-    render_device: Res<RenderDevice>,
-    render_queue: Res<RenderQueue>,
-    mut images: ResMut<Assets<Image>>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-) {
-    info!("Setting up widget catalog terminal with easy setup API...");
+fn setup_terminal(mut commands: Commands) {
+    info!("Setting up widget catalog terminal with the declarative TuiRequest API...");
 
     let font_data = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -125,30 +117,12 @@ fn setup_terminal(
     // Spawn camera
     commands.spawn(Camera2d);
 
-    // Create terminal with the new bundle API
-    let mut ctx = TerminalSpawnCtx {
-        render_device: &render_device,
-        render_queue: &render_queue,
-        images: &mut images,
-        meshes: &mut meshes,
-        materials: &mut materials,
-    };
-    let bundle = TerminalBundle::ui(
-        COLS,
-        ROWS,
-        fonts,
-        TerminalConfig {
-            programmatic_glyphs: true,
-            keyboard: true,
-            mouse: true,
-            ..default()
-        },
-        &mut ctx,
-    )
-    .expect("Failed to create terminal");
-
     let terminal_entity = commands
-        .spawn((bundle, Node::default(), CatalogTerminal))
+        .spawn((
+            TuiRequest::ui(COLS, ROWS, fonts),
+            Node::default(),
+            CatalogTerminal,
+        ))
         .id();
 
     // Set focus on this terminal
@@ -374,7 +348,7 @@ fn render_terminal(
 
             let tabs = Tabs::new(vec!["Buttons", "Lists", "Charts", "Interactive", "Glyphs"])
                 .block(
-                    Block::bordered().title(format!("Widget Catalog")),
+                    Block::bordered().title("Widget Catalog".to_string()),
                 )
                 .style(Style::default().fg(RatatuiColor::White))
                 .highlight_style(Style::default().fg(RatatuiColor::Yellow).bold())

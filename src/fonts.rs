@@ -465,3 +465,144 @@ impl Fonts {
             .unwrap_or(u32::MAX)
     }
 }
+
+// ============================================================================
+// Test: font_for_cell's per-style fallback order (P2-4). Pure CPU - loads
+// the shipped M+ font multiple times (each load gets a fresh random `id()`,
+// see `Font::build`'s `RandomState::new()` per call) to stand in for
+// distinct "regular"/"bold"/"italic"/"bold_italic" font slots, and checks
+// which slot's `id()` wins for each `Modifier` combination.
+// ============================================================================
+
+#[cfg(test)]
+mod font_for_cell_tests {
+    use super::*;
+    use ratatui::buffer::Cell;
+    use ratatui::style::Modifier;
+
+    const FONT_DATA: &[u8] = include_bytes!("../assets/fonts/Mplus1Code-Regular.ttf");
+
+    /// A fresh `Font` with its own random `id()` - loading the same bytes
+    /// twice via `Font::from_vec` yields two distinguishable `Font`s (see
+    /// module doc comment), letting tests tell "which slot was picked"
+    /// apart without needing physically different font files.
+    fn fresh_font() -> Font {
+        Font::from_vec(FONT_DATA.to_vec()).expect("failed to load test font")
+    }
+
+    fn cell_with(modifier: Modifier) -> Cell {
+        let mut cell = Cell::default();
+        cell.set_symbol("a");
+        cell.modifier = modifier;
+        cell
+    }
+
+    #[test]
+    fn regular_cell_prefers_the_regular_slot() {
+        let mut fonts = Fonts::new(fresh_font(), 16); // last_resort
+        let regular = fresh_font();
+        let regular_id = regular.id();
+        fonts.add_regular_fonts([regular]);
+
+        let (font, fake_bold, fake_italic) = fonts.font_for_cell(&cell_with(Modifier::empty()));
+        assert_eq!(font.id(), regular_id);
+        assert!(!fake_bold && !fake_italic);
+    }
+
+    #[test]
+    fn bold_cell_prefers_the_bold_slot_over_regular() {
+        let mut fonts = Fonts::new(fresh_font(), 16);
+        let bold = fresh_font();
+        let bold_id = bold.id();
+        fonts.add_regular_fonts([fresh_font()]);
+        fonts.add_bold_fonts([bold]);
+
+        let (font, fake_bold, fake_italic) = fonts.font_for_cell(&cell_with(Modifier::BOLD));
+        assert_eq!(
+            font.id(),
+            bold_id,
+            "a real bold font must win over faking bold on the regular font"
+        );
+        assert!(!fake_bold && !fake_italic, "a real bold font needs no faking");
+    }
+
+    #[test]
+    fn bold_cell_falls_back_to_faking_bold_on_regular_when_no_bold_slot() {
+        let mut fonts = Fonts::new(fresh_font(), 16);
+        let regular = fresh_font();
+        let regular_id = regular.id();
+        fonts.add_regular_fonts([regular]);
+        // No bold font registered at all.
+
+        let (font, fake_bold, fake_italic) = fonts.font_for_cell(&cell_with(Modifier::BOLD));
+        assert_eq!(
+            font.id(),
+            regular_id,
+            "with no bold font, the regular font must be reused"
+        );
+        assert!(fake_bold, "bold must be faked on top of the regular font");
+        assert!(!fake_italic);
+    }
+
+    #[test]
+    fn bold_cell_falls_back_to_last_resort_when_nothing_else_registered() {
+        let last_resort = fresh_font();
+        let last_resort_id = last_resort.id();
+        let fonts = Fonts::new(last_resort, 16); // no regular/bold/italic added at all
+
+        let (font, fake_bold, _) = fonts.font_for_cell(&cell_with(Modifier::BOLD));
+        assert_eq!(font.id(), last_resort_id);
+        assert!(fake_bold, "bold must be faked on the last-resort font too");
+    }
+
+    #[test]
+    fn italic_cell_prefers_the_italic_slot_over_regular() {
+        let mut fonts = Fonts::new(fresh_font(), 16);
+        let italic = fresh_font();
+        let italic_id = italic.id();
+        fonts.add_regular_fonts([fresh_font()]);
+        fonts.add_italic_fonts([italic]);
+
+        let (font, fake_bold, fake_italic) = fonts.font_for_cell(&cell_with(Modifier::ITALIC));
+        assert_eq!(font.id(), italic_id);
+        assert!(!fake_bold && !fake_italic);
+    }
+
+    #[test]
+    fn bold_italic_cell_prefers_the_bold_italic_slot_over_everything() {
+        let mut fonts = Fonts::new(fresh_font(), 16);
+        let bold_italic = fresh_font();
+        let bold_italic_id = bold_italic.id();
+        fonts.add_regular_fonts([fresh_font()]);
+        fonts.add_bold_fonts([fresh_font()]);
+        fonts.add_italic_fonts([fresh_font()]);
+        fonts.add_bold_italic_fonts([bold_italic]);
+
+        let (font, fake_bold, fake_italic) =
+            fonts.font_for_cell(&cell_with(Modifier::BOLD | Modifier::ITALIC));
+        assert_eq!(font.id(), bold_italic_id);
+        assert!(!fake_bold && !fake_italic);
+    }
+
+    #[test]
+    fn bold_italic_cell_falls_back_to_bold_slot_with_faked_italic() {
+        let mut fonts = Fonts::new(fresh_font(), 16);
+        let bold = fresh_font();
+        let bold_id = bold.id();
+        fonts.add_regular_fonts([fresh_font()]);
+        fonts.add_bold_fonts([bold]);
+        // No bold_italic or italic-only slot registered.
+
+        let (font, fake_bold, fake_italic) =
+            fonts.font_for_cell(&cell_with(Modifier::BOLD | Modifier::ITALIC));
+        assert_eq!(
+            font.id(),
+            bold_id,
+            "with no bold_italic slot, the bold font is the next-best fallback"
+        );
+        assert!(
+            !fake_bold && fake_italic,
+            "bold is real (no faking needed) but italic must be faked on top"
+        );
+    }
+}

@@ -1,5 +1,4 @@
 use bevy::prelude::*;
-use bevy::render::renderer::{RenderDevice, RenderQueue};
 use bevy_tui_texture::prelude::*;
 use bevy_tui_texture::Font as TerminalFont;
 use font_kit::family_name::FamilyName;
@@ -24,14 +23,9 @@ fn main() {
         .run();
 }
 
-fn setup(
-    mut commands: Commands,
-    render_device: Res<RenderDevice>,
-    render_queue: Res<RenderQueue>,
-    mut images: ResMut<Assets<Image>>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-) {
+/// Declarative spawning: no render resources anywhere in this signature -
+/// spawn a `TuiRequest` and the plugin materializes it next frame.
+fn setup(mut commands: Commands) {
     let fonts = {
         let font_data = SystemSource::new()
             .select_best_match(&[FamilyName::Monospace], &Properties::new())
@@ -47,27 +41,15 @@ fn setup(
         ))
     };
 
-    let mut ctx = TerminalSpawnCtx {
-        render_device: &render_device,
-        render_queue: &render_queue,
-        images: &mut images,
-        meshes: &mut meshes,
-        materials: &mut materials,
-    };
-    let bundle = TerminalBundle::ui(
-        80,
-        25,
-        fonts,
-        TerminalConfig {
+    commands.spawn((
+        TuiRequest::ui(80, 25, fonts).with_config(TerminalConfig {
             keyboard: false,
             mouse: false,
             ..default()
-        },
-        &mut ctx,
-    )
-    .expect("Failed to create terminal");
-
-    commands.spawn((bundle, Node::default(), HelloTerminal));
+        }),
+        Node::default(),
+        HelloTerminal,
+    ));
     commands.spawn(Camera2d);
 }
 

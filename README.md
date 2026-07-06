@@ -14,7 +14,7 @@ https://github.com/user-attachments/assets/57c2fb98-04a6-4ecf-8c72-58808a9f499f
 - **Interactive Input** - Built-in keyboard and mouse input handling with focus management
 - **Programmatic Glyphs** - Automatic rendering of box-drawing, block elements, and Braille patterns
 - **Real-time Updates** - Efficient real-time terminal content updates with minimal overhead
-- **Easy Setup API** - `TerminalBundle::ui`/`::world_quad` spawn helpers for quick integration
+- **Declarative Spawning** - `TuiRequest` component: spawn it, the plugin materializes the terminal - no render resources in your setup system
 
 ## Quick Start
 
@@ -33,7 +33,6 @@ Mirrors `examples/helloworld.rs` (also embedded as this crate's Quick Start doct
 
 ```rust
 use bevy::prelude::*;
-use bevy::render::renderer::{RenderDevice, RenderQueue};
 use bevy_tui_texture::prelude::*;
 use bevy_tui_texture::Font as TerminalFont;
 use font_kit::family_name::FamilyName;
@@ -56,14 +55,9 @@ fn main() {
         .run();
 }
 
-fn setup(
-    mut commands: Commands,
-    render_device: Res<RenderDevice>,
-    render_queue: Res<RenderQueue>,
-    mut images: ResMut<Assets<Image>>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-) {
+// No render resources anywhere in this signature - spawn a `TuiRequest`
+// and the plugin materializes it next frame.
+fn setup(mut commands: Commands) {
     let fonts = {
         let font_data = SystemSource::new()
             .select_best_match(&[FamilyName::Monospace], &Properties::new())
@@ -75,18 +69,13 @@ fn setup(
             TerminalFont::new(font_data).expect("Failed to parse font"), 16))
     };
 
-    let mut ctx = TerminalSpawnCtx {
-        render_device: &render_device, render_queue: &render_queue,
-        images: &mut images, meshes: &mut meshes, materials: &mut materials,
-    };
-    let bundle = TerminalBundle::ui(
-        80, 25, fonts,
-        TerminalConfig { keyboard: false, mouse: false, ..default() },
-        &mut ctx,
-    )
-    .expect("Failed to create terminal");
-
-    commands.spawn((bundle, Node::default(), HelloTerminal));
+    commands.spawn((
+        TuiRequest::ui(80, 25, fonts).with_config(TerminalConfig {
+            keyboard: false, mouse: false, ..default()
+        }),
+        Node::default(),
+        HelloTerminal,
+    ));
     commands.spawn(Camera2d);
 }
 
@@ -118,16 +107,17 @@ The `examples/` directory contains comprehensive demonstrations:
 ### Advanced Examples
 
 - **`multiple_terminals.rs`** - Managing multiple independent terminals
-- **`world_terminal.rs`** - World-unit-sized in-game screen (`TerminalBundle::world_quad`)
+- **`world_terminal.rs`** - World-unit-sized in-game screen (`TuiRequest::world_quad` + `TuiFontSource::Asset`)
 - **`shader_mesh.rs`** - Custom shader effects and mesh3d with terminal textures
 - **`retro_crt.rs`** - glTF model + `ExtendedMaterial` CRT shader + overlay UI + camera modes
 - **`tui_component.rs`** - Manual entity spawning with `TerminalTexture` (no spawn helpers)
+- **`resize.rs`** - `Tui::request_resize` following the window size live
+- **`transparent_world_quad.rs`** - HUD-style see-through screen (`transparent_reset_bg` + `AlphaMode::Blend`)
 - **`benchmark.rs`** - Performance benchmarking and optimization
 
 ### WebAssembly
 
-- **`wasm_demo.rs`** - Full widget catalog running in browser
-- **`wasm_serve.rs`** - One-command WASM build & serve
+- **`wasm_demo.rs`** - the full retro CRT scene running in a browser (WebGL2)
 
 ## Run examples with
 
@@ -135,21 +125,21 @@ The `examples/` directory contains comprehensive demonstrations:
 cargo run --example helloworld
 cargo run --example widget_catalog_3d
 
-# For WASM demo
+# For the WASM demo (browser-ready site in docs/ - see docs/README.md
+# for deploy + local preview instructions)
 rustup target add wasm32-unknown-unknown
-cargo install wasm-bindgen-cli
+cargo install wasm-bindgen-cli   # version must match Cargo.lock's wasm-bindgen
 
-# Install wasm-opt (via binaryen)
-# macOS: brew install binaryen
-# Ubuntu: apt install binaryen
+cargo build --example wasm_demo --target wasm32-unknown-unknown --profile wasm-release
+wasm-bindgen --target web --no-typescript --out-dir docs \
+  target/wasm32-unknown-unknown/wasm-release/examples/wasm_demo.wasm
 
-# Install wabt for wasm-strip (via wabt)
-# macOS: brew install wabt
-# Ubuntu: apt install wabt
-
-cargo run --example wasm_serve
-
-# Output files are placed in `examples/web/`.
+# Shrink the binary (~31MB -> ~24MB) with wasm-opt (binaryen); see
+# docs/README.md's "Binary size" section for what each flag does and why.
+wasm-opt -Oz --strip-debug --strip-producers \
+  --enable-nontrapping-float-to-int --enable-bulk-memory --enable-sign-ext \
+  --enable-mutable-globals --enable-simd --enable-reference-types \
+  -o docs/wasm_demo_bg.wasm docs/wasm_demo_bg.wasm
 ```
 
 ## Feature Flags
@@ -165,16 +155,17 @@ features = ["2d", "3d", "keyboard_input", "mouse_input"]
 
 Available features:
 
-- **`2d`** (default) - 2D UI terminals (`TuiUi`, `TerminalBundle::ui`)
-- **`3d`** (default) - 3D mesh terminals (`TerminalBundle::world_quad`, `AttachTerminal`, mesh raycasting)
+- **`2d`** (default) - 2D UI terminals (`TuiUi`, `TuiKind::Ui`)
+- **`3d`** (default) - 3D mesh terminals (`TuiKind::WorldQuad`, `AttachTerminal`, mesh raycasting)
 - **`keyboard_input`** (default) - Enable keyboard event handling
 - **`mouse_input`** (default) - Enable mouse event handling for both 2D UI and 3D mesh terminals
 - **`bold_italic_fonts`** - Enable fake bold and italic font rendering support
 - **`emoji`** - Enable emoji and extended Unicode character support (WIP)
 
-`TerminalBundle`/`TerminalSpawnCtx` require both `2d` and `3d` together (not
-split further); build with just one display surface by disabling the other,
-e.g. `features = ["3d", "keyboard_input", "mouse_input"]` for a 3D-only app.
+`TuiRequest`'s `TuiKind` variants gate individually (`Ui` needs `2d`,
+`WorldQuad` needs `3d`, `Headless` is always available); build with just
+one display surface by disabling the other, e.g.
+`features = ["3d", "keyboard_input", "mouse_input"]` for a 3D-only app.
 
 ## Performance
 
@@ -189,16 +180,34 @@ See `examples/benchmark.rs` for performance metrics.
 
 ## Requirements
 
-- Rust 1.92 or later (2024 edition)
+- Rust 1.95 or later (2024 edition)
 - Bevy 0.19
 - Ratatui 0.30
 - A GPU with WGPU support
 
-| `bevy` | `ratatui` | `bevy_tui_texture` |
-|--------|-----------|--------------------|
-| `0.19` | `0.30`    | `0.3`              |
-| `0.18` | `0.30`    | `0.2`              |
-| `0.17` | `0.29`    | `0.1`              |
+**MSRV policy**: the declared `rust-version` tracks whichever dependency
+needs the newest compiler - currently bevy 0.19 itself (`rust-version =
+"1.95.0"`), not anything this crate's own code requires (edition 2024's
+floor is 1.85; ratatui 0.30.2 declares 1.88.0). Bumping bevy/ratatui may
+raise this floor further; there's no separate "N versions behind latest
+stable" policy on top of that.
+
+| `bevy` | `ratatui` | `wgpu` | `bevy_tui_texture` |
+|--------|-----------|--------|--------------------|
+| `0.19` | `0.30`    | `29`   | `0.3`              |
+| `0.18` | `0.30`    | `27`   | `0.2`              |
+| `0.17` | `0.29`    | `26`   | `0.1`              |
+
+`wgpu` must exactly match the version bevy itself is pinned to (see the
+comment above the `wgpu` dependency in `Cargo.toml`) - bump together.
+
+## Font Licensing
+
+The example/test fonts under `assets/fonts/` are SIL OFL 1.1-licensed, not
+MIT (this crate's own `license = "MIT"` covers the Rust code only):
+`Mplus1Code-Regular.ttf` (`assets/fonts/LICENSE/mplus1code.txt`) and
+`fusion-pixel-10px-monospaced-ja.ttf` (`assets/fonts/OFL.txt` +
+`assets/fonts/LICENSE/*.txt` for its bundled source fonts).
 
 ## Platform Support
 

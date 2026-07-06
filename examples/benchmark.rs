@@ -6,7 +6,6 @@
 
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::prelude::*;
-use bevy::render::renderer::{RenderDevice, RenderQueue};
 use bevy::window::{PresentMode, WindowResolution};
 use ratatui::layout::Rect as RatatuiRect;
 use ratatui::prelude::*;
@@ -52,14 +51,7 @@ struct BenchmarkState {
     last_report_secs: f32,
 }
 
-fn setup(
-    mut commands: Commands,
-    render_device: Res<RenderDevice>,
-    render_queue: Res<RenderQueue>,
-    mut images: ResMut<Assets<Image>>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-) {
+fn setup(mut commands: Commands) {
     let font_data = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/assets/fonts/Mplus1Code-Regular.ttf"
@@ -67,28 +59,12 @@ fn setup(
     let font = TerminalFont::new(font_data).expect("Failed to load font");
     let fonts = Arc::new(Fonts::new(font, 16));
 
-    let mut ctx = TerminalSpawnCtx {
-        render_device: &render_device,
-        render_queue: &render_queue,
-        images: &mut images,
-        meshes: &mut meshes,
-        materials: &mut materials,
-    };
-    let bundle = TerminalBundle::ui(
-        COLS,
-        ROWS,
-        fonts,
-        TerminalConfig {
+    commands.spawn((
+        TuiRequest::ui(COLS, ROWS, fonts).with_config(TerminalConfig {
             keyboard: false,
             mouse: false, // NO INPUT - pure rendering benchmark
             ..default()
-        },
-        &mut ctx,
-    )
-    .expect("Failed to create terminal");
-
-    commands.spawn((
-        bundle,
+        }),
         Node {
             position_type: PositionType::Absolute,
             left: Val::Px(10.0),

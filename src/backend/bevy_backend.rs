@@ -4,11 +4,8 @@ use web_time::{Duration, Instant};
 
 use crate::backend::rasterize::rasterize_glyph;
 use crate::backend::TextBgVertexMember;
-use crate::backend::TextCacheBgPipeline;
-use crate::backend::TextCacheFgPipeline;
 use crate::backend::TextVertexMember;
 use crate::backend::Viewport;
-use crate::backend::WgpuState;
 use crate::colors::Rgb;
 use crate::fonts::Fonts;
 use crate::utils::plan_cache::PlanCache;
@@ -22,11 +19,6 @@ use ratatui::buffer::Cell;
 use ratatui::text::Line;
 use rustybuzz::ttf_parser::GlyphId;
 use rustybuzz::UnicodeBuffer;
-use wgpu::Buffer;
-use wgpu::Device;
-use wgpu::Queue;
-use wgpu::Texture;
-use wgpu::TextureView;
 
 #[allow(dead_code)]
 const NULL_CELL: Cell = Cell::new("");
@@ -49,7 +41,11 @@ type Sourced = HashSet<(i32, i32, GlyphId, u32), RandomState>;
 ///
 /// - No lifetime parameters
 /// - Fonts are shared via Arc
-/// - Device/Queue are not owned, passed as references during rendering
+/// - Pure CPU state: cell grid, dirty tracking, text shaping/rasterization,
+///   and vertex generation. No `Device`/`Queue`, no GPU resources at all -
+///   those live in the render-world `TerminalGpuState` (`backend/mod.rs`),
+///   built from the `TerminalDrawPayload` this backend hands off each dirty
+///   frame (see `take_draw_payload`)
 /// - No Surface management, renders directly to textures
 /// - Simplified for Bevy's rendering pipeline
 pub struct BevyTerminalBackend {
@@ -81,15 +77,10 @@ pub struct BevyTerminalBackend {
     pub(super) rowmap: Vec<u16>,
 
     // ====== Glyph cache (owned) ======
+    // Slot allocation only (a pure CPU LRU tracker, no wgpu dependency) -
+    // the corresponding GPU texture lives in the render-world
+    // `TerminalGpuState`, keyed by destination image.
     pub(super) cached: Atlas,
-    pub(super) text_cache: Texture,
-    #[allow(dead_code)]
-    pub(super) text_mask: Texture,
-
-    // ====== Rendering pipelines (owned) ======
-    pub(super) text_bg_compositor: TextCacheBgPipeline,
-    pub(super) text_fg_compositor: TextCacheFgPipeline,
-    pub(super) text_screen_size_buffer: Buffer,
 
     // ====== Draw data (owned) ======
     pub(super) bg_vertices: Vec<TextBgVertexMember>,
@@ -99,13 +90,24 @@ pub struct BevyTerminalBackend {
     // ====== Pending GPU uploads ======
     pub(super) pending_cache_updates: Vec<(CacheRect, Vec<u32>, bool)>,
 
-    // ====== wgpu state (owned) ======
-    #[allow(dead_code)]
-    pub(super) wgpu_state: WgpuState,
-
     // ====== Color settings ======
     pub(super) reset_fg: Rgb,
     pub(super) reset_bg: Rgb,
+    /// If true, a cell whose *effective* background is `Color::Reset`
+    /// (accounting for `Modifier::REVERSED` - see the color-selection logic
+    /// in `flush()`) is packed with alpha 0 instead of 255, making it show
+    /// through to whatever is behind the terminal's surface (a world-quad
+    /// with `AlphaMode::Blend`, or a transparent-background UI node).
+    /// Localized entirely to vertex-color packing here - no shader/pipeline
+    /// change needed (`composite_bg.wgsl` already unpacks and outputs the
+    /// full RGBA of `bg_color`, and the bg pipeline's `BlendState::REPLACE`
+    /// writes it through as-is).
+    pub(super) transparent_reset_bg: bool,
+    /// Color shown before any content has been drawn (or while nothing is
+    /// drawn at all - e.g. mid-resize): the render world's `LoadOp::Clear`
+    /// color whenever a draw payload's vertex data is empty. Carried on
+    /// every `TerminalDrawPayload` as `clear_color` (see `take_draw_payload`).
+    pub(super) initial_fill: [u8; 4],
 
     // ====== Blink management (for future use) ======
     #[allow(dead_code)]
@@ -136,6 +138,8 @@ pub struct TerminalBuilder {
     viewport: Viewport,
     fast_blink: Duration,
     slow_blink: Duration,
+    transparent_reset_bg: bool,
+    initial_fill: [u8; 4],
 }
 
 impl TerminalBuilder {
@@ -150,6 +154,8 @@ impl TerminalBuilder {
             viewport: Viewport::Full,
             fast_blink: Duration::from_millis(200),
             slow_blink: Duration::from_millis(1000),
+            transparent_reset_bg: false,
+            initial_fill: [0, 0, 0, 255],
         }
     }
 
@@ -178,113 +184,34 @@ impl TerminalBuilder {
         self
     }
 
+    /// If `true`, cells whose effective background is `Color::Reset` render
+    /// with alpha 0 instead of opaque `reset_bg` - see the field doc on
+    /// `BevyTerminalBackend::transparent_reset_bg`. Default `false`.
+    pub fn with_transparent_reset_bg(mut self, transparent: bool) -> Self {
+        self.transparent_reset_bg = transparent;
+        self
+    }
+
+    /// Color shown before any content has been drawn. Default opaque black
+    /// (`[0, 0, 0, 255]`) - see the field doc on
+    /// `BevyTerminalBackend::initial_fill`.
+    pub fn with_initial_fill(mut self, initial_fill: [u8; 4]) -> Self {
+        self.initial_fill = initial_fill;
+        self
+    }
+
     /// Build the BevyTerminalBackend.
     ///
     /// This is synchronous (unlike the original async Builder).
-    /// Device and Queue are borrowed, not owned.
-    pub fn build(self, device: &Device, _queue: &Queue) -> BevyTerminalBackend {
-        use crate::backend::{
-            build_text_bg_compositor, build_text_fg_compositor, build_wgpu_state, CACHE_HEIGHT,
-            CACHE_WIDTH,
-        };
-        use std::mem::size_of;
-        use wgpu::util::BufferInitDescriptor;
-        use wgpu::util::DeviceExt;
-        use wgpu::{
-            AddressMode, BufferDescriptor, BufferUsages, Extent3d, FilterMode, SamplerDescriptor,
-            TextureDescriptor, TextureDimension, TextureFormat, TextureUsages,
-            TextureViewDescriptor,
-        };
+    /// Pure CPU construction - no `Device`/`Queue` needed at all. The
+    /// corresponding GPU resources (glyph atlas texture, compositor
+    /// pipelines) are created lazily in the render world on this
+    /// terminal's first extract (see `TerminalGpuState` in `backend/mod.rs`
+    /// and the render-world store in `bevy_plugin.rs`).
+    pub fn build(self) -> BevyTerminalBackend {
+        use crate::backend::{CACHE_HEIGHT, CACHE_WIDTH};
 
-        // Calculate drawable dimensions
-        let drawable_width = self.cols as u32 * self.fonts.min_width_px();
-        let drawable_height = self.rows as u32 * self.fonts.height_px();
-
-        // Create text cache texture (RGBA8, for colored glyphs)
-        let text_cache = device.create_texture(&TextureDescriptor {
-            label: Some("Text Cache"),
-            size: Extent3d {
-                width: CACHE_WIDTH,
-                height: CACHE_HEIGHT,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: TextureDimension::D2,
-            format: TextureFormat::Rgba8Unorm,
-            usage: TextureUsages::TEXTURE_BINDING
-                | TextureUsages::COPY_DST
-                | TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-
-        let text_cache_view = text_cache.create_view(&TextureViewDescriptor::default());
-
-        // Create text mask texture (R8, for alpha mask)
-        let text_mask = device.create_texture(&TextureDescriptor {
-            label: Some("Text Mask"),
-            size: Extent3d {
-                width: CACHE_WIDTH,
-                height: CACHE_HEIGHT,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: TextureDimension::D2,
-            format: TextureFormat::R8Unorm,
-            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-
-        let text_mask_view = text_mask.create_view(&TextureViewDescriptor::default());
-
-        // Create sampler
-        let sampler = device.create_sampler(&SamplerDescriptor {
-            address_mode_u: AddressMode::ClampToEdge,
-            address_mode_v: AddressMode::ClampToEdge,
-            address_mode_w: AddressMode::ClampToEdge,
-            mag_filter: FilterMode::Nearest,
-            min_filter: FilterMode::Nearest,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-            ..Default::default()
-        });
-
-        // Create uniform buffers
-        let text_screen_size_buffer = device.create_buffer(&BufferDescriptor {
-            label: Some("Text Uniforms Buffer"),
-            size: size_of::<[f32; 4]>() as u64,
-            mapped_at_creation: false,
-            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-        });
-
-        let atlas_size_buffer = device.create_buffer_init(&BufferInitDescriptor {
-            label: Some("Atlas Size buffer"),
-            contents: bytemuck::cast_slice(&[CACHE_WIDTH as f32, CACHE_HEIGHT as f32, 0.0, 0.0]),
-            usage: BufferUsages::UNIFORM,
-        });
-
-        // For BevyTerminalBackend, we use a default texture format (Rgba8Unorm)
-        // The actual render target format will be determined when render_to_texture is called
-        let target_format = TextureFormat::Rgba8Unorm;
-
-        // Build rendering pipelines
-        let text_bg_compositor =
-            build_text_bg_compositor(device, &text_screen_size_buffer, target_format);
-
-        let text_fg_compositor = build_text_fg_compositor(
-            device,
-            &text_screen_size_buffer,
-            &atlas_size_buffer,
-            &text_cache_view,
-            &text_mask_view,
-            &sampler,
-            target_format,
-        );
-
-        // Build WgpuState
-        let wgpu_state = build_wgpu_state(device, drawable_width, drawable_height);
-
-        // Initialize Atlas
+        // Initialize Atlas (pure CPU slot allocator - no wgpu dependency)
         let cached = Atlas::new(&self.fonts, CACHE_WIDTH, CACHE_HEIGHT);
 
         // Initialize plan cache
@@ -310,18 +237,14 @@ impl TerminalBuilder {
             row: String::new(),
             rowmap: vec![],
             cached,
-            text_cache,
-            text_mask,
-            text_bg_compositor,
-            text_fg_compositor,
-            text_screen_size_buffer,
             bg_vertices: vec![],
             text_indices: vec![],
             text_vertices: vec![],
             pending_cache_updates: vec![],
-            wgpu_state,
             reset_fg: self.reset_fg,
             reset_bg: self.reset_bg,
+            transparent_reset_bg: self.transparent_reset_bg,
+            initial_fill: self.initial_fill,
             fast_blinking: BitVec::new(),
             slow_blinking: BitVec::new(),
             fast_duration: self.fast_blink,
@@ -360,15 +283,27 @@ impl BevyTerminalBackend {
         self.cells_changed_last_draw
     }
 
+    /// Update the grid dimensions used by `Backend::size()`/`window_size()`.
+    /// Pure bookkeeping - the actual cell/dirty-tracking buffers (`cells`,
+    /// `dirty_rows`, `sourced`, `rendered`, blink bitvecs) are resized
+    /// lazily inside `draw()` based on the bounds this affects, the same
+    /// path a fresh terminal's first draw already goes through. Callers
+    /// must also resize ratatui's own front/back buffers (`Terminal::resize`
+    /// or the diff-driving `autoresize` on the next `Terminal::draw`) - this
+    /// method only updates what `BevyTerminalBackend` owns directly.
+    pub(crate) fn resize(&mut self, cols: u16, rows: u16) {
+        self.cols = cols;
+        self.rows = rows;
+    }
+
     /// Pre-populate programmatic glyphs into the texture atlas.
     ///
-    /// This method renders all special glyphs (box-drawing, block elements, braille, powerline)
-    /// using tiny-skia and queues them for GPU upload. Should be called once during initialization.
-    /// Glyphs not yet implemented are silently skipped (not an error).
-    ///
-    /// # Arguments
-    /// * `queue` - WGPU queue for uploading textures to GPU
-    pub fn populate_programmatic_glyphs(&mut self, queue: &Queue) {
+    /// This method rasterizes all special glyphs (box-drawing, block elements, braille, powerline)
+    /// using tiny-skia and queues them in `pending_cache_updates` - pure CPU work, no GPU upload
+    /// here (there is no GPU resource to upload to yet; the render world does that on this
+    /// terminal's first extract, exactly like any other glyph). Glyphs not yet implemented are
+    /// silently skipped (not an error).
+    pub fn populate_programmatic_glyphs(&mut self) {
         use crate::backend::programmatic_glyphs::{
             all_programmatic_glyphs, render_programmatic_glyph,
         };
@@ -418,9 +353,6 @@ impl BevyTerminalBackend {
             populated_count += 1;
         }
 
-        // Flush all uploads to GPU immediately
-        self.flush_cache_updates(queue);
-
         tracing::debug!(
             "Successfully pre-populated {} programmatic glyphs ({} skipped - not yet implemented)",
             populated_count,
@@ -428,202 +360,30 @@ impl BevyTerminalBackend {
         );
     }
 
-    /// Flush pending cache updates to GPU
-    fn flush_cache_updates(&mut self, queue: &Queue) {
-        use std::mem::size_of;
-        use wgpu::{
-            Extent3d, Origin3d, TexelCopyBufferLayout, TexelCopyTextureInfo, TextureAspect,
-        };
-
-        for (cached, image, _is_emoji) in self.pending_cache_updates.drain(..) {
-            queue.write_texture(
-                TexelCopyTextureInfo {
-                    texture: &self.text_cache,
-                    mip_level: 0,
-                    origin: Origin3d {
-                        x: cached.x,
-                        y: cached.y,
-                        z: 0,
-                    },
-                    aspect: TextureAspect::All,
-                },
-                bytemuck::cast_slice(&image),
-                TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(cached.width * size_of::<u32>() as u32),
-                    rows_per_image: Some(cached.height),
-                },
-                Extent3d {
-                    width: cached.width,
-                    height: cached.height,
-                    depth_or_array_layers: 1,
-                },
-            );
-        }
-    }
-
-    /// Render terminal content to an external GPU texture.
-    ///
-    /// This is the main rendering entry point for Bevy integration.
-    ///
-    /// # Rendering Pipeline
-    ///
-    /// 1. **GPU Uploads**: Uploads pending glyph rasterizations to `text_cache` texture
-    /// 2. **Background Pass**: Renders colored backgrounds for each cell
-    /// 3. **Foreground Pass**: Renders text glyphs sampled from glyph atlas
-    ///
-    /// # Arguments
-    ///
-    /// * `device` - Borrowed WGPU device (from Bevy's RenderDevice)
-    /// * `queue` - Borrowed WGPU queue (from Bevy's RenderQueue)
-    /// * `target` - Target texture view to render into (Bevy-managed texture)
-    ///
-    /// # Prerequisites
-    ///
-    /// **IMPORTANT**: `flush()` must be called before this method to prepare vertex data.
-    pub fn render_to_texture(&mut self, device: &Device, queue: &Queue, target: &TextureView) {
+    /// Drain the CPU-computed draw payload for the render world to consume:
+    /// pending glyph rasterizations plus the background/foreground
+    /// vertex+index data ratatui's diffed buffer produced on the most
+    /// recent `draw()`/`flush()`. Called only when the terminal is dirty
+    /// (see `Tui::flush` in `setup.rs`) - the render-world side
+    /// (`TerminalGpuState::render` in `backend/mod.rs`) does the actual GPU
+    /// work.
+    pub(crate) fn take_draw_payload(&mut self) -> crate::backend::TerminalDrawPayload {
         use ratatui::backend::Backend;
-        use wgpu::util::{BufferInitDescriptor, DeviceExt};
-        use wgpu::{
-            BufferUsages, CommandEncoderDescriptor, IndexFormat, LoadOp, Operations,
-            RenderPassColorAttachment, RenderPassDescriptor, StoreOp,
-        };
 
-        // Get terminal bounds (using Backend trait's size() method)
-        let bounds = match Backend::size(self) {
-            Ok(size) => size,
-            Err(_) => return, // No content to render
-        };
-
-        let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
-            label: Some("Terminal Draw Encoder"),
+        let bounds = Backend::size(self).unwrap_or(ratatui::layout::Size {
+            width: 0,
+            height: 0,
         });
 
-        // Upload pending glyph rasterizations to GPU textures
-        for (cached, image, _is_emoji) in &self.pending_cache_updates {
-            use std::mem::size_of;
-            use wgpu::{
-                Extent3d, Origin3d, TexelCopyBufferLayout, TexelCopyTextureInfo, TextureAspect,
-            };
-
-            queue.write_texture(
-                TexelCopyTextureInfo {
-                    texture: &self.text_cache,
-                    mip_level: 0,
-                    origin: Origin3d {
-                        x: cached.x,
-                        y: cached.y,
-                        z: 0,
-                    },
-                    aspect: TextureAspect::All,
-                },
-                bytemuck::cast_slice(image),
-                TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(cached.width * size_of::<u32>() as u32),
-                    rows_per_image: Some(cached.height),
-                },
-                Extent3d {
-                    width: cached.width,
-                    height: cached.height,
-                    depth_or_array_layers: 1,
-                },
-            );
-
-            // For mask texture (monochrome glyphs only, but we'll skip for now)
-            // TODO: Implement mask texture upload if needed
+        crate::backend::TerminalDrawPayload {
+            screen_width_px: bounds.width as f32 * self.fonts.min_width_px() as f32,
+            screen_height_px: bounds.height as f32 * self.fonts.height_px() as f32,
+            clear_color: self.initial_fill,
+            glyph_uploads: std::mem::take(&mut self.pending_cache_updates),
+            bg_vertices: std::mem::take(&mut self.bg_vertices),
+            text_vertices: std::mem::take(&mut self.text_vertices),
+            text_indices: std::mem::take(&mut self.text_indices),
         }
-
-        if !self.text_vertices.is_empty() {
-            // Update screen size uniform. `write_buffer` (not
-            // `write_buffer_with`) avoids the `Option`/`NonZeroU64` dance -
-            // it takes the bytes directly and cannot fail at this call site.
-            queue.write_buffer(
-                &self.text_screen_size_buffer,
-                0,
-                bytemuck::cast_slice(&[
-                    bounds.width as f32 * self.fonts.min_width_px() as f32,
-                    bounds.height as f32 * self.fonts.height_px() as f32,
-                    0.0,
-                    0.0,
-                ]),
-            );
-
-            // Create vertex and index buffers
-            let bg_vertices = device.create_buffer_init(&BufferInitDescriptor {
-                label: Some("Text Bg Vertices"),
-                contents: bytemuck::cast_slice(&self.bg_vertices),
-                usage: BufferUsages::VERTEX,
-            });
-
-            let fg_vertices = device.create_buffer_init(&BufferInitDescriptor {
-                label: Some("Text Vertices"),
-                contents: bytemuck::cast_slice(&self.text_vertices),
-                usage: BufferUsages::VERTEX,
-            });
-
-            let indices = device.create_buffer_init(&BufferInitDescriptor {
-                label: Some("Text Indices"),
-                contents: bytemuck::cast_slice(&self.text_indices),
-                usage: BufferUsages::INDEX,
-            });
-
-            {
-                // Render pass: background + foreground
-                let mut text_render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
-                    label: Some("Terminal Text Render Pass"),
-                    color_attachments: &[Some(RenderPassColorAttachment {
-                        view: target,
-                        resolve_target: None,
-                        ops: Operations {
-                            load: LoadOp::Clear(wgpu::Color::BLACK),
-                            store: StoreOp::Store,
-                        },
-                        depth_slice: None,
-                    })],
-                    ..Default::default()
-                });
-
-                text_render_pass.set_index_buffer(indices.slice(..), IndexFormat::Uint32);
-
-                // Background pass
-                text_render_pass.set_pipeline(&self.text_bg_compositor.pipeline);
-                text_render_pass.set_bind_group(0, &self.text_bg_compositor.fs_uniforms, &[]);
-                text_render_pass.set_vertex_buffer(0, bg_vertices.slice(..));
-                text_render_pass.draw_indexed(0..(self.bg_vertices.len() as u32 / 4) * 6, 0, 0..1);
-
-                // Foreground pass
-                text_render_pass.set_pipeline(&self.text_fg_compositor.pipeline);
-                text_render_pass.set_bind_group(0, &self.text_fg_compositor.fs_uniforms, &[]);
-                text_render_pass.set_bind_group(1, &self.text_fg_compositor.atlas_bindings, &[]);
-                text_render_pass.set_vertex_buffer(0, fg_vertices.slice(..));
-                text_render_pass.draw_indexed(
-                    0..(self.text_vertices.len() as u32 / 4) * 6,
-                    0,
-                    0..1,
-                );
-            }
-        } else {
-            // If no text, just clear the target
-            {
-                let _clear_pass = encoder.begin_render_pass(&RenderPassDescriptor {
-                    label: Some("Terminal Clear Pass"),
-                    color_attachments: &[Some(RenderPassColorAttachment {
-                        view: target,
-                        resolve_target: None,
-                        ops: Operations {
-                            load: LoadOp::Clear(wgpu::Color::BLACK),
-                            store: StoreOp::Store,
-                        },
-                        depth_slice: None,
-                    })],
-                    ..Default::default()
-                });
-            } // Render pass dropped automatically here
-        }
-
-        queue.submit(Some(encoder.finish()));
-        // NOTE: No present() call - Bevy will handle that
     }
 
     /// Get the terminal dimensions in characters (columns, rows).
@@ -791,7 +551,7 @@ impl ratatui::backend::Backend for BevyTerminalBackend {
     /// - `text_indices`: Index buffer for efficient quad rendering
     ///
     /// Pending glyph rasterizations are stored in `pending_cache_updates` and will be
-    /// uploaded to the GPU texture in `render_to_texture()`.
+    /// uploaded to the GPU texture by the render world (see `take_draw_payload`).
     ///
     /// # Performance Notes
     ///
@@ -804,11 +564,22 @@ impl ratatui::backend::Backend for BevyTerminalBackend {
 
         let bounds = self.size()?;
 
-        // Clear buffers
+        // Clear the vertex/index buffers - they are full-frame state,
+        // regenerated from scratch below. `pending_cache_updates` must NOT
+        // be cleared here: its entries are one-shot atlas uploads for slots
+        // the `Atlas` LRU already considers cached, queued by a *previous*
+        // flush (or by `populate_programmatic_glyphs` at creation) and not
+        // yet drained by `take_draw_payload`. Clearing them here destroys
+        // the only copy of those glyphs' pixels - the glyph is never
+        // re-rasterized (the LRU says it's cached) and its slot stays
+        // garbage forever, i.e. permanently invisible characters. This is
+        // exactly what happens when `Terminal::draw` runs more than once
+        // between payload-takes: creation-time populate + a setup-time
+        // initial draw + the first per-frame draw are three flushes before
+        // the first `gpu_flush_system` ever runs.
         self.bg_vertices.clear();
         self.text_vertices.clear();
         self.text_indices.clear();
-        self.pending_cache_updates.clear();
 
         // Mark all cells as dirty for now (TODO: optimize)
         self.dirty_cells.clear();
@@ -987,6 +758,13 @@ impl ratatui::backend::Backend for BevyTerminalBackend {
 
                 // Get colors
                 let reverse = cell.modifier.contains(ratatui::style::Modifier::REVERSED);
+                // The color actually being used *as the background* -
+                // `cell.fg` when reversed, matching the swap below. Checked
+                // against `Color::Reset` before `c2c()` resolves it to an
+                // opaque RGB, since that resolution is exactly what erases
+                // the "this cell has no explicit background" information
+                // `transparent_reset_bg` needs.
+                let bg_source = if reverse { cell.fg } else { cell.bg };
                 let bg_color = if reverse {
                     c2c(cell.fg, self.reset_fg)
                 } else {
@@ -998,8 +776,15 @@ impl ratatui::backend::Backend for BevyTerminalBackend {
                     c2c(cell.fg, self.reset_fg)
                 };
 
+                let bg_alpha = if self.transparent_reset_bg
+                    && matches!(bg_source, ratatui::style::Color::Reset)
+                {
+                    0
+                } else {
+                    255
+                };
                 let [r, g, b] = bg_color;
-                let bg_color_u32 = u32::from_be_bytes([r, g, b, 255]);
+                let bg_color_u32 = u32::from_be_bytes([r, g, b, bg_alpha]);
 
                 let [r, g, b] = fg_color;
                 let fg_color_u32 = u32::from_be_bytes([r, g, b, 255]);
@@ -1091,5 +876,128 @@ impl ratatui::backend::Backend for BevyTerminalBackend {
     ) -> Result<(), Self::Error> {
         // For now, just delegate to clear() for all clear types
         self.clear()
+    }
+}
+
+// ============================================================================
+// Test: cell-level transparency (P2-2). Pure CPU - drives ratatui's
+// `Backend::draw()` directly and inspects the packed vertex color, no
+// GPU/App needed. `bg_color`'s alpha byte is what `composite_bg.wgsl`
+// outputs unmodified (`BlendState::REPLACE`), so this is the whole story:
+// no shader/pipeline test is needed on top of this.
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fonts::{Font, Fonts};
+    use ratatui::backend::Backend as RatatuiBackend;
+    use ratatui::buffer::Cell;
+    use ratatui::style::Color;
+
+    fn test_fonts() -> Arc<Fonts> {
+        let font_data = include_bytes!("../../assets/fonts/Mplus1Code-Regular.ttf");
+        let font = Font::new(font_data).expect("failed to load test font");
+        Arc::new(Fonts::new(font, 16))
+    }
+
+    #[test]
+    fn transparent_reset_bg_zeroes_alpha_only_for_reset_backgrounds() {
+        let mut backend = TerminalBuilder::new(test_fonts())
+            .with_dimensions(2, 1)
+            .with_transparent_reset_bg(true)
+            .build();
+
+        let mut reset_cell = Cell::default();
+        reset_cell.set_symbol("a");
+        reset_cell.bg = Color::Reset;
+
+        let mut colored_cell = Cell::default();
+        colored_cell.set_symbol("b");
+        colored_cell.bg = Color::Rgb(10, 20, 30);
+
+        RatatuiBackend::draw(
+            &mut backend,
+            [(0u16, 0u16, &reset_cell), (1u16, 0u16, &colored_cell)].into_iter(),
+        )
+        .expect("draw failed");
+        RatatuiBackend::flush(&mut backend).expect("flush failed");
+
+        assert_eq!(
+            backend.bg_vertices.len(),
+            8,
+            "one quad (4 vertices) per cell, 2 cells"
+        );
+        for vertex in &backend.bg_vertices[0..4] {
+            assert_eq!(
+                vertex.bg_color & 0xFF,
+                0,
+                "a Color::Reset background must pack alpha 0 when \
+                 transparent_reset_bg is enabled"
+            );
+        }
+        for vertex in &backend.bg_vertices[4..8] {
+            assert_eq!(
+                vertex.bg_color & 0xFF,
+                255,
+                "an explicit background color must stay fully opaque"
+            );
+        }
+    }
+
+    #[test]
+    fn transparent_reset_bg_disabled_keeps_reset_cells_opaque() {
+        let mut backend = TerminalBuilder::new(test_fonts())
+            .with_dimensions(1, 1)
+            .with_transparent_reset_bg(false) // the default
+            .build();
+
+        let mut reset_cell = Cell::default();
+        reset_cell.set_symbol("a");
+        reset_cell.bg = Color::Reset;
+
+        RatatuiBackend::draw(&mut backend, [(0u16, 0u16, &reset_cell)].into_iter())
+            .expect("draw failed");
+        RatatuiBackend::flush(&mut backend).expect("flush failed");
+
+        assert!(!backend.bg_vertices.is_empty(), "flush must generate vertices");
+        for vertex in &backend.bg_vertices {
+            assert_eq!(
+                vertex.bg_color & 0xFF,
+                255,
+                "without transparent_reset_bg, Reset backgrounds render \
+                 opaque (using reset_bg), matching pre-P2-2 behavior"
+            );
+        }
+    }
+
+    #[test]
+    fn reversed_modifier_checks_fg_for_reset_transparency() {
+        // With Modifier::REVERSED, cell.fg becomes the effective background
+        // (see the color-swap in flush()) - transparency must follow that
+        // swap, not check cell.bg unconditionally.
+        let mut backend = TerminalBuilder::new(test_fonts())
+            .with_dimensions(1, 1)
+            .with_transparent_reset_bg(true)
+            .build();
+
+        let mut cell = Cell::default();
+        cell.set_symbol("a");
+        cell.modifier.insert(ratatui::style::Modifier::REVERSED);
+        cell.fg = Color::Reset; // effective background under REVERSED
+        cell.bg = Color::Rgb(1, 2, 3); // effective foreground under REVERSED - must not matter
+
+        RatatuiBackend::draw(&mut backend, [(0u16, 0u16, &cell)].into_iter())
+            .expect("draw failed");
+        RatatuiBackend::flush(&mut backend).expect("flush failed");
+
+        assert!(!backend.bg_vertices.is_empty(), "flush must generate vertices");
+        for vertex in &backend.bg_vertices {
+            assert_eq!(
+                vertex.bg_color & 0xFF,
+                0,
+                "reversed cell.fg == Reset must still zero the background alpha"
+            );
+        }
     }
 }

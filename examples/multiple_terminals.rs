@@ -39,14 +39,13 @@
 //!
 //! ## Architecture Highlights
 //!
-//! - Uses `TerminalBundle::ui()` for each terminal - each terminal is a
+//! - Uses `TuiRequest::ui` for each terminal - each terminal is a
 //!   `Tui` Component on its own entity, no wrapping Resource
 //! - Demonstrates entity-based terminal identification via marker components
 //! - Shows how to route `TerminalEvent` to specific terminals
 //! - Each terminal's draw system takes zero render-resource parameters
 
 use bevy::prelude::*;
-use bevy::render::renderer::{RenderDevice, RenderQueue};
 use bevy::window::WindowResolution;
 use ratatui::prelude::*;
 use ratatui::style::Color as RatatuiColor;
@@ -108,15 +107,8 @@ struct OverlapBackTerminal;
 #[derive(Component)]
 struct OverlapFrontTerminal;
 
-fn setup_terminals(
-    mut commands: Commands,
-    render_device: Res<RenderDevice>,
-    render_queue: Res<RenderQueue>,
-    mut images: ResMut<Assets<Image>>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-) {
-    info!("Setting up multiple terminals with easy setup API...");
+fn setup_terminals(mut commands: Commands) {
+    info!("Setting up multiple terminals with the declarative TuiRequest API...");
 
     // Load font (shared across all terminals)
     let font_data = include_bytes!(concat!(
@@ -155,30 +147,18 @@ fn setup_terminals(
     // Create camera FIRST
     commands.spawn(Camera2d);
 
-    let mut ctx = TerminalSpawnCtx {
-        render_device: &render_device,
-        render_queue: &render_queue,
-        images: &mut images,
-        meshes: &mut meshes,
-        materials: &mut materials,
+    // A `TerminalConfig` for the display-only terminals below (mouse only,
+    // no keyboard, no programmatic glyphs).
+    let display_config = || TerminalConfig {
+        programmatic_glyphs: false,
+        keyboard: false,
+        mouse: true,
+        ..default()
     };
 
     // Create interactive terminal (top-left) with full input
-    let interactive_bundle = TerminalBundle::ui(
-        INTERACTIVE_COL,
-        INTERACTIVE_ROW,
-        fonts.clone(),
-        TerminalConfig {
-            programmatic_glyphs: true,
-            keyboard: true,
-            mouse: true,
-            ..default()
-        },
-        &mut ctx,
-    )
-    .expect("Failed to create interactive terminal");
     commands.spawn((
-        interactive_bundle,
+        TuiRequest::ui(INTERACTIVE_COL, INTERACTIVE_ROW, fonts.clone()),
         Node {
             position_type: PositionType::Absolute,
             left: Val::Px(interactive_pos.0),
@@ -189,21 +169,8 @@ fn setup_terminals(
     ));
 
     // Create log terminal (top-right) with mouse input only
-    let log_bundle = TerminalBundle::ui(
-        LOG_COL,
-        LOG_ROW,
-        fonts.clone(),
-        TerminalConfig {
-            programmatic_glyphs: false,
-            keyboard: false,
-            mouse: true,
-            ..default()
-        },
-        &mut ctx,
-    )
-    .expect("Failed to create log terminal");
     commands.spawn((
-        log_bundle,
+        TuiRequest::ui(LOG_COL, LOG_ROW, fonts.clone()).with_config(display_config()),
         Node {
             position_type: PositionType::Absolute,
             left: Val::Px(log_pos.0),
@@ -214,21 +181,8 @@ fn setup_terminals(
     ));
 
     // Create status terminal (bottom-left) with mouse input
-    let status_bundle = TerminalBundle::ui(
-        STATUS_COL,
-        STATUS_ROW,
-        fonts.clone(),
-        TerminalConfig {
-            programmatic_glyphs: false,
-            keyboard: false,
-            mouse: true,
-            ..default()
-        },
-        &mut ctx,
-    )
-    .expect("Failed to create status terminal");
     commands.spawn((
-        status_bundle,
+        TuiRequest::ui(STATUS_COL, STATUS_ROW, fonts.clone()).with_config(display_config()),
         Node {
             position_type: PositionType::Absolute,
             left: Val::Px(status_pos.0),
@@ -239,21 +193,8 @@ fn setup_terminals(
     ));
 
     // Create overlapping back terminal (lower z-index)
-    let overlap_back_bundle = TerminalBundle::ui(
-        40,
-        12,
-        fonts.clone(),
-        TerminalConfig {
-            programmatic_glyphs: false,
-            keyboard: false,
-            mouse: true,
-            ..default()
-        },
-        &mut ctx,
-    )
-    .expect("Failed to create overlap back terminal");
     commands.spawn((
-        overlap_back_bundle,
+        TuiRequest::ui(40, 12, fonts.clone()).with_config(display_config()),
         Node {
             position_type: PositionType::Absolute,
             left: Val::Px(overlap_back_pos.0),
@@ -265,21 +206,8 @@ fn setup_terminals(
     ));
 
     // Create overlapping front terminal (higher z-index)
-    let overlap_front_bundle = TerminalBundle::ui(
-        40,
-        12,
-        fonts.clone(),
-        TerminalConfig {
-            programmatic_glyphs: false,
-            keyboard: false,
-            mouse: true,
-            ..default()
-        },
-        &mut ctx,
-    )
-    .expect("Failed to create overlap front terminal");
     commands.spawn((
-        overlap_front_bundle,
+        TuiRequest::ui(40, 12, fonts.clone()).with_config(display_config()),
         Node {
             position_type: PositionType::Absolute,
             left: Val::Px(overlap_front_pos.0),

@@ -402,7 +402,26 @@ impl PartialOrd for SortKey {
                     ord => Some(ord),
                 }
             }
-            _ => None, // Can't compare ZIndex with Distance
+            // A 2D UI terminal and a 3D mesh terminal can both register a
+            // hit for the same cursor position: the mesh ray-cast tests
+            // world-space geometry regardless of what bevy_ui has drawn on
+            // top of it, so a UI panel overlapping a 3D terminal in screen
+            // space (e.g. a HUD panel sitting above where a world model
+            // happens to project to) produces hit_candidates for both.
+            // Previously this returned `None`, and the caller's
+            // `sort_by(|a, b| ... .unwrap_or(Equal))` treated that as
+            // "equal" - `Vec::sort_by` is stable, so the winner silently
+            // fell back to whichever entity the `terminals` query happened
+            // to iterate first (archetype/spawn-order dependent, NOT
+            // screen-depth dependent). That made 2D UI clicks
+            // unpredictably "shadowed" by an unrelated 3D hit - observed as
+            // "the 3D model's screen responds to clicks but the 2D overlay
+            // panel doesn't" on some platforms/window sizes but not others,
+            // purely from incidental query ordering. bevy_ui is rendered as
+            // a screen-space overlay on top of every 3D camera regardless
+            // of `Camera::order`, so a UI hit always wins when both fire.
+            (SortKey::ZIndex(_), SortKey::Distance { .. }) => Some(std::cmp::Ordering::Less),
+            (SortKey::Distance { .. }, SortKey::ZIndex(_)) => Some(std::cmp::Ordering::Greater),
         }
     }
 }
@@ -425,6 +444,44 @@ fn detect_terminal_type(
     } else {
         TerminalType::Unknown
     }
+}
+
+/// Convert a pixel position local to a terminal's rendered area (origin at
+/// the terminal's top-left, `+Y` down) to a clamped grid cell. Pure
+/// function, no bevy types - used by 2D UI hit-testing
+/// (`bounding_box_hit_test`).
+///
+/// Clamps in both directions: negative input (shouldn't happen at the
+/// current call site, which already bounds-checks before calling this, but
+/// this function makes no such assumption) clamps to column/row 0; input at
+/// or beyond the terminal's pixel size clamps to the last column/row
+/// (`cols - 1`/`rows - 1`), never `cols`/`rows` themselves - those would be
+/// one past the last valid grid index.
+#[cfg(all(feature = "mouse_input", feature = "2d"))]
+fn pixel_to_cell(local_x: f32, local_y: f32, char_width: f32, char_height: f32, cols: u16, rows: u16) -> (u16, u16) {
+    let max_col = cols.saturating_sub(1) as f32;
+    let max_row = rows.saturating_sub(1) as f32;
+    let col = (local_x.max(0.0) / char_width).min(max_col) as u16;
+    let row = (local_y.max(0.0) / char_height).min(max_row) as u16;
+    (col, row)
+}
+
+/// Convert a mesh UV coordinate to a clamped grid cell. Pure function, no
+/// bevy types - used by 3D ray-mesh hit-testing (`ray_cast_hit_test_inner`).
+///
+/// UV is nominally `0.0..=1.0`, but ray-mesh intersection can return values
+/// fractionally outside that range at triangle edges due to floating-point
+/// error - clamped the same way as [`pixel_to_cell`], including the "never
+/// return `cols`/`rows` themselves" rule (a naive `(uv * cols).clamp(0.0,
+/// cols)` allows exactly that at `uv == 1.0`, one past the last valid grid
+/// index).
+#[cfg(all(feature = "mouse_input", feature = "3d"))]
+fn uv_to_cell(uv_x: f32, uv_y: f32, cols: u16, rows: u16) -> (u16, u16) {
+    let max_col = cols.saturating_sub(1) as f32;
+    let max_row = rows.saturating_sub(1) as f32;
+    let col = (uv_x.max(0.0) * cols as f32).min(max_col) as u16;
+    let row = (uv_y.max(0.0) * rows as f32).min(max_row) as u16;
+    (col, row)
 }
 
 /// Perform 2D UI bounding box hit test.
@@ -541,8 +598,7 @@ fn bounding_box_hit_test(
     );
 
     // Convert to terminal grid coordinates
-    let col = (local_x / char_width).min(cols - 1.0) as u16;
-    let row = (local_y / char_height).min(rows - 1.0) as u16;
+    let (col, row) = pixel_to_cell(local_x, local_y, char_width, char_height, cols as u16, rows as u16);
 
     debug!("Hit test result: col={}, row={}", col, row);
 
@@ -615,14 +671,13 @@ fn ray_cast_hit_test_inner(
     let uv = hit.uv?;
 
     let (cols, rows) = if let Some(dims) = dimensions {
-        (dims.cols as f32, dims.rows as f32)
+        (dims.cols, dims.rows)
     } else {
-        (80.0, 24.0)
+        (80, 24)
     };
 
     // UV to terminal grid mapping (90° CCW rotated mesh)
-    let col = (uv.x * cols).clamp(0.0, cols) as u16;
-    let row = (uv.y * rows).clamp(0.0, rows) as u16;
+    let (col, row) = uv_to_cell(uv.x, uv.y, cols, rows);
 
     debug!(
         "3D Hit Test: uv=({:.3},{:.3}) distance={:.1} cols={} rows={} -> grid=({},{})",
@@ -1230,5 +1285,94 @@ mod tests {
         assert!(config.mouse_enabled);
         assert!(config.auto_focus);
         assert_eq!(config.focus_button, MouseButton::Left);
+    }
+
+    // ========================================================================
+    // Coordinate mapping (P2-4): pixel_to_cell (2D UI) / uv_to_cell (3D mesh).
+    // Pure math, no bevy types - exercised directly.
+    // ========================================================================
+
+    #[cfg(all(feature = "mouse_input", feature = "2d"))]
+    mod pixel_to_cell_tests {
+        use super::super::pixel_to_cell;
+
+        #[test]
+        fn origin_maps_to_first_cell() {
+            assert_eq!(pixel_to_cell(0.0, 0.0, 8.0, 16.0, 80, 24), (0, 0));
+        }
+
+        #[test]
+        fn exactly_on_a_cell_boundary_rounds_down_into_the_next_cell() {
+            // x=8.0 is exactly the boundary between column 0 and column 1 -
+            // ratatui/terminal convention: the boundary pixel belongs to the
+            // cell it starts (column 1), not the one it ends (column 0).
+            assert_eq!(pixel_to_cell(8.0, 16.0, 8.0, 16.0, 80, 24), (1, 1));
+            // Just before the boundary still belongs to the previous cell.
+            assert_eq!(pixel_to_cell(7.9, 15.9, 8.0, 16.0, 80, 24), (0, 0));
+        }
+
+        #[test]
+        fn last_column_and_row_clamp_correctly() {
+            // Exactly at the terminal's pixel edge (80 cols * 8px = 640,
+            // 24 rows * 16px = 384) must clamp to the LAST valid index
+            // (79, 23), not 80/24 (one past the grid).
+            assert_eq!(pixel_to_cell(640.0, 384.0, 8.0, 16.0, 80, 24), (79, 23));
+            // Comfortably inside the last cell must resolve the same way.
+            assert_eq!(pixel_to_cell(635.0, 380.0, 8.0, 16.0, 80, 24), (79, 23));
+        }
+
+        #[test]
+        fn out_of_bounds_pixels_clamp_instead_of_wrapping_or_panicking() {
+            assert_eq!(
+                pixel_to_cell(-50.0, -50.0, 8.0, 16.0, 80, 24),
+                (0, 0),
+                "negative input must clamp to the first cell"
+            );
+            assert_eq!(
+                pixel_to_cell(10_000.0, 10_000.0, 8.0, 16.0, 80, 24),
+                (79, 23),
+                "far-out-of-bounds input must clamp to the last cell"
+            );
+        }
+
+        #[test]
+        fn single_cell_terminal_always_resolves_to_zero() {
+            assert_eq!(pixel_to_cell(500.0, 500.0, 8.0, 16.0, 1, 1), (0, 0));
+        }
+    }
+
+    #[cfg(all(feature = "mouse_input", feature = "3d"))]
+    mod uv_to_cell_tests {
+        use super::super::uv_to_cell;
+
+        #[test]
+        fn origin_maps_to_first_cell() {
+            assert_eq!(uv_to_cell(0.0, 0.0, 80, 24), (0, 0));
+        }
+
+        #[test]
+        fn uv_one_clamps_to_the_last_cell_not_one_past_it() {
+            // The bug this guards against: a naive `(uv * cols).clamp(0.0,
+            // cols)` allows exactly `cols` at `uv == 1.0`, one past the last
+            // valid grid index (0..cols-1).
+            assert_eq!(uv_to_cell(1.0, 1.0, 80, 24), (79, 23));
+        }
+
+        #[test]
+        fn slightly_past_one_still_clamps_to_the_last_cell() {
+            // Ray-mesh intersection can return UV fractionally outside
+            // 0.0..=1.0 at triangle edges due to floating-point error.
+            assert_eq!(uv_to_cell(1.0001, 1.0001, 80, 24), (79, 23));
+        }
+
+        #[test]
+        fn negative_uv_clamps_to_the_first_cell() {
+            assert_eq!(uv_to_cell(-0.0001, -0.0001, 80, 24), (0, 0));
+        }
+
+        #[test]
+        fn midpoint_maps_to_the_middle_of_the_grid() {
+            assert_eq!(uv_to_cell(0.5, 0.5, 80, 24), (40, 12));
+        }
     }
 }

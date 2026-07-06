@@ -16,7 +16,6 @@ use bevy::pbr::{ExtendedMaterial, MaterialExtension};
 use bevy::prelude::*;
 use bevy::reflect::Reflect;
 use bevy::render::render_resource::{AsBindGroup, ShaderType};
-use bevy::render::renderer::{RenderDevice, RenderQueue};
 use bevy::shader::ShaderRef;
 use bevy::window::WindowResolution;
 use ratatui::prelude::*;
@@ -92,8 +91,6 @@ struct MainTerminal;
 
 fn setup(
     mut commands: Commands,
-    render_device: Res<RenderDevice>,
-    render_queue: Res<RenderQueue>,
     mut images: ResMut<Assets<Image>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<CrtMaterial>>,
@@ -107,16 +104,8 @@ fn setup(
     let fonts = Arc::new(Fonts::new(font, 16));
 
     // Create terminal texture
-    let texture_state = TerminalTexture::create(
-        80,
-        30,
-        fonts,
-        true,
-        &render_device,
-        &render_queue,
-        &mut images,
-    )
-    .expect("Failed to create terminal");
+    let texture_state = TerminalTexture::create(80, 30, fonts, true, false, [0, 0, 0, 255], &mut images)
+        .expect("Failed to create terminal");
 
     let image_handle = texture_state.image_handle();
     let dimensions = texture_state.dimensions();
