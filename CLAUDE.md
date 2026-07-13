@@ -276,9 +276,12 @@ touching anywhere).
    any material's bind group already references. No asset mutation, no
    material touching, for any material type.
 
-One-frame latency: the draw payload extracted this frame renders on the
-next render pass. There is no CPU readback anywhere in this path (see
-`Tui::read_back_blocking` for the explicit opt-in exception).
+Same-frame latency: the draw payload extracted this frame is rendered before
+this same frame's main camera passes submit (`render_tui_textures` runs
+`.before(bevy::render::renderer::render_system)`), so a material samples
+this frame's content, not the previous frame's. There is no CPU readback
+anywhere in this path (see `Tui::read_back_blocking` for the explicit
+opt-in exception).
 
 ## Key Implementation Patterns
 
@@ -384,7 +387,7 @@ through this same path - no per-material-type plugin registration needed.
 ## Common Gotchas
 
 1. **Terminal creation needs no `RenderDevice`/`RenderQueue`** - `TerminalTexture::create` is pure CPU (`cols, rows, fonts, programmatic_glyphs, &mut Assets<Image>`); the GPU pipelines are built lazily in the render world on first render
-2. **One-frame latency GPU updates** - `gpu_flush_system` (main world) extracts a draw payload the same frame a terminal is dirty; the render world renders it next render pass. There is no CPU readback anywhere in the hot path (see "Terminal Rendering: Render World Only, No Material Touch" above) - the only blocking readback is the explicit opt-in `Tui::read_back_blocking` (screenshots/tests, never call it every frame; goes through a request/response channel to the render world, so call it from a different thread than the one driving `App::update()` unless using `PipelinedRenderingPlugin`)
+2. **Same-frame GPU updates** - `gpu_flush_system` (main world) extracts a draw payload the same frame a terminal is dirty; the render world renders it before that same frame's main camera passes submit (`render_tui_textures` runs `.before(bevy::render::renderer::render_system)`), so there is no display lag behind `Tui::draw()`. There is no CPU readback anywhere in the hot path (see "Terminal Rendering: Render World Only, No Material Touch" above) - the only blocking readback is the explicit opt-in `Tui::read_back_blocking` (screenshots/tests, never call it every frame; goes through a request/response channel to the render world, so call it from a different thread than the one driving `App::update()` unless using `PipelinedRenderingPlugin`)
 3. **Material updates need no touching at all** - not for `StandardMaterial`, not for custom materials. See "Terminal Rendering: Render World Only, No Material Touch" above
 4. **System ordering** - Always use `TerminalSystemSet` or rendering may occur before input
 5. **Font loading errors** - Verify font file exists and is valid TrueType format

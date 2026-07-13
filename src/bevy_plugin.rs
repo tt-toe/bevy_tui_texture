@@ -3,7 +3,7 @@
 
 use bevy::prelude::*;
 use bevy::render::render_asset::RenderAssets;
-use bevy::render::renderer::{RenderDevice, RenderQueue};
+use bevy::render::renderer::{render_system, RenderDevice, RenderQueue};
 use bevy::render::texture::GpuImage;
 use bevy::render::{ExtractSchedule, MainWorld, Render, RenderApp, RenderSystems};
 use std::collections::HashMap;
@@ -220,7 +220,14 @@ impl Plugin for TerminalPlugin {
                     Render,
                     (render_tui_textures, process_tui_readbacks)
                         .chain()
-                        .in_set(RenderSystems::Render),
+                        .in_set(RenderSystems::Render)
+                        // Ensures this frame's terminal-texture submit lands
+                        // before bevy's own main-pass submit (inside
+                        // `render_system`), so materials sample this
+                        // frame's content instead of the previous frame's -
+                        // otherwise wgpu's submit-order execution makes the
+                        // display lag one frame behind `Tui::draw()`.
+                        .before(render_system),
                 );
         }
 
