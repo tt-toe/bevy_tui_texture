@@ -384,16 +384,25 @@ fn extract_tui_draws(
             font_uploads.0.entry(font_key).or_default().extend(uploads);
         }
 
+        // Single payload in flight per destination (Phase 2 partial
+        // redraw): if an entry is still sitting in `pending` from a frame
+        // `render_tui_textures` skipped (destination `GpuImage` not
+        // prepared yet), do NOT drain this `Tui` this frame. A partial
+        // payload only covers the rows dirty as of ITS take - overwriting
+        // an unrendered entry would silently drop whatever rows it
+        // covered, and rendering both in one submit would double-write
+        // the shared per-terminal vertex buffers within that submit
+        // (`queue.write_buffer` applies before the submit as a whole, so
+        // both draw calls would see only the LAST write). Leaving the
+        // payload in `Tui::pending_draw` instead means the next dirty
+        // frame's `Tui::flush` sees `pending_draw.is_some()` and upgrades
+        // that next payload to a full one, which safely supersedes
+        // whatever this one would have covered - nothing is lost.
+        if pending.0.contains_key(&tui.image_handle().id()) {
+            continue;
+        }
+
         if let Some((dest, draw)) = tui.take_pending_draw() {
-            // Simply replaces any entry still in the map from a frame
-            // `render_tui_textures` skipped (destination `GpuImage` not
-            // prepared yet) - safe to drop that older payload's vertex
-            // data outright, since `draw` is this frame's full correct
-            // geometry regardless. (Before IMPROVEMENT.md C3 moved glyph
-            // rasterizations out of this payload and into the shared
-            // per-font state, an older payload's one-shot atlas uploads
-            // had to be merged forward here or those glyphs would render
-            // as garbage forever - no longer a concern for this map.)
             pending.0.insert(dest, draw);
         }
     }

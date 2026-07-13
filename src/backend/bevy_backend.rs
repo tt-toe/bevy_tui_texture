@@ -59,6 +59,23 @@ pub struct BevyTerminalBackend {
     pub(super) cells_changed_last_draw: bool,
     pub(super) cursor: (u16, u16),
     pub(super) viewport: Viewport,
+    /// Rows needing re-render, accumulated across flushes since the last
+    /// `take_draw_payload`: each `flush()` unions ratatui's dirty rows in;
+    /// `take_draw_payload` consumes and clears it. Rows reshaped in
+    /// `flush()`'s pass 2 due to atlas eviction are NOT included - eviction
+    /// only invalidates a row's cached UVs for a future redraw of that row;
+    /// the pixels already rendered to the destination texture from its last
+    /// actual redraw remain correct, so no GPU re-render is owed for it
+    /// this frame.
+    pub(super) rows_dirty_since_take: Vec<bool>,
+    /// True whenever the destination texture's current content can't be
+    /// trusted to already hold everything up to the last taken payload
+    /// (just created / resized / cleared / fonts swapped, or a main-world
+    /// pending-payload overwrite - see `Tui::flush` and
+    /// `Tui::apply_pending_resize`). While set, `take_draw_payload` always
+    /// produces a full payload (`TerminalDrawPayload::load_previous ==
+    /// false`) instead of one covering only dirty rows.
+    pub(super) full_redraw_needed: bool,
 
     // ====== Font management (Arc, no lifetime) ======
     // `cached` (Atlas), `plan_cache`, and `pending_cache_updates` used to
@@ -86,8 +103,10 @@ pub struct BevyTerminalBackend {
     // count (quad i -> [4i, 4i+1, 4i+2, 4i+2, 4i+3, 4i+1]), so this
     // terminal's `TerminalGpuState` (backend/mod.rs) owns one static,
     // grow-only index buffer instead of regenerating one here every frame.
-    pub(super) bg_vertices: Vec<TextBgVertexMember>,
-    pub(super) text_vertices: Vec<TextVertexMember>,
+    // Note: there are no `bg_vertices`/`text_vertices` fields here -
+    // `flush()` only maintains `row_geometry` below; the full-frame or
+    // dirty-rows-only vertex `Vec`s are built on demand in
+    // `take_draw_payload` (Phase 2 partial redraw), not accumulated here.
     /// Per-row geometry cache, indexed by row `y`, letting `flush()` skip
     /// reshaping+re-rasterizing rows `dirty_rows` says are unchanged. See
     /// `RowGeometry` and IMPROVEMENT.md A2.
@@ -200,14 +219,14 @@ impl TerminalBuilder {
             cells_changed_last_draw: false,
             cursor: (0, 0),
             viewport: self.viewport,
+            rows_dirty_since_take: vec![],
+            full_redraw_needed: true,
             fonts: self.fonts,
             buffer: UnicodeBuffer::new(),
             row: String::new(),
             rowmap: vec![],
             #[cfg(feature = "ascii_fast_shaping")]
             ascii_glyph_cache: std::collections::HashMap::new(),
-            bg_vertices: vec![],
-            text_vertices: vec![],
             row_geometry: vec![],
             reset_fg: self.reset_fg,
             reset_bg: self.reset_bg,
@@ -264,6 +283,13 @@ impl BevyTerminalBackend {
         // IMPROVEMENT.md A2's invalidation list).
         self.dirty_rows.clear();
         self.row_geometry.clear();
+
+        // The destination texture is about to be recreated at the new
+        // size (see `Tui::apply_pending_resize`) - nothing rendered to it
+        // so far is meaningful at the new dimensions, so the next payload
+        // must be a full one, not a dirty-rows-only partial.
+        self.rows_dirty_since_take.clear();
+        self.full_redraw_needed = true;
     }
 
     /// Pre-populate programmatic glyphs into the texture atlas.
@@ -332,13 +358,34 @@ impl BevyTerminalBackend {
         );
     }
 
-    /// Drain the CPU-computed draw payload for the render world to consume:
-    /// the background/foreground vertex data ratatui's diffed buffer
-    /// produced on the most recent `draw()`/`flush()`, plus this backend's
-    /// font identity (`font_key`, see [`Fonts::identity`]) so the render
-    /// world knows which shared atlas/pipelines to render against
-    /// (IMPROVEMENT.md C3). Called only when the terminal is dirty (see
-    /// `Tui::flush` in `setup.rs`).
+    /// Build the CPU-computed draw payload for the render world to consume:
+    /// the background/foreground vertex data for whichever rows need
+    /// re-rendering, plus this backend's font identity (`font_key`, see
+    /// [`Fonts::identity`]) so the render world knows which shared
+    /// atlas/pipelines to render against (IMPROVEMENT.md C3). Called only
+    /// when the terminal is dirty (see `Tui::flush` in `setup.rs`).
+    ///
+    /// Phase 2 partial redraw: concatenates `row_geometry` (maintained by
+    /// `flush()`) into the payload's vertex `Vec`s, choosing between two
+    /// shapes:
+    /// - **Full** (`load_previous == false`): every row is included, no
+    ///   synthesized clear quads - the render pass uses `LoadOp::Clear`,
+    ///   which wipes the whole destination texture before drawing. Chosen
+    ///   whenever `full_redraw_needed` is set (destination texture content
+    ///   can't be trusted - see that field's doc) or every row happens to
+    ///   be dirty anyway (cheaper than synthesizing a clear quad per row).
+    /// - **Partial** (`load_previous == true`): only rows in
+    ///   `rows_dirty_since_take` are included, and each such row is
+    ///   preceded by a synthesized full-row-width background quad in the
+    ///   `initial_fill` color. The render pass uses `LoadOp::Load`
+    ///   (preserving every other row's pixels already on the destination
+    ///   texture), and because the bg pipeline blends with
+    ///   `BlendState::REPLACE`, that synthesized quad is pixel-identical
+    ///   to clearing just that row - required because `shape_row` itself
+    ///   skips emitting a bg quad for any cell whose color already equals
+    ///   `initial_fill` (nothing to draw under `LoadOp::Clear`, but under
+    ///   `LoadOp::Load` a previous frame's different pixels there would
+    ///   otherwise linger).
     ///
     /// Glyph rasterizations are NOT part of this payload - they queue in
     /// the shared `Fonts::with_shared_cpu_state`, keyed by font rather than
@@ -351,15 +398,91 @@ impl BevyTerminalBackend {
             width: 0,
             height: 0,
         });
+        let height = bounds.height as usize;
+
+        // All rows dirty is cheaper handled as full (no synthesized clear
+        // quads to build). A `rows_dirty_since_take` shorter than `height`
+        // (e.g. take called before any draw at this size) never counts as
+        // "all dirty" - `full_redraw_needed` (set on every path that grows
+        // the grid) is what guarantees correctness for that case instead.
+        let all_dirty = height > 0
+            && self.rows_dirty_since_take.len() >= height
+            && self.rows_dirty_since_take[..height].iter().all(|&d| d);
+        let full = self.full_redraw_needed || all_dirty;
+
+        let mut bg_vertices = Vec::new();
+        let mut text_vertices = Vec::new();
+        let row_width_px = bounds.width as f32 * self.fonts.min_width_px() as f32;
+        let cell_height_px = self.fonts.height_px() as f32;
+
+        for y in 0..height {
+            let redraw = full
+                || self
+                    .rows_dirty_since_take
+                    .get(y)
+                    .copied()
+                    .unwrap_or(false);
+            if !redraw {
+                continue;
+            }
+            if !full {
+                // Row-clear quad: TL, TR, BL, BR corner order, matching
+                // `shape_row`'s own quads - REPLACE-blended, so this is
+                // pixel-identical to clearing just this row.
+                let y0 = y as f32 * cell_height_px;
+                let y1 = y0 + cell_height_px;
+                let color = u32::from_be_bytes(self.initial_fill);
+                bg_vertices.extend_from_slice(&[
+                    TextBgVertexMember {
+                        vertex: [0.0, y0],
+                        bg_color: color,
+                    },
+                    TextBgVertexMember {
+                        vertex: [row_width_px, y0],
+                        bg_color: color,
+                    },
+                    TextBgVertexMember {
+                        vertex: [0.0, y1],
+                        bg_color: color,
+                    },
+                    TextBgVertexMember {
+                        vertex: [row_width_px, y1],
+                        bg_color: color,
+                    },
+                ]);
+            }
+            // `row_geometry` may not reach `y` yet if this is called before
+            // the first draw at the current size - skip; `full_redraw_needed`
+            // guarantees this only happens while `full` is true, so the
+            // `LoadOp::Clear` on an empty payload already covers it.
+            if let Some(row) = self.row_geometry.get(y) {
+                bg_vertices.extend_from_slice(&row.bg_vertices);
+                text_vertices.extend_from_slice(&row.text_vertices);
+            }
+        }
+
+        self.rows_dirty_since_take.iter_mut().for_each(|d| *d = false);
+        self.full_redraw_needed = false;
 
         crate::backend::TerminalDrawPayload {
             screen_width_px: bounds.width as f32 * self.fonts.min_width_px() as f32,
             screen_height_px: bounds.height as f32 * self.fonts.height_px() as f32,
             clear_color: self.initial_fill,
             font_key: self.fonts.identity(),
-            bg_vertices: std::mem::take(&mut self.bg_vertices),
-            text_vertices: std::mem::take(&mut self.text_vertices),
+            load_previous: !full,
+            bg_vertices,
+            text_vertices,
         }
+    }
+
+    /// Forces the next [`Self::take_draw_payload`] call to produce a full
+    /// payload (`load_previous == false`) regardless of which rows are
+    /// actually marked dirty. Used by `Tui::flush` (setup.rs) when it is
+    /// about to overwrite a not-yet-extracted payload - a partial payload
+    /// covering only some rows would otherwise lose whatever rows the
+    /// overwritten one covered.
+    pub(crate) fn force_full_redraw(&mut self) {
+        self.full_redraw_needed = true;
     }
 
     /// This backend's font identity - see [`Fonts::identity`] and
@@ -410,6 +533,8 @@ impl BevyTerminalBackend {
         // goes away, same as any other Rust value).
         self.dirty_rows.clear();
         self.row_geometry.clear();
+        self.rows_dirty_since_take.clear();
+        self.full_redraw_needed = true;
         #[cfg(feature = "ascii_fast_shaping")]
         self.ascii_glyph_cache.clear();
         self.fonts = new_fonts;
@@ -844,6 +969,13 @@ impl ratatui::backend::Backend for BevyTerminalBackend {
         self.row_geometry.clear();
         self.cursor = (0, 0);
 
+        // The destination texture's content is no longer meaningful once
+        // the terminal's own cell grid has been cleared - force the next
+        // payload to be a full one (`LoadOp::Clear`) rather than a
+        // dirty-rows-only partial.
+        self.rows_dirty_since_take.clear();
+        self.full_redraw_needed = true;
+
         Ok(())
     }
 
@@ -890,7 +1022,13 @@ impl ratatui::backend::Backend for BevyTerminalBackend {
         })
     }
 
-    /// Prepare vertex data for GPU rendering.
+    /// Maintain the per-row geometry cache for GPU rendering (IMPROVEMENT.md
+    /// A2) and accumulate which rows need re-rendering
+    /// (`rows_dirty_since_take` - Phase 2 partial redraw). Concatenating
+    /// `row_geometry` into an actual draw payload - deciding full vs.
+    /// partial, synthesizing row-clear quads - happens later, in
+    /// `take_draw_payload`; this method only keeps `row_geometry` correct
+    /// and notes which rows changed.
     ///
     /// Two-pass, row-incremental design (IMPROVEMENT.md A2):
     /// 1. Regenerate every row `dirty_rows` says actually changed, via
@@ -904,7 +1042,11 @@ impl ratatui::backend::Backend for BevyTerminalBackend {
     ///    might now point at a reassigned slot, so it is reshaped too,
     ///    this once. This is a graceful-degradation path: it only engages
     ///    under atlas pressure, at the same per-frame cost the pre-A2 code
-    ///    always paid every frame.
+    ///    always paid every frame. Rows reshaped here are NOT added to
+    ///    `rows_dirty_since_take` - eviction only invalidates a row's
+    ///    cached UVs for a FUTURE redraw of that row; the pixels already
+    ///    rendered to the destination texture from its last actual redraw
+    ///    remain correct, so no GPU re-render is owed for it this frame.
     ///
     /// A cached row is trustworthy only while nothing has reassigned an
     /// atlas slot since it was recorded: `Atlas::get`'s eviction branch
@@ -930,7 +1072,7 @@ impl ratatui::backend::Backend for BevyTerminalBackend {
     /// when the most recent `draw()` didn't actually change any cell -
     /// `cells_changed_last_draw` is exactly that signal (reset at the top
     /// of every `draw()`, set `true` iff the diff yielded at least one
-    /// cell). Nothing downstream reads this backend's vertex buffers
+    /// cell). Nothing downstream reads `row_geometry`/`rows_dirty_since_take`
     /// unless `Tui::flush` sees its own `dirty` flag set, which is derived
     /// from this same signal - so skipping here changes nothing observable
     /// on an unchanged frame.
@@ -943,11 +1085,9 @@ impl ratatui::backend::Backend for BevyTerminalBackend {
         let width = bounds.width as usize;
         let height = bounds.height as usize;
 
-        // Clear the vertex buffers - they are full-frame state, rebuilt
-        // from `row_geometry` (reused rows) and fresh shaping (regenerated
-        // rows) below. `pending_cache_updates` must NOT be cleared here:
-        // its entries are one-shot atlas uploads for slots the `Atlas` LRU
-        // already considers cached, queued by a *previous* flush (or by
+        // `pending_cache_updates` must NOT be cleared here: its entries are
+        // one-shot atlas uploads for slots the `Atlas` LRU already
+        // considers cached, queued by a *previous* flush (or by
         // `populate_programmatic_glyphs` at creation) and not yet drained
         // by `take_draw_payload`. Clearing them here destroys the only
         // copy of those glyphs' pixels - the glyph is never re-rasterized
@@ -957,8 +1097,13 @@ impl ratatui::backend::Backend for BevyTerminalBackend {
         // payload-takes: creation-time populate + a setup-time initial
         // draw + the first per-frame draw are three flushes before the
         // first `gpu_flush_system` ever runs.
-        self.bg_vertices.clear();
-        self.text_vertices.clear();
+
+        // Track which rows actually changed content this flush,
+        // accumulated across flushes since the last `take_draw_payload` -
+        // `take` unions this into the row-clear set for the next partial
+        // payload. See the field doc on `rows_dirty_since_take` for why
+        // pass 2's eviction-driven reshapes below do NOT feed into this.
+        self.rows_dirty_since_take.resize(height, false);
 
         // Snapshot which rows ratatui's diff actually marked dirty coming
         // INTO this flush - `dirty_rows[y]` is cleared as each such row is
@@ -966,6 +1111,11 @@ impl ratatui::backend::Backend for BevyTerminalBackend {
         // rows still need looking at (a row just cleared by pass 1 must
         // not be reconsidered by pass 2 as "was already clean").
         let was_dirty = self.dirty_rows[..height].to_vec();
+        for (y, &dirty) in was_dirty.iter().enumerate() {
+            if dirty {
+                self.rows_dirty_since_take[y] = true;
+            }
+        }
 
         // Cloned (not borrowed) so the closure below can hold it alongside
         // an independent `&mut self` for `self.shape_row(...)` - `self.fonts`
@@ -983,8 +1133,6 @@ impl ratatui::backend::Backend for BevyTerminalBackend {
                     continue;
                 }
                 let (bg_vertices, text_vertices) = self.shape_row(y, width, shared);
-                self.bg_vertices.extend_from_slice(&bg_vertices);
-                self.text_vertices.extend_from_slice(&text_vertices);
                 self.row_geometry[y] = RowGeometry {
                     bg_vertices,
                     text_vertices,
@@ -1009,16 +1157,10 @@ impl ratatui::backend::Backend for BevyTerminalBackend {
                     && self.row_geometry[y].atlas_generation == generation_before_flush;
 
                 if cache_valid {
-                    self.bg_vertices
-                        .extend_from_slice(&self.row_geometry[y].bg_vertices);
-                    self.text_vertices
-                        .extend_from_slice(&self.row_geometry[y].text_vertices);
                     continue;
                 }
 
                 let (bg_vertices, text_vertices) = self.shape_row(y, width, shared);
-                self.bg_vertices.extend_from_slice(&bg_vertices);
-                self.text_vertices.extend_from_slice(&text_vertices);
                 self.row_geometry[y] = RowGeometry {
                     bg_vertices,
                     text_vertices,
@@ -1082,13 +1224,17 @@ mod tests {
         )
         .expect("draw failed");
         RatatuiBackend::flush(&mut backend).expect("flush failed");
+        let payload = backend.take_draw_payload();
 
+        // First-ever take on this backend is always full (no synthesized
+        // row-clear quad), so this is exactly one quad per cell.
+        assert!(payload.is_full(), "the first take on a fresh backend must be full");
         assert_eq!(
-            backend.bg_vertices.len(),
+            payload.bg_vertices.len(),
             8,
             "one quad (4 vertices) per cell, 2 cells"
         );
-        for vertex in &backend.bg_vertices[0..4] {
+        for vertex in &payload.bg_vertices[0..4] {
             assert_eq!(
                 vertex.bg_color & 0xFF,
                 0,
@@ -1096,7 +1242,7 @@ mod tests {
                  transparent_reset_bg is enabled"
             );
         }
-        for vertex in &backend.bg_vertices[4..8] {
+        for vertex in &payload.bg_vertices[4..8] {
             assert_eq!(
                 vertex.bg_color & 0xFF,
                 255,
@@ -1125,9 +1271,10 @@ mod tests {
         RatatuiBackend::draw(&mut backend, [(0u16, 0u16, &reset_cell)].into_iter())
             .expect("draw failed");
         RatatuiBackend::flush(&mut backend).expect("flush failed");
+        let payload = backend.take_draw_payload();
 
-        assert!(!backend.bg_vertices.is_empty(), "flush must generate vertices");
-        for vertex in &backend.bg_vertices {
+        assert!(!payload.bg_vertices.is_empty(), "flush must generate vertices");
+        for vertex in &payload.bg_vertices {
             assert_eq!(
                 vertex.bg_color & 0xFF,
                 255,
@@ -1156,9 +1303,10 @@ mod tests {
         RatatuiBackend::draw(&mut backend, [(0u16, 0u16, &cell)].into_iter())
             .expect("draw failed");
         RatatuiBackend::flush(&mut backend).expect("flush failed");
+        let payload = backend.take_draw_payload();
 
-        assert!(!backend.bg_vertices.is_empty(), "flush must generate vertices");
-        for vertex in &backend.bg_vertices {
+        assert!(!payload.bg_vertices.is_empty(), "flush must generate vertices");
+        for vertex in &payload.bg_vertices {
             assert_eq!(
                 vertex.bg_color & 0xFF,
                 0,
@@ -1186,17 +1334,11 @@ mod tests {
         RatatuiBackend::draw(&mut backend, [(0u16, 0u16, &cell)].into_iter())
             .expect("draw failed");
         RatatuiBackend::flush(&mut backend).expect("flush failed");
+        let payload = backend.take_draw_payload();
         assert!(
-            !backend.bg_vertices.is_empty(),
+            !payload.bg_vertices.is_empty(),
             "first draw onto an empty buffer must generate vertices"
         );
-
-        // Drain the payload the way `Tui::flush` does, so the buffers are
-        // empty going into the identical redraw below - otherwise "empty
-        // after flush" would trivially pass even if flush regenerated the
-        // same content.
-        let _ = backend.take_draw_payload();
-        assert!(backend.bg_vertices.is_empty() && backend.text_vertices.is_empty());
 
         // Second draw: byte-identical content. Note ratatui's own
         // `Terminal::flush` (ratatui-core `terminal/buffers.rs`) is what
@@ -1213,12 +1355,13 @@ mod tests {
         );
         RatatuiBackend::flush(&mut backend).expect("flush failed");
 
+        let payload = backend.take_draw_payload();
         assert!(
-            backend.bg_vertices.is_empty(),
+            payload.bg_vertices.is_empty(),
             "flush must skip regenerating bg vertices for an unchanged frame"
         );
         assert!(
-            backend.text_vertices.is_empty(),
+            payload.text_vertices.is_empty(),
             "flush must skip regenerating text vertices for an unchanged frame"
         );
     }
@@ -1288,8 +1431,13 @@ mod tests {
             .expect("draw failed");
         RatatuiBackend::flush(&mut backend).expect("flush failed");
 
-        let incremental_bg = backend.bg_vertices.clone();
-        let incremental_text = backend.text_vertices.clone();
+        // Snapshot the row cache produced incrementally. `row_geometry` -
+        // what IMPROVEMENT.md A2 caches - is what this test verifies;
+        // `take_draw_payload`'s full/partial concatenation and row-clear-quad
+        // synthesis (Phase 2) are orthogonal to row-cache correctness, so
+        // comparing `row_geometry` directly (rather than a concatenated
+        // payload) keeps this test decoupled from that later concern.
+        let incremental_rows: Vec<RowGeometry> = backend.row_geometry.clone();
         let _ = backend.take_draw_payload();
 
         // Force every row to be reshaped from scratch, on this same
@@ -1303,17 +1451,221 @@ mod tests {
         backend.cells_changed_last_draw = true;
         RatatuiBackend::flush(&mut backend).expect("flush failed");
 
+        for (y, (incremental, reshaped)) in incremental_rows
+            .iter()
+            .zip(backend.row_geometry.iter())
+            .enumerate()
+        {
+            assert_eq!(
+                sorted_bytes(&incremental.bg_vertices),
+                sorted_bytes(&reshaped.bg_vertices),
+                "row {y} bg vertices from an incremental (row-cached) flush must \
+                 match a full reshape of the same content on the same atlas state"
+            );
+            assert_eq!(
+                sorted_bytes(&incremental.text_vertices),
+                sorted_bytes(&reshaped.text_vertices),
+                "row {y} text vertices from an incremental (row-cached) flush must \
+                 match a full reshape of the same content on the same atlas state"
+            );
+        }
+    }
+
+    // ========================================================================
+    // Phase 2 tests: partial redraw (full vs. dirty-rows-only payloads).
+    // ========================================================================
+
+    #[test]
+    fn first_take_is_full() {
+        let mut backend = TerminalBuilder::new(test_fonts())
+            .with_dimensions(2, 1)
+            .build();
+
+        let mut cell = Cell::default();
+        cell.set_symbol("a");
+        cell.bg = Color::Rgb(10, 20, 30);
+
+        RatatuiBackend::draw(&mut backend, [(0u16, 0u16, &cell)].into_iter())
+            .expect("draw failed");
+        RatatuiBackend::flush(&mut backend).expect("flush failed");
+        let payload = backend.take_draw_payload();
+
+        assert!(payload.is_full(), "the very first take must be a full payload");
+    }
+
+    #[test]
+    fn partial_take_contains_only_dirty_rows() {
+        fn cell_with_symbol(symbol: &str) -> Cell {
+            let mut cell = Cell::default();
+            cell.set_symbol(symbol);
+            cell
+        }
+
+        let mut backend = TerminalBuilder::new(test_fonts())
+            .with_dimensions(1, 3)
+            .build();
+
+        let row_a = cell_with_symbol("A");
+        let row_b = cell_with_symbol("B");
+        let row_c = cell_with_symbol("C");
+        RatatuiBackend::draw(
+            &mut backend,
+            [(0u16, 0u16, &row_a), (0u16, 1u16, &row_b), (0u16, 2u16, &row_c)].into_iter(),
+        )
+        .expect("draw failed");
+        RatatuiBackend::flush(&mut backend).expect("flush failed");
+        let _ = backend.take_draw_payload(); // consume the initial full take
+
+        // Change only row 1.
+        let row_b_changed = cell_with_symbol("Z");
+        RatatuiBackend::draw(&mut backend, [(0u16, 1u16, &row_b_changed)].into_iter())
+            .expect("draw failed");
+        RatatuiBackend::flush(&mut backend).expect("flush failed");
+        let payload = backend.take_draw_payload();
+
+        assert!(!payload.is_full(), "a single-row change must take a partial payload");
+
+        let cell_height_px = backend.fonts.height_px() as f32;
+        let y0 = 1.0 * cell_height_px;
+        let y1 = 2.0 * cell_height_px;
+        let expected_color = u32::from_be_bytes(backend.initial_fill);
+
+        // The first 4 vertices are the synthesized row-clear quad for row 1
+        // (TL, TR, BL, BR), in the `initial_fill` color.
+        assert_eq!(payload.bg_vertices[0].vertex, [0.0, y0]);
+        assert_eq!(payload.bg_vertices[1].vertex[1], y0);
+        assert_eq!(payload.bg_vertices[2].vertex, [0.0, y1]);
+        assert_eq!(payload.bg_vertices[3].vertex[1], y1);
+        for vertex in &payload.bg_vertices[0..4] {
+            assert_eq!(vertex.bg_color, expected_color);
+        }
+
+        // No vertex (row-clear quad or actual glyph/bg content) may lie
+        // outside row 1's pixel span - partial redraw must not touch rows
+        // it didn't mark dirty.
+        for vertex in &payload.bg_vertices {
+            assert!(vertex.vertex[1] >= y0 && vertex.vertex[1] <= y1);
+        }
+        for vertex in &payload.text_vertices {
+            assert!(vertex.vertex[1] >= y0 && vertex.vertex[1] <= y1);
+        }
+    }
+
+    #[test]
+    fn partial_take_row_clear_quad_respects_alpha_zero_initial_fill() {
+        let mut backend = TerminalBuilder::new(test_fonts())
+            .with_dimensions(1, 2)
+            .with_initial_fill([0, 0, 0, 0]) // transparent_reset_bg-style fill
+            .build();
+
+        let mut cell_top = Cell::default();
+        cell_top.set_symbol("A");
+        let mut cell_bottom = Cell::default();
+        cell_bottom.set_symbol("B");
+
+        RatatuiBackend::draw(
+            &mut backend,
+            [(0u16, 0u16, &cell_top), (0u16, 1u16, &cell_bottom)].into_iter(),
+        )
+        .expect("draw failed");
+        RatatuiBackend::flush(&mut backend).expect("flush failed");
+        let _ = backend.take_draw_payload();
+
+        let mut cell_bottom_changed = Cell::default();
+        cell_bottom_changed.set_symbol("Z");
+        RatatuiBackend::draw(&mut backend, [(0u16, 1u16, &cell_bottom_changed)].into_iter())
+            .expect("draw failed");
+        RatatuiBackend::flush(&mut backend).expect("flush failed");
+        let payload = backend.take_draw_payload();
+
+        assert!(!payload.is_full());
         assert_eq!(
-            sorted_bytes(&incremental_bg),
-            sorted_bytes(&backend.bg_vertices),
-            "bg vertices from an incremental (row-cached) flush must match a \
-             full reshape of the same content on the same atlas state"
+            payload.bg_vertices[0].bg_color & 0xFF,
+            0,
+            "the synthesized row-clear quad must carry initial_fill's alpha (0), \
+             matching what a LoadOp::Clear(initial_fill) would have produced"
         );
-        assert_eq!(
-            sorted_bytes(&incremental_text),
-            sorted_bytes(&backend.text_vertices),
-            "text vertices from an incremental (row-cached) flush must match a \
-             full reshape of the same content on the same atlas state"
-        );
+    }
+
+    #[test]
+    fn take_after_resize_is_full() {
+        let mut backend = TerminalBuilder::new(test_fonts())
+            .with_dimensions(1, 1)
+            .build();
+
+        let mut cell = Cell::default();
+        cell.set_symbol("a");
+        RatatuiBackend::draw(&mut backend, [(0u16, 0u16, &cell)].into_iter())
+            .expect("draw failed");
+        RatatuiBackend::flush(&mut backend).expect("flush failed");
+        let _ = backend.take_draw_payload();
+
+        backend.resize(2, 2);
+        RatatuiBackend::draw(&mut backend, [(0u16, 0u16, &cell)].into_iter())
+            .expect("draw failed");
+        RatatuiBackend::flush(&mut backend).expect("flush failed");
+        let payload = backend.take_draw_payload();
+
+        assert!(payload.is_full(), "the first take after a resize must be full");
+    }
+
+    #[test]
+    fn take_after_clear_is_full() {
+        let mut backend = TerminalBuilder::new(test_fonts())
+            .with_dimensions(1, 1)
+            .build();
+
+        let mut cell = Cell::default();
+        cell.set_symbol("a");
+        RatatuiBackend::draw(&mut backend, [(0u16, 0u16, &cell)].into_iter())
+            .expect("draw failed");
+        RatatuiBackend::flush(&mut backend).expect("flush failed");
+        let _ = backend.take_draw_payload();
+
+        RatatuiBackend::clear(&mut backend).expect("clear failed");
+        RatatuiBackend::draw(&mut backend, [(0u16, 0u16, &cell)].into_iter())
+            .expect("draw failed");
+        RatatuiBackend::flush(&mut backend).expect("flush failed");
+        let payload = backend.take_draw_payload();
+
+        assert!(payload.is_full(), "the first take after a clear must be full");
+    }
+
+    #[test]
+    fn all_rows_dirty_takes_full_path() {
+        fn cell_with_symbol(symbol: &str) -> Cell {
+            let mut cell = Cell::default();
+            cell.set_symbol(symbol);
+            cell
+        }
+
+        let mut backend = TerminalBuilder::new(test_fonts())
+            .with_dimensions(1, 2)
+            .build();
+
+        let row_a = cell_with_symbol("A");
+        let row_b = cell_with_symbol("B");
+        RatatuiBackend::draw(
+            &mut backend,
+            [(0u16, 0u16, &row_a), (0u16, 1u16, &row_b)].into_iter(),
+        )
+        .expect("draw failed");
+        RatatuiBackend::flush(&mut backend).expect("flush failed");
+        let _ = backend.take_draw_payload(); // consume the initial full take
+
+        // Change every row - `all_dirty` should route this back through the
+        // full path (cheaper than synthesizing a clear quad per row), even
+        // though `full_redraw_needed` is false at this point.
+        let row_a2 = cell_with_symbol("C");
+        let row_b2 = cell_with_symbol("D");
+        RatatuiBackend::draw(
+            &mut backend,
+            [(0u16, 0u16, &row_a2), (0u16, 1u16, &row_b2)].into_iter(),
+        )
+        .expect("draw failed");
+        RatatuiBackend::flush(&mut backend).expect("flush failed");
+        let payload = backend.take_draw_payload();
+
+        assert!(payload.is_full(), "every row dirty must take the full path");
     }
 }

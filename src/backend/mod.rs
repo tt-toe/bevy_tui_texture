@@ -391,14 +391,23 @@ pub(crate) struct TerminalDrawPayload {
     /// `cols * char_width_px` grid size.
     screen_width_px: f32,
     screen_height_px: f32,
-    /// Color to clear to when `text_vertices` is empty (nothing drawn yet,
-    /// or mid-resize) - see `BevyTerminalBackend::initial_fill`.
+    /// Color to clear to when both vertex `Vec`s are empty (nothing drawn
+    /// yet, or mid-resize) - see `BevyTerminalBackend::initial_fill`.
     clear_color: [u8; 4],
     /// Identity of the `Fonts` this terminal renders with (see
     /// [`crate::fonts::Fonts::identity`]) - the render world uses this to
     /// find the correct shared atlas/pipelines (`SharedFontGpuStore`,
     /// IMPROVEMENT.md C3) for this terminal's vertex data.
     font_key: usize,
+    /// Phase 2 partial redraw: `true` means this payload covers only the
+    /// rows `BevyTerminalBackend::take_draw_payload` found dirty (each
+    /// preceded by a synthesized row-clear quad), and the render pass must
+    /// use `LoadOp::Load` to preserve every other row's existing pixels.
+    /// `false` means this payload covers every row and the render pass
+    /// uses `LoadOp::Clear` - required whenever the destination texture's
+    /// current content can't be trusted (see
+    /// `BevyTerminalBackend::full_redraw_needed`).
+    load_previous: bool,
     bg_vertices: Vec<TextBgVertexMember>,
     text_vertices: Vec<TextVertexMember>,
 }
@@ -408,10 +417,13 @@ impl TerminalDrawPayload {
     /// the time) - used by `Tui::apply_pending_resize`, where the
     /// just-taken payload's geometry was computed at the OLD grid size and
     /// would render garbled against the freshly resized destination
-    /// texture.
+    /// texture. Also forces a full clear (`load_previous = false`): the
+    /// destination texture is about to be recreated at the new size, so
+    /// there is nothing valid for a `LoadOp::Load` to preserve.
     pub(crate) fn discard_stale_geometry(&mut self) {
         self.bg_vertices.clear();
         self.text_vertices.clear();
+        self.load_previous = false;
     }
 
     /// Identity of the `Fonts` this terminal renders with - used by
@@ -419,6 +431,15 @@ impl TerminalDrawPayload {
     /// [`SharedFontGpuState`] for this payload's vertex data.
     pub(crate) fn font_key(&self) -> usize {
         self.font_key
+    }
+
+    /// `true` iff this payload is a full redraw (`load_previous == false`).
+    /// A `pub(crate)` accessor for tests outside the `backend` module -
+    /// `load_previous` itself stays private since callers outside this
+    /// module otherwise never need to inspect payload internals.
+    #[cfg(test)]
+    pub(crate) fn is_full(&self) -> bool {
+        !self.load_previous
     }
 }
 
@@ -749,6 +770,12 @@ impl TerminalGpuState {
     /// `SharedFontGpuState::upload_glyphs` must be called once per font
     /// per frame before rendering any terminal sharing that font (see
     /// `render_tui_textures` in `bevy_plugin.rs`).
+    ///
+    /// Phase 2 partial redraw: `draw.load_previous` selects `LoadOp::Load`
+    /// (preserve every pixel not touched by this payload's quads - a
+    /// partial payload, whose dirty rows already carry a synthesized
+    /// full-row clear quad from `take_draw_payload`) or `LoadOp::Clear`
+    /// (wipe the whole texture first - a full payload).
     pub(crate) fn render(
         &mut self,
         device: &Device,
@@ -763,9 +790,10 @@ impl TerminalGpuState {
             RenderPassDescriptor, StoreOp,
         };
 
-        // Shared by both branches below (IMPROVEMENT.md B3) - previously
-        // the vertices-exist branch cleared to hardcoded black while only
-        // the empty branch cleared to `initial_fill`, so a terminal with a
+        // Only meaningful when `load_previous` is false (a `LoadOp::Load`
+        // pass ignores the clear color entirely) - previously the
+        // vertices-exist branch cleared to hardcoded black while only the
+        // empty branch cleared to `initial_fill`, so a terminal with a
         // non-black `initial_fill` flashed the wrong color on its very
         // first (content-free) frame. Also what `flush()`'s bg-quad
         // skipping compares against (`initial_fill_u32` there), so a
@@ -777,8 +805,24 @@ impl TerminalGpuState {
             b: b as f64 / 255.0,
             a: a as f64 / 255.0,
         };
+        let load = if draw.load_previous {
+            LoadOp::Load
+        } else {
+            LoadOp::Clear(clear_color)
+        };
 
-        if !draw.text_vertices.is_empty() {
+        // Branch on EITHER vertex `Vec`, not `text_vertices` alone: a
+        // partial payload can legitimately carry bg-only content (a row's
+        // text was deleted, leaving just its synthesized clear quad) -
+        // branching on `text_vertices` alone would fall into the
+        // clear-only branch below and, under `LoadOp::Clear`, wipe rows
+        // this payload never touched. (Both empty only happens for a
+        // partial payload with zero dirty rows, which the live pipeline
+        // never produces - `Tui::flush` only calls `take_draw_payload`
+        // when at least one row was marked dirty - but `load` still
+        // resolves that case correctly too: a `LoadOp::Load` pass with no
+        // draw calls is a no-op.)
+        if !draw.bg_vertices.is_empty() || !draw.text_vertices.is_empty() {
             queue.write_buffer(
                 &self.text_screen_size_buffer,
                 0,
@@ -829,7 +873,7 @@ impl TerminalGpuState {
                     view: target,
                     resolve_target: None,
                     ops: Operations {
-                        load: LoadOp::Clear(clear_color),
+                        load,
                         store: StoreOp::Store,
                     },
                     depth_slice: None,
@@ -861,7 +905,7 @@ impl TerminalGpuState {
                     view: target,
                     resolve_target: None,
                     ops: Operations {
-                        load: LoadOp::Clear(clear_color),
+                        load,
                         store: StoreOp::Store,
                     },
                     depth_slice: None,

@@ -418,6 +418,16 @@ through this same path - no per-material-type plugin registration needed.
   (byte-identical redraws are free), and re-shapes only the rows
   `dirty_rows` marks changed, reusing a per-row vertex cache
   (`RowGeometry`) otherwise
+- Partial redraw: `take_draw_payload` concatenates `row_geometry` into
+  either a full payload (every row, `LoadOp::Clear`) or a partial one
+  (only the rows dirty since the last take, each preceded by a synthesized
+  row-clear quad, `LoadOp::Load` to preserve every other row's existing
+  pixels) - a full payload is used whenever the destination texture's
+  content can't be trusted (`full_redraw_needed` - just created / resized /
+  cleared / fonts swapped, or a main-world pending-payload overwrite) or
+  every row happens to be dirty anyway. On a redraw touching only a few
+  rows, both the CPU-side vertex concatenation and the GPU-side upload/fill
+  scale with dirty rows instead of the whole grid
 - Glyph cache eviction uses LRU policy (via the `evictor` crate); the atlas
   itself is shared across every terminal using the same `Fonts` (see "GPU
   Texture Architecture" above), so a shared font's glyphs are rasterized

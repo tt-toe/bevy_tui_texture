@@ -412,6 +412,15 @@ impl Tui {
         payload.discard_stale_geometry();
         self.pending_draw = Some(payload);
 
+        // `backend.resize()` (above) already set `full_redraw_needed`, but
+        // the `take_draw_payload()` call just above consumed and cleared
+        // it while building the (now-discarded) payload. Re-arm it so the
+        // FIRST REAL DRAW after this resize also comes out full rather
+        // than partial - the destination texture was just recreated at the
+        // new size, so a `LoadOp::Load` partial has nothing valid to
+        // preserve yet.
+        backend.force_full_redraw();
+
         self.texture_state
             .terminal
             .resize(ratatui::layout::Rect::new(0, 0, cols, rows))
@@ -509,15 +518,22 @@ impl Tui {
     /// actual GPU render happens there, not here.
     pub(crate) fn flush(&mut self) {
         if self.dirty {
-            let draw = self.texture_state.terminal.backend_mut().take_draw_payload();
-            // Simply replaces any not-yet-extracted previous payload (the
-            // render world skipped a frame - it extracts every frame once
-            // running, but sits out the first few while the renderer
-            // initializes asynchronously). That older payload's vertex
-            // data was for an even earlier frame, equally stale; glyph
-            // rasterizations live in the shared per-font state (`Fonts`,
-            // IMPROVEMENT.md C3) rather than in this payload, so there is
-            // nothing one-shot left here to lose by dropping it.
+            let backend = self.texture_state.terminal.backend_mut();
+            if self.pending_draw.is_some() {
+                // About to replace a not-yet-extracted previous payload
+                // (the render world skipped a frame - it extracts every
+                // frame once running, but sits out the first few while the
+                // renderer initializes asynchronously). A Phase 2 partial
+                // payload only covers the rows dirty as of ITS take - if
+                // the new payload were also partial, the old payload's
+                // rows would simply be dropped, never rendered. Force a
+                // full payload instead, which safely supersedes anything
+                // (glyph rasterizations live in the shared per-font state,
+                // `Fonts`, IMPROVEMENT.md C3, rather than in this payload,
+                // so there is nothing font-side to lose here either way).
+                backend.force_full_redraw();
+            }
+            let draw = backend.take_draw_payload();
             self.pending_draw = Some(draw);
             self.dirty = false;
         }
@@ -1247,6 +1263,133 @@ mod tui_flush_tests {
         assert!(
             has_red_pixel,
             "rendered texture does not contain the drawn red background"
+        );
+    }
+
+    /// Phase 2 partial redraw, GPU-backed regression: draw two rows (red,
+    /// green), read back the fully-rendered texture, then redraw ONLY the
+    /// second row (green -> blue) and read back again. The first row's
+    /// pixels must be byte-identical across both readbacks (proving
+    /// `LoadOp::Load` actually preserved them - a `LoadOp::Clear` bug here
+    /// would wipe row 0 on the second render), and the second row must now
+    /// show blue instead of green. Same skip-if-no-GPU policy as
+    /// `flush_renders_drawn_content_synchronously`.
+    #[test]
+    fn flush_renders_partial_redraw_correctly() {
+        use crate::bevy_plugin::TuiReadbackChannel;
+        use crate::bevy_plugin::TerminalPlugin;
+        use bevy::render::renderer::RenderDevice;
+
+        let mut app = App::new();
+        app.add_plugins((
+            bevy::app::TaskPoolPlugin::default(),
+            bevy::asset::AssetPlugin::default(),
+            bevy::window::WindowPlugin {
+                primary_window: None,
+                exit_condition: bevy::window::ExitCondition::DontExit,
+                ..default()
+            },
+            bevy::mesh::MeshPlugin,
+            bevy::diagnostic::FrameCountPlugin,
+            bevy::time::TimePlugin,
+            bevy::render::RenderPlugin::default(),
+            bevy::image::ImagePlugin::default(),
+            TerminalPlugin::display_only(),
+        ));
+        app.init_resource::<bevy::camera::ClearColor>();
+        app.finish();
+        app.cleanup();
+
+        let mut ready = false;
+        for _ in 0..200 {
+            app.update();
+            if app.world().get_resource::<RenderDevice>().is_some() {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if !ready {
+            eprintln!("skipping: no GPU adapter available in this environment");
+            return;
+        }
+
+        let paint = |frame: &mut ratatui::Frame, row1_color: RatatuiColor| {
+            frame.render_widget(
+                Block::default().style(Style::default().bg(RatatuiColor::Red)),
+                ratatui::layout::Rect::new(0, 0, 4, 1),
+            );
+            frame.render_widget(
+                Block::default().style(Style::default().bg(row1_color)),
+                ratatui::layout::Rect::new(0, 1, 4, 1),
+            );
+        };
+
+        let entity = {
+            let mut images = app.world_mut().resource_mut::<Assets<Image>>();
+            let texture_state = TerminalTexture::create(4, 2, test_fonts(), false, false, [0, 0, 0, 255], &mut images)
+                .expect("failed to create terminal texture");
+            let mut tui = Tui::from_texture_state(texture_state);
+            tui.draw(|frame| paint(frame, RatatuiColor::Green));
+            app.world_mut().spawn(tui).id()
+        };
+
+        let width_px = app.world().get::<Tui>(entity).unwrap().size_px().x as usize;
+        let height_px = app.world().get::<Tui>(entity).unwrap().size_px().y as usize;
+        let row0_bytes_len = width_px * 4 * (height_px / 2);
+
+        let image_id = app
+            .world()
+            .get::<Tui>(entity)
+            .unwrap()
+            .image_handle()
+            .id();
+        let channel = app.world().resource::<TuiReadbackChannel>().clone();
+
+        let request_and_wait = |app: &mut App, channel: &TuiReadbackChannel| -> Vec<u8> {
+            let channel = channel.clone();
+            let readback = std::thread::spawn(move || channel.request_blocking(image_id));
+            for _ in 0..200 {
+                app.update();
+                if readback.is_finished() {
+                    return readback.join().expect("readback thread panicked");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!("readback never completed - render world stalled");
+        };
+
+        let pixels_before = request_and_wait(&mut app, &channel);
+
+        // Redraw with row 0 UNCHANGED (same widget, same style - ratatui's
+        // own diff must see zero changed cells there) and row 1 changed
+        // from green to blue.
+        app.world_mut()
+            .get_mut::<Tui>(entity)
+            .unwrap()
+            .draw(|frame| paint(frame, RatatuiColor::Blue));
+
+        let pixels_after = request_and_wait(&mut app, &channel);
+
+        assert_eq!(
+            pixels_before[..row0_bytes_len],
+            pixels_after[..row0_bytes_len],
+            "row 0's pixels must be untouched by a redraw that only changed row 1 - \
+             a LoadOp::Clear bug here would wipe them instead of preserving them"
+        );
+
+        // Named-color RGB values (colors.rs `named::GREEN`/`BLUE`) - bg
+        // quads are solid REPLACE-blended fills with no antialiasing, so
+        // an exact match is reliable away from glyph ink.
+        let row1_before = &pixels_before[row0_bytes_len..];
+        let row1_after = &pixels_after[row0_bytes_len..];
+        assert!(
+            row1_before.chunks_exact(4).any(|px| px[0..3] == [0, 128, 0]),
+            "row 1 must start out green"
+        );
+        assert!(
+            row1_after.chunks_exact(4).any(|px| px[0..3] == [0, 0, 255]),
+            "row 1 must show blue after being redrawn"
         );
     }
 }
