@@ -505,13 +505,12 @@ fn bounding_box_hit_test(
             node_size.y * comp.inverse_scale_factor,
             comp.inverse_scale_factor,
         )
-    } else if let Some(n) = node {
+    } else {
+        let n = node?;
         match (n.width, n.height) {
             (bevy::ui::Val::Px(w), bevy::ui::Val::Px(h)) => (w, h, 1.0),
             _ => return None, // Not in pixels
         }
-    } else {
-        return None; // No size info
     };
 
     // Coordinate system handling for Bevy UI:
