@@ -3,9 +3,11 @@
 
 use bevy::prelude::*;
 use bevy::render::render_asset::RenderAssets;
-use bevy::render::renderer::{render_system, RenderDevice, RenderQueue};
+use bevy::render::renderer::{
+    FlushCommands, RenderContext, RenderDevice, RenderGraph, RenderGraphSystems, RenderQueue,
+};
 use bevy::render::texture::GpuImage;
-use bevy::render::{ExtractSchedule, MainWorld, Render, RenderApp, RenderSystems};
+use bevy::render::{ExtractSchedule, MainWorld, RenderApp};
 use std::collections::HashMap;
 use tracing::debug;
 use wgpu;
@@ -206,6 +208,19 @@ impl Plugin for TerminalPlugin {
         // sub-app) in configurations without a rendering backend, e.g. some
         // headless test setups - silently skip registration there, matching
         // every other bevy render-world plugin's own convention.
+        //
+        // Registered on the `RenderGraph` schedule (bevy 0.19 has no
+        // node-based render graph - `RenderGraph` is a schedule, run once
+        // per frame from inside `render_system`, with chained sets
+        // `Begin -> Render -> Submit -> Finish`; bevy_core_pipeline's own
+        // camera passes run in `Render`, batched-submitted in `Submit`),
+        // rather than the plain `Render` schedule's `RenderSystems::Render`
+        // set: putting `render_tui_textures` in `RenderGraphSystems::Begin`
+        // structurally guarantees it records before this same frame's
+        // camera passes (`RenderGraphSystems::Render`), so a material
+        // samples this frame's terminal content, not the previous frame's -
+        // not by system-order-plus-submit-timing luck, but because `Begin`
+        // is chained strictly before `Render`.
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
             render_app
                 .init_resource::<PendingTuiDraws>()
@@ -217,17 +232,28 @@ impl Plugin for TerminalPlugin {
                 .insert_resource(TuiReadbackReceiver(std::sync::Mutex::new(readback_rx)))
                 .add_systems(ExtractSchedule, extract_tui_draws)
                 .add_systems(
-                    Render,
-                    (render_tui_textures, process_tui_readbacks)
-                        .chain()
-                        .in_set(RenderSystems::Render)
-                        // Ensures this frame's terminal-texture submit lands
-                        // before bevy's own main-pass submit (inside
-                        // `render_system`), so materials sample this
-                        // frame's content instead of the previous frame's -
-                        // otherwise wgpu's submit-order execution makes the
-                        // display lag one frame behind `Tui::draw()`.
-                        .before(render_system),
+                    RenderGraph,
+                    (
+                        render_tui_textures.in_set(RenderGraphSystems::Begin),
+                        // Safety net for app configurations without
+                        // `CorePipelinePlugin` (bevy_core_pipeline's own
+                        // `submit_pending_command_buffers`, which normally
+                        // does this) - e.g. the headless GPU test in
+                        // setup.rs, which builds its app from
+                        // `RenderPlugin` alone. With `CorePipelinePlugin`
+                        // present, whichever of the two flushes runs first
+                        // submits every pending command buffer in recording
+                        // order and the other is an empty no-op - never a
+                        // double submit, since both take
+                        // `ResMut<PendingCommandBuffers>` and so can't
+                        // interleave.
+                        flush_tui_commands.in_set(RenderGraphSystems::Submit),
+                        // `Finish` runs after `Submit` - by the time this
+                        // runs, this frame's (or a retried earlier frame's)
+                        // terminal render is already submitted, so the
+                        // blocking GPU->CPU copy reads real content.
+                        process_tui_readbacks.in_set(RenderGraphSystems::Finish),
+                    ),
                 );
         }
 
@@ -410,11 +436,11 @@ fn extract_tui_draws(
 
 /// Render-world system: renders every pending draw payload queued by
 /// [`extract_tui_draws`] directly into its destination `GpuImage`'s own
-/// texture, in [`RenderSystems::Render`] (after
-/// [`RenderSystems::PrepareAssets`], so newly created destination
-/// `GpuImage`s are already prepared). A destination not yet prepared (can
-/// happen on a terminal's very first frame) is left in the map and retried
-/// next frame - it is never dropped.
+/// texture, in [`RenderGraphSystems::Begin`] - structurally before this
+/// same frame's camera passes (`RenderGraphSystems::Render`), which is
+/// what gives terminal updates same-frame (not one-frame-lagged) display.
+/// A destination not yet prepared (can happen on a terminal's very first
+/// frame) is left in the map and retried next frame - it is never dropped.
 ///
 /// Eviction: [`TerminalGpuStore`] entries are retained only for destination
 /// images still present in `RenderAssets<GpuImage>` - once a `Tui`
@@ -423,10 +449,14 @@ fn extract_tui_draws(
 /// store's now-orphaned GPU state (atlas texture, pipelines) right along
 /// with it. No entity-level bookkeeping needed.
 ///
-/// Batches every terminal's draw into one `CommandEncoder` and submits it
-/// once at the end (IMPROVEMENT.md B3), instead of each terminal creating
-/// its own encoder and submitting separately. Skipped entirely on a frame
-/// with nothing pending, so a fully static scene still submits nothing.
+/// Records every terminal's draw into the shared [`RenderContext`] encoder
+/// (auto-flushed into `PendingCommandBuffers` at the end of this system,
+/// batch-submitted once alongside the rest of the frame's rendering in
+/// `RenderGraphSystems::Submit` - see [`flush_tui_commands`]) instead of
+/// creating and submitting its own `CommandEncoder` (IMPROVEMENT.md B3 - no
+/// longer a separate submit at all, now that submission itself is
+/// batched). Skipped entirely on a frame with nothing pending, so a fully
+/// static scene still touches no encoder and submits nothing extra.
 #[allow(clippy::too_many_arguments)]
 fn render_tui_textures(
     mut pending: ResMut<PendingTuiDraws>,
@@ -437,6 +467,7 @@ fn render_tui_textures(
     gpu_images: Res<RenderAssets<GpuImage>>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
+    mut render_context: RenderContext,
 ) {
     // A font with no live `Tui` left using it (its last terminal despawned)
     // has no destination image to key eviction off of the way
@@ -449,12 +480,7 @@ fn render_tui_textures(
         return;
     }
 
-    let mut encoder =
-        render_device
-            .wgpu_device()
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Terminal Draw Encoder (batched)"),
-            });
+    let encoder = render_context.command_encoder();
 
     pending.0.retain(|dest, draw| {
         let Some(gpu_image) = gpu_images.get(*dest) else {
@@ -480,17 +506,29 @@ fn render_tui_textures(
             render_device.wgpu_device(),
             render_queue.0.as_ref(),
             shared,
-            &mut encoder,
+            encoder,
             &gpu_image.texture_view,
             draw,
         );
         false // rendered - drop from the pending map
     });
 
-    render_queue.0.submit(Some(encoder.finish()));
-
     store.0.retain(|dest, _| gpu_images.get(*dest).is_some());
     font_uploads.0.clear();
+}
+
+/// Submits every command buffer [`render_tui_textures`] recorded via
+/// [`RenderContext`] this frame, exactly like bevy_core_pipeline's own
+/// `submit_pending_command_buffers` (which normally does this - both take
+/// `ResMut<PendingCommandBuffers>`, so whichever runs first submits
+/// everything pending in recording order and the other is an empty no-op,
+/// never a double submit). Registered as a safety net for app
+/// configurations without `CorePipelinePlugin` (e.g. the headless GPU test
+/// in setup.rs, which builds its app from `RenderPlugin` alone) - without
+/// it, `render_tui_textures`'s recorded commands would never reach the
+/// queue in such a configuration.
+fn flush_tui_commands(mut flush: FlushCommands) {
+    flush.flush();
 }
 
 // ============================================================================

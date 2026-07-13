@@ -276,12 +276,17 @@ touching anywhere).
    any material's bind group already references. No asset mutation, no
    material touching, for any material type.
 
-Same-frame latency: the draw payload extracted this frame is rendered before
-this same frame's main camera passes submit (`render_tui_textures` runs
-`.before(bevy::render::renderer::render_system)`), so a material samples
-this frame's content, not the previous frame's. There is no CPU readback
-anywhere in this path (see `Tui::read_back_blocking` for the explicit
-opt-in exception).
+Same-frame latency: `render_tui_textures` runs in the `RenderGraph`
+schedule's `RenderGraphSystems::Begin` set, chained strictly before
+`RenderGraphSystems::Render` (where bevy_core_pipeline's `camera_driver`
+runs the camera passes) and `RenderGraphSystems::Submit` (where every
+recorded command buffer, terminal and camera alike, is submitted together
+- see `flush_tui_commands`). So the draw payload extracted this frame is
+rendered and submitted before this same frame's camera passes, and a
+material samples this frame's content, not the previous frame's - a
+structural guarantee from the schedule's set ordering, not a system-order-
+plus-submit-timing coincidence. There is no CPU readback anywhere in this
+path (see `Tui::read_back_blocking` for the explicit opt-in exception).
 
 ## Key Implementation Patterns
 
@@ -387,7 +392,7 @@ through this same path - no per-material-type plugin registration needed.
 ## Common Gotchas
 
 1. **Terminal creation needs no `RenderDevice`/`RenderQueue`** - `TerminalTexture::create` is pure CPU (`cols, rows, fonts, programmatic_glyphs, &mut Assets<Image>`); the GPU pipelines are built lazily in the render world on first render
-2. **Same-frame GPU updates** - `gpu_flush_system` (main world) extracts a draw payload the same frame a terminal is dirty; the render world renders it before that same frame's main camera passes submit (`render_tui_textures` runs `.before(bevy::render::renderer::render_system)`), so there is no display lag behind `Tui::draw()`. There is no CPU readback anywhere in the hot path (see "Terminal Rendering: Render World Only, No Material Touch" above) - the only blocking readback is the explicit opt-in `Tui::read_back_blocking` (screenshots/tests, never call it every frame; goes through a request/response channel to the render world, so call it from a different thread than the one driving `App::update()` unless using `PipelinedRenderingPlugin`)
+2. **Same-frame GPU updates** - `gpu_flush_system` (main world) extracts a draw payload the same frame a terminal is dirty; the render world renders it in the `RenderGraph` schedule's `RenderGraphSystems::Begin` set, chained strictly before the camera passes (`RenderGraphSystems::Render`) and the frame's batched submit (`RenderGraphSystems::Submit`), so there is no display lag behind `Tui::draw()`. There is no CPU readback anywhere in the hot path (see "Terminal Rendering: Render World Only, No Material Touch" above) - the only blocking readback is the explicit opt-in `Tui::read_back_blocking` (screenshots/tests, never call it every frame; goes through a request/response channel to the render world, so call it from a different thread than the one driving `App::update()` unless using `PipelinedRenderingPlugin`)
 3. **Material updates need no touching at all** - not for `StandardMaterial`, not for custom materials. See "Terminal Rendering: Render World Only, No Material Touch" above
 4. **System ordering** - Always use `TerminalSystemSet` or rendering may occur before input
 5. **Font loading errors** - Verify font file exists and is valid TrueType format
@@ -434,8 +439,11 @@ through this same path - no per-material-type plugin registration needed.
   and uploaded once, not once per terminal
 - Per-terminal vertex/index GPU buffers are persistent and grow-only
   (`queue.write_buffer`d in place instead of recreated every dirty frame)
-- Every dirty terminal's draw is recorded into one shared `CommandEncoder`
-  and submitted once per frame, instead of one submit per terminal
+- Every dirty terminal's draw is recorded via the render world's shared
+  `RenderContext` encoder (`render_tui_textures`, `RenderGraphSystems::Begin`)
+  and rides the frame's single batched submit
+  (`RenderGraphSystems::Submit`) alongside the camera passes' own commands,
+  instead of creating and submitting a separate `CommandEncoder` per frame
 - Release builds use `lto = "fat"` and `codegen-units = 1` for maximum optimization
 
 ## Version Compatibility
