@@ -25,7 +25,7 @@ Thank you for your interest in contributing to bevy_tui_texture! This document p
 
 ### Prerequisites
 
-- Rust 1.95 or later (2024 edition)
+- Rust 1.96 or later (2024 edition)
 - A GPU with WGPU support
 - Basic familiarity with Bevy, ratatui, and WGPU
 
@@ -58,11 +58,15 @@ cargo run --example multiple_terminals
 
 # 3D examples
 cargo run --example widget_catalog_3d
-cargo run --example terminal_texture_3d
+cargo run --example shader_mesh
+cargo run --example retro_crt
 
 # Performance testing
-cargo run --example benchmark --release
+cargo run --release --example benchmark
+cargo run --release --example benchmark_partial
 ```
+
+See README.md's "Examples" section for the full list, one per feature area.
 
 ## Code Style
 
@@ -80,26 +84,24 @@ cargo run --example benchmark --release
 - Examples should be included for non-trivial functions
 - Update README.md if adding new features
 
-Example:
+Example (matching the actual style used in `src/setup.rs`):
 
 ```rust
-/// Creates a new terminal with the specified dimensions.
-///
-/// # Arguments
-///
-/// * `cols` - Number of columns (characters wide)
-/// * `rows` - Number of rows (characters tall)
-///
-/// # Returns
-///
-/// Returns `Ok(Terminal)` on success, or an error message on failure.
+/// Requests a resize to `cols` × `rows`. A no-op if the terminal is
+/// already that size. No GPU work at the call site - the destination
+/// `Image` is recreated in place, and the sibling `TerminalDimensions`
+/// component (and, for a `TuiKind::WorldQuad`, the mesh's aspect ratio)
+/// update automatically on the next `gpu_flush_system` pass.
 ///
 /// # Example
 ///
 /// ```no_run
-/// let terminal = create_terminal(80, 25)?;
+/// # use bevy_tui_texture::prelude::*;
+/// # fn resize(mut tui: bevy::prelude::Mut<Tui>) {
+/// tui.request_resize(80, 25);
+/// # }
 /// ```
-pub fn create_terminal(cols: u16, rows: u16) -> Result<Terminal> {
+pub fn request_resize(&mut self, cols: u16, rows: u16) {
     // ...
 }
 ```
@@ -110,40 +112,53 @@ pub fn create_terminal(cols: u16, rows: u16) -> Result<Terminal> {
 
 ```bash
 # Run all tests
-cargo test
+cargo test --all-features
 
-# Run specific test
-cargo test test_terminal_creation
+# Run one test by name (works across every #[cfg(test)] module)
+cargo test resize_to_the_current_size_is_a_no_op
+
+# Run every test in one module
+cargo test tui_flush_tests::
 
 # Run tests with logging
-RUST_LOG=debug cargo test
+RUST_LOG=debug cargo test --all-features
 ```
 
 ### Adding Tests
 
-- Add unit tests in the same file as the code being tested
-- Add integration tests in `tests/` directory
-- Test both success and error cases
-- Include edge cases and boundary conditions
+- There is **no dedicated `tests/` directory** - add unit tests as an
+  inline `#[cfg(test)] mod ...` next to the code they cover (see
+  `src/setup.rs`, `src/input/mod.rs`, `src/fonts.rs` for the existing
+  pattern - often several test submodules per file, one per concern)
+- Prefer testing pure-CPU logic directly (coordinate mapping, dirty
+  tracking, font fallback order, hit-region decoding, ...) - almost
+  everything in this crate can be tested with no GPU adapter at all
+- If a test genuinely needs a GPU (a `RenderDevice`/`RenderQueue`), make it
+  skip gracefully when no adapter is available rather than failing CI on
+  headless runners - see `flush_renders_drawn_content_synchronously` in
+  `src/setup.rs` for the pattern
+- Test both success and error cases, including edge cases and boundary
+  conditions
 
-Example:
+Example (matching the actual style used in `src/input/mod.rs`):
 
 ```rust
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod pixel_to_cell_tests {
+    use super::super::pixel_to_cell;
 
     #[test]
-    fn test_terminal_dimensions() {
-        let terminal = create_terminal(80, 25).unwrap();
-        assert_eq!(terminal.cols(), 80);
-        assert_eq!(terminal.rows(), 25);
+    fn origin_maps_to_first_cell() {
+        assert_eq!(pixel_to_cell(0.0, 0.0, 8.0, 16.0, 80, 24), (0, 0));
     }
 
     #[test]
-    fn test_invalid_dimensions() {
-        let result = create_terminal(0, 0);
-        assert!(result.is_err());
+    fn out_of_bounds_pixels_clamp_instead_of_wrapping_or_panicking() {
+        assert_eq!(
+            pixel_to_cell(-50.0, -50.0, 8.0, 16.0, 80, 24),
+            (0, 0),
+            "negative input must clamp to the first cell"
+        );
     }
 }
 ```
@@ -193,42 +208,54 @@ Why is this change needed? What problem does it solve?
 ```
 bevy_tui_texture/
 ├── src/
-│   ├── lib.rs              # Main library entry point
-│   ├── bevy_plugin.rs      # Bevy plugin and resources
-│   ├── setup.rs            # SimpleTerminal2D/3D utilities
-│   ├── fonts.rs            # Font loading and management
-│   ├── colors.rs           # Color conversion utilities
+│   ├── lib.rs              # Crate entry point, prelude, public re-exports
+│   ├── bevy_plugin.rs      # TerminalPlugin, TerminalSystemSet, render-world GPU dispatch
+│   ├── setup.rs            # Tui, TerminalTexture, TuiRequest, AttachTerminal - the spawn/draw API
+│   ├── fonts.rs            # Font loading, Fonts fallback slots, font identity
+│   ├── colors.rs           # ratatui <-> RGB color conversion
 │   ├── backend/
-│   │   ├── mod.rs          # Backend module entry
-│   │   ├── bevy_backend.rs # Main ratatui backend
-│   │   ├── rasterize.rs    # Glyph rasterization
-│   │   └── programmatic_glyphs/ # Box-drawing, braille, etc.
+│   │   ├── mod.rs          # Backend module entry, GPU pipelines, texture atlas plumbing
+│   │   ├── bevy_backend.rs # BevyTerminalBackend (the ratatui::backend::Backend impl)
+│   │   ├── rasterize.rs    # Glyph rasterization (rustybuzz + raqote)
+│   │   └── programmatic_glyphs/ # Box-drawing, braille, block elements, powerline
 │   ├── input/
-│   │   ├── mod.rs          # Input event handling
-│   │   └── ray.rs          # 3D mouse raycasting
+│   │   ├── mod.rs          # Input event handling, focus, hit-testing dispatch
+│   │   └── ray.rs          # 3D mouse raycasting (feature `3d`)
 │   └── utils/
-│       ├── text_atlas.rs   # GPU glyph cache
+│       ├── mod.rs          # Shared small utilities (outline geometry, ...)
+│       ├── text_atlas.rs   # GPU glyph cache (LRU-evicted)
 │       └── plan_cache.rs   # Text shaping cache
-├── examples/               # Example applications
-└── assets/                 # Fonts and resources
+└── examples/               # Example applications, one per feature area (see README.md)
+    ├── assets/             # Fonts, glTF model, shaders (shared by native + wasm)
+    └── web/                # WASM demo site (index.html, generated wasm/js)
 ```
 
 ## Performance Guidelines
 
 ### General Principles
 
-- Minimize GPU-CPU data transfers
-- Batch rendering operations when possible
-- Use dirty tracking to avoid unnecessary work
-- Cache frequently used data
+- `tui.draw(...)` is designed to be called every frame regardless of
+  whether content changed - a byte-identical redraw is a free no-op
+  (see CLAUDE.md's "Terminal Rendering" section), so don't build
+  change-detection around it yourself
+- Share one `Fonts` (`Arc<Fonts>`) across every terminal that uses the
+  same font - they then also share one glyph atlas and rasterize each
+  glyph only once, instead of paying for it per terminal
+- Avoid creating new fonts or textures in hot loops
+- Use `Arc` to share immutable data instead of cloning
 
 ### Profiling
 
-Use the benchmark example to test performance:
+Two benchmark examples target different workload shapes - see each
+one's module doc comment for details:
 
 ```bash
-# Run performance benchmark
-cargo run --example benchmark --release
+# Full-frame throughput (every cell redrawn every frame)
+cargo run --release --example benchmark
+
+# Isolates the cost of unchanged-frame / partial-row redraws
+BENCH_MODE=static cargo run --release --example benchmark_partial
+BENCH_MODE=partial cargo run --release --example benchmark_partial
 
 # Profile with perf (Linux)
 CARGO_PROFILE_RELEASE_DEBUG=true cargo build --release --example benchmark
@@ -236,32 +263,26 @@ perf record --call-graph dwarf ./target/release/examples/benchmark
 perf report
 ```
 
-### Common Performance Pitfalls
-
-- Don't call `terminal.draw()` every frame if content hasn't changed
-- Avoid creating new fonts or textures in hot loops
-- Use `Arc` to share immutable data instead of cloning
-- Prefer async GPU operations over blocking transfers
+Always compare `--release` numbers against `--release` numbers - debug
+builds are not representative and must not be compared across runs.
 
 ## Areas for Contribution
 
-### High Priority
+Known incomplete spots, from the `TODO`s currently in the code:
 
-- [ ] Performance optimizations for large terminals
+- [ ] `src/backend/programmatic_glyphs/box_drawing.rs` - remaining
+      box-drawing glyphs (U+250C-U+257F)
+- [ ] `src/backend/programmatic_glyphs/block_elements.rs` - proper dark
+      shade block pattern (currently an approximation)
+- [ ] `src/backend/bevy_backend.rs` - text extraction from the backend's
+      cell buffer (for accessibility / copy-paste support)
+
+Beyond those:
+
 - [ ] Additional examples demonstrating advanced features
-- [ ] Precise programmatic glyph sets
-
-### Medium Priority
-
 - [ ] Better error messages and debugging tools
 - [ ] Documentation improvements
-- [ ] CI/CD pipeline enhancements
-
-### Low Priority
-
 - [ ] Alternative font backends
-- [ ] Theme/color scheme presets
-- [ ] Animation utilities
 
 ## Questions or Issues?
 

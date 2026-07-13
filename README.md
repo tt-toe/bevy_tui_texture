@@ -4,7 +4,7 @@
 
 Seamlessly integrate terminal UIs into your Bevy applications. Display ratatui widgets on 2D sprites, 3D meshes, or UI elements with full GPU acceleration.
 
-https://github.com/user-attachments/assets/57c2fb98-04a6-4ecf-8c72-58808a9f499f
+https://github.com/user-attachments/assets/64e1e136-7d2d-4e32-9c10-1da2cfb78ccd
 
 ## Features
 
@@ -113,7 +113,8 @@ The `examples/` directory contains comprehensive demonstrations:
 - **`tui_component.rs`** - Manual entity spawning with `TerminalTexture` (no spawn helpers)
 - **`resize.rs`** - `Tui::request_resize` following the window size live
 - **`transparent_world_quad.rs`** - HUD-style see-through screen (`transparent_reset_bg` + `AlphaMode::Blend`)
-- **`benchmark.rs`** - Performance benchmarking and optimization
+- **`benchmark.rs`** - Full-frame rendering throughput (every cell redrawn each frame)
+- **`benchmark_partial.rs`** - `BENCH_MODE=static|partial` - isolates the cost of unchanged-frame and partial-row redraws
 
 ### WebAssembly
 
@@ -125,21 +126,21 @@ The `examples/` directory contains comprehensive demonstrations:
 cargo run --example helloworld
 cargo run --example widget_catalog_3d
 
-# For the WASM demo (browser-ready site in docs/ - see docs/README.md
-# for deploy + local preview instructions)
+# For the WASM demo (browser-ready site in examples/web/ - see
+# examples/web/README.md for deploy + local preview instructions)
 rustup target add wasm32-unknown-unknown
 cargo install wasm-bindgen-cli   # version must match Cargo.lock's wasm-bindgen
 
 cargo build --example wasm_demo --target wasm32-unknown-unknown --profile wasm-release
-wasm-bindgen --target web --no-typescript --out-dir docs \
+wasm-bindgen --target web --no-typescript --out-dir examples/web \
   target/wasm32-unknown-unknown/wasm-release/examples/wasm_demo.wasm
 
 # Shrink the binary (~31MB -> ~24MB) with wasm-opt (binaryen); see
-# docs/README.md's "Binary size" section for what each flag does and why.
+# examples/web/README.md's "Binary size" section for what each flag does and why.
 wasm-opt -Oz --strip-debug --strip-producers \
   --enable-nontrapping-float-to-int --enable-bulk-memory --enable-sign-ext \
   --enable-mutable-globals --enable-simd --enable-reference-types \
-  -o docs/wasm_demo_bg.wasm docs/wasm_demo_bg.wasm
+  -o examples/web/wasm_demo_bg.wasm examples/web/wasm_demo_bg.wasm
 ```
 
 ## Feature Flags
@@ -180,17 +181,17 @@ See `examples/benchmark.rs` for performance metrics.
 
 ## Requirements
 
-- Rust 1.95 or later (2024 edition)
+- Rust 1.96 or later (2024 edition)
 - Bevy 0.19
 - Ratatui 0.30
 - A GPU with WGPU support
 
 **MSRV policy**: the declared `rust-version` tracks whichever dependency
-needs the newest compiler - currently bevy 0.19 itself (`rust-version =
-"1.95.0"`), not anything this crate's own code requires (edition 2024's
-floor is 1.85; ratatui 0.30.2 declares 1.88.0). Bumping bevy/ratatui may
-raise this floor further; there's no separate "N versions behind latest
-stable" policy on top of that.
+needs the newest compiler - currently bevy 0.19 itself, not anything this
+crate's own code requires (edition 2024's floor is 1.85; ratatui 0.30.2
+declares 1.88.0). Bumping bevy/ratatui may raise this floor further;
+there's no separate "N versions behind latest stable" policy on top of
+that.
 
 | `bevy` | `ratatui` | `wgpu` | `bevy_tui_texture` |
 |--------|-----------|--------|--------------------|
@@ -203,11 +204,12 @@ comment above the `wgpu` dependency in `Cargo.toml`) - bump together.
 
 ## Font Licensing
 
-The example/test fonts under `assets/fonts/` are SIL OFL 1.1-licensed, not
-MIT (this crate's own `license = "MIT"` covers the Rust code only):
-`Mplus1Code-Regular.ttf` (`assets/fonts/LICENSE/mplus1code.txt`) and
-`fusion-pixel-10px-monospaced-ja.ttf` (`assets/fonts/OFL.txt` +
-`assets/fonts/LICENSE/*.txt` for its bundled source fonts).
+The example/test fonts under `examples/assets/fonts/` are SIL OFL
+1.1-licensed, not MIT (this crate's own `license = "MIT"` covers the Rust
+code only): `Mplus1Code-Regular.ttf`
+(`examples/assets/fonts/LICENSE/mplus1code.txt`) and
+`fusion-pixel-10px-monospaced-ja.ttf` (`examples/assets/fonts/OFL.txt` +
+`examples/assets/fonts/LICENSE/*.txt` for its bundled source fonts).
 
 ## Platform Support
 

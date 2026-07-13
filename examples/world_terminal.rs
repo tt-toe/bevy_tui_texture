@@ -28,13 +28,22 @@ const SCREEN_POS: Vec3 = Vec3::new(0.0, 2.4, -1.5);
 
 fn main() {
     App::new()
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "TuiRequest::world_quad — in-game screen".to_string(),
-                ..default()
-            }),
-            ..default()
-        }))
+        .add_plugins(
+            DefaultPlugins
+                .set(WindowPlugin {
+                    primary_window: Some(Window {
+                        title: "TuiRequest::world_quad — in-game screen".to_string(),
+                        ..default()
+                    }),
+                    ..default()
+                })
+                // assets/ lives at examples/assets/, not the crate-root
+                // default `assets/` bevy's AssetPlugin assumes.
+                .set(AssetPlugin {
+                    file_path: "examples/assets".into(),
+                    ..default()
+                }),
+        )
         .add_plugins(TerminalPlugin::default())
         .init_resource::<Clicks>()
         .add_systems(Startup, setup)

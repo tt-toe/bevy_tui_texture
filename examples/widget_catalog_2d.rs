@@ -104,7 +104,7 @@ fn setup_terminal(mut commands: Commands) {
 
     let font_data = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/assets/fonts/Mplus1Code-Regular.ttf"
+        "/examples/assets/fonts/Mplus1Code-Regular.ttf"
     ));
     let font = TerminalFont::new(font_data).expect("Failed to load font");
     let mut fonts = Fonts::new(font.clone(), 16);

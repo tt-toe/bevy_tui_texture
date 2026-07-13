@@ -33,9 +33,12 @@ downstream code can name matching types without pinning its own copies).
 - User systems never need `RenderDevice`, `RenderQueue`, `Assets<Image>`,
   `Assets<Mesh>`, or `Assets<StandardMaterial>` — not at spawn time, not
   per frame.
-- Per-terminal GPU state (glyph atlas, pipelines) is created lazily on
-  first render and evicted automatically when the `Tui`'s last
-  `Handle<Image>` drops. No manual cleanup.
+- Per-terminal GPU state (vertex/index buffers, screen-size uniform) is
+  created lazily on first render and evicted automatically when the
+  `Tui`'s last `Handle<Image>` drops. The glyph atlas + compositor
+  pipelines are shared across every terminal using the same `Fonts`
+  (keyed by font identity, not by terminal) and evicted once no live
+  `Tui` uses that font anymore. No manual cleanup either way.
 
 ## Choosing a spawn API (top of the ladder first)
 
@@ -74,7 +77,7 @@ Spawn (no render resources in the signature — this is the whole point):
 ```rust
 fn setup(mut commands: Commands) {
     let fonts = Arc::new(Fonts::new(
-        Font::new(include_bytes!("../assets/fonts/Mplus1Code-Regular.ttf")).unwrap(),
+        Font::new(include_bytes!("assets/fonts/Mplus1Code-Regular.ttf")).unwrap(),
         16, // cell height in px
     ));
     commands.spawn((TuiRequest::ui(80, 25, fonts), Node::default(), MyTerminal));
@@ -201,10 +204,11 @@ failed id decode returns `None`, it does not fall through).
 
 ## GPU facts worth knowing
 
-- Glyph atlas: 2048×2048 RGBA8 per terminal, LRU-evicted; capacity is
-  logged at INFO on creation ("Glyph atlas: 2048x2048px in use, entries
-  WxHpx, capacity N"). Entry slots are `2·min_width_px × height_px`, so
-  capacity scales with font size.
+- Glyph atlas: 2048×2048 RGBA8, LRU-evicted; capacity is logged at INFO on
+  creation ("Glyph atlas: 2048x2048px in use, entries WxHpx, capacity N").
+  Entry slots are `2·min_width_px × height_px`, so capacity scales with
+  font size. Shared across every terminal using the same `Fonts` — sharing
+  a font across terminals rasterizes and uploads each glyph only once.
 - Atlas textures are explicitly zero-initialized at creation — no WebGL
   "lazy initialization" warnings from partial glyph uploads.
 - All terminal textures are `Rgba8Unorm`; the render is a two-pass
@@ -250,7 +254,7 @@ failed id decode returns `None`, it does not fall through).
 ## Verification (what CI runs — .github/workflows/ci.yml)
 
 ```bash
-cargo test --all-features                       # 58 tests, GPU-free except 1 skip-capable
+cargo test --all-features                       # 60 tests, GPU-free except 1 skip-capable
 cargo clippy --all-features --all-targets -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 cargo check --lib --no-default-features         # + --features 2d / 3d variants
@@ -258,13 +262,16 @@ cargo run --example helloworld                  # ALWAYS cargo run, never the ba
                                                 # binary (assets resolve via CARGO_MANIFEST_DIR)
 ```
 
-WASM build pipeline (browser demo → `docs/`): see the header of
+WASM build pipeline (browser demo → `examples/web/`): see the header of
 `examples/wasm_demo.rs` (cargo build --profile wasm-release →
-wasm-bindgen → wasm-opt; bump `ASSET_VERSION` in `docs/index.html` on
-every redeploy — the JS glue and wasm are a matched pair and stale
-browser caches mixing versions fail with `LinkError`).
+wasm-bindgen → wasm-opt; bump `ASSET_VERSION` in `examples/web/index.html`
+on every redeploy — the JS glue and wasm are a matched pair and stale
+browser caches mixing versions fail with `LinkError`). Assets (models,
+shaders, fonts) live in `examples/assets/`, shared by native and wasm —
+`examples/web/index.html` fetches them from the sibling `../assets/` at
+runtime, so local preview must serve from `examples/` (not
+`examples/web/` itself), see `examples/web/README.md`.
 
-Deeper reference: `CLAUDE.md` (architecture, hard-won gotchas),
-`examples/` (one per feature — `resize.rs`, `transparent_world_quad.rs`,
+Deeper reference: `examples/` (one per feature — `resize.rs`, `transparent_world_quad.rs`,
 `world_terminal.rs` for async fonts, `retro_crt.rs` for glTF attach,
 `wasm_demo.rs` for the browser shim).

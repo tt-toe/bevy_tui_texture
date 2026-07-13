@@ -399,22 +399,17 @@ impl Tui {
         backend.resize(cols, rows);
 
         // Drain whatever the backend currently holds (vertex geometry from
-        // the last draw at the OLD grid size, plus any glyph-atlas
-        // uploads) - rendering that geometry against the freshly resized
-        // texture would show garbled, wrongly-scaled content for one
-        // frame, so it's discarded. The glyph uploads are NOT discarded:
-        // they remain valid pixel data regardless of grid size, and the
-        // CPU-side `Atlas` LRU already considers those slots cached -
-        // dropping the actual upload would leave the corresponding
-        // characters permanently invisible (the exact bug this mirrors:
-        // see `TerminalDrawPayload::merge_undelivered`). Any previously
+        // the last draw at the OLD grid size) - rendering that geometry
+        // against the freshly resized texture would show garbled,
+        // wrongly-scaled content for one frame, so it's discarded. Glyph
+        // rasterizations queue in the shared per-font state (`Fonts`,
+        // IMPROVEMENT.md C3), not in this payload, so there is nothing
+        // grid-size-dependent left to preserve there. Any previously
         // unflushed payload (`self.pending_draw`, not yet drained by
-        // `extract_tui_draws`) gets the same treatment, folded in here.
+        // `extract_tui_draws`) is simply replaced - its vertex data was
+        // for an even older frame, equally stale.
         let mut payload = backend.take_draw_payload();
         payload.discard_stale_geometry();
-        if let Some(previously_pending) = self.pending_draw.take() {
-            payload.merge_undelivered(previously_pending);
-        }
         self.pending_draw = Some(payload);
 
         self.texture_state
@@ -514,15 +509,15 @@ impl Tui {
     /// actual GPU render happens there, not here.
     pub(crate) fn flush(&mut self) {
         if self.dirty {
-            let mut draw = self.texture_state.terminal.backend_mut().take_draw_payload();
-            // The previous payload not having been extracted yet means the
-            // render world skipped a frame (it extracts every frame once
+            let draw = self.texture_state.terminal.backend_mut().take_draw_payload();
+            // Simply replaces any not-yet-extracted previous payload (the
+            // render world skipped a frame - it extracts every frame once
             // running, but sits out the first few while the renderer
-            // initializes asynchronously). Its atlas uploads are one-shot -
-            // carry them forward or those glyphs render as garbage forever.
-            if let Some(undelivered) = self.pending_draw.take() {
-                draw.merge_undelivered(undelivered);
-            }
+            // initializes asynchronously). That older payload's vertex
+            // data was for an even earlier frame, equally stale; glyph
+            // rasterizations live in the shared per-font state (`Fonts`,
+            // IMPROVEMENT.md C3) rather than in this payload, so there is
+            // nothing one-shot left here to lose by dropping it.
             self.pending_draw = Some(draw);
             self.dirty = false;
         }
@@ -538,6 +533,20 @@ impl Tui {
         self.pending_draw
             .take()
             .map(|draw| (self.texture_state.image_handle.id(), draw))
+    }
+
+    /// Returns this terminal's font identity key, alongside any glyph
+    /// rasterizations still pending upload to that font's shared atlas
+    /// (IMPROVEMENT.md C3). The upload list is frequently empty: whichever
+    /// terminal sharing a given font is visited first in a frame drains it
+    /// for all of them (see `Fonts::with_shared_cpu_state`). Called once
+    /// per `Tui` per frame by the render-world extract system
+    /// (`extract_tui_draws` in `bevy_plugin.rs`).
+    pub(crate) fn take_shared_font_uploads(
+        &self,
+    ) -> (usize, Vec<(crate::utils::text_atlas::CacheRect, Vec<u32>)>) {
+        let backend = self.texture_state.terminal.backend();
+        (backend.font_key(), backend.take_shared_glyph_uploads())
     }
 }
 
@@ -1075,7 +1084,7 @@ mod tui_flush_tests {
     use ratatui::widgets::Block;
 
     fn test_fonts() -> Arc<Fonts> {
-        let font_data = include_bytes!("../assets/fonts/Mplus1Code-Regular.ttf");
+        let font_data = include_bytes!("../examples/assets/fonts/Mplus1Code-Regular.ttf");
         let font = Font::new(font_data).expect("failed to load test font");
         Arc::new(Fonts::new(font, 16))
     }
@@ -1258,7 +1267,13 @@ mod tui_request_tests {
         let mut app = App::new();
         app.add_plugins((
             bevy::app::TaskPoolPlugin::default(),
-            bevy::asset::AssetPlugin::default(),
+            // Test fixture fonts live in examples/assets/ (shared with the
+            // examples, see examples/retro_crt.rs's `build_app`), not the
+            // AssetPlugin default `assets/` relative to the crate root.
+            bevy::asset::AssetPlugin {
+                file_path: "examples/assets".into(),
+                ..default()
+            },
             // Headless: registers the window message types
             // `window_resize_system` reads, without an OS window.
             bevy::window::WindowPlugin {
@@ -1343,7 +1358,7 @@ mod attach_churn_tests {
         world.init_resource::<Assets<Image>>();
         world.init_resource::<Assets<StandardMaterial>>();
 
-        let font_data = include_bytes!("../assets/fonts/Mplus1Code-Regular.ttf");
+        let font_data = include_bytes!("../examples/assets/fonts/Mplus1Code-Regular.ttf");
         let font = Font::new(font_data).expect("failed to load test font");
         let fonts = Arc::new(Fonts::new(font, 16));
         let texture = {
@@ -1417,7 +1432,7 @@ mod resize_tests {
     use crate::fonts::{Font, Fonts};
 
     fn test_fonts() -> Arc<Fonts> {
-        let font_data = include_bytes!("../assets/fonts/Mplus1Code-Regular.ttf");
+        let font_data = include_bytes!("../examples/assets/fonts/Mplus1Code-Regular.ttf");
         let font = Font::new(font_data).expect("failed to load test font");
         Arc::new(Fonts::new(font, 16))
     }

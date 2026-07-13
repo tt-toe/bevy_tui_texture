@@ -113,7 +113,7 @@ fn setup_terminals(mut commands: Commands) {
     // Load font (shared across all terminals)
     let font_data = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/assets/fonts/fusion-pixel-10px-monospaced-ja.ttf"
+        "/examples/assets/fonts/fusion-pixel-10px-monospaced-ja.ttf"
     ));
     let font = TerminalFont::new(font_data).expect("Failed to load font");
     let fonts = Arc::new(Fonts::new(font, 16));

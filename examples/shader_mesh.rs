@@ -29,14 +29,23 @@ use bevy_tui_texture::Font as TerminalFont;
 
 fn main() {
     App::new()
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "ExtendedMaterial CRT Effect with Mesh3d".to_string(),
-                resolution: WindowResolution::new(1024, 768),
-                ..default()
-            }),
-            ..default()
-        }))
+        .add_plugins(
+            DefaultPlugins
+                .set(WindowPlugin {
+                    primary_window: Some(Window {
+                        title: "ExtendedMaterial CRT Effect with Mesh3d".to_string(),
+                        resolution: WindowResolution::new(1024, 768),
+                        ..default()
+                    }),
+                    ..default()
+                })
+                // assets/ lives at examples/assets/, not the crate-root
+                // default `assets/` bevy's AssetPlugin assumes.
+                .set(AssetPlugin {
+                    file_path: "examples/assets".into(),
+                    ..default()
+                }),
+        )
         .add_plugins(MaterialPlugin::<CrtMaterial>::default())
         .add_plugins(TerminalPlugin::default())
         .add_systems(Startup, setup)
@@ -98,7 +107,7 @@ fn setup(
     // Load font
     let font_data = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/assets/fonts/fusion-pixel-10px-monospaced-ja.ttf"
+        "/examples/assets/fonts/fusion-pixel-10px-monospaced-ja.ttf"
     ));
     let font = TerminalFont::new(font_data).expect("Failed to load font");
     let fonts = Arc::new(Fonts::new(font, 16));

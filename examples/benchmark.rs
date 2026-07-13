@@ -54,7 +54,7 @@ struct BenchmarkState {
 fn setup(mut commands: Commands) {
     let font_data = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/assets/fonts/Mplus1Code-Regular.ttf"
+        "/examples/assets/fonts/Mplus1Code-Regular.ttf"
     ));
     let font = TerminalFont::new(font_data).expect("Failed to load font");
     let fonts = Arc::new(Fonts::new(font, 16));

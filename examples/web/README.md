@@ -4,13 +4,16 @@ Browser-ready build of `examples/wasm_demo.rs` - a thin wasm-bindgen shim
 around `examples/retro_crt.rs`'s scene (glTF model + `ExtendedMaterial` CRT
 shader + additive reflection + overlay UI + camera modes, running on
 WebGL2). `wasm_demo.rs` includes `retro_crt.rs` as a module and calls its
-`main()` rather than duplicating the source - the wasm-only bits (canvas
-config, tonemapping without LUTs, OIT skipped) live inline in
+`build_app()` rather than duplicating the source - the wasm-only bits
+(canvas config, tonemapping without LUTs, OIT skipped) live inline in
 `retro_crt.rs` behind `#[cfg(target_arch = "wasm32")]`.
 
-Deploy: copy this directory's **contents** to the root of a
-`*.github.io` repository (or enable GitHub Pages with "deploy from
-branch", folder `/docs`, on this repository). 
+**This directory is not self-contained** - the demo fetches its runtime
+assets (glTF model, WGSL shaders) from `../assets/` at runtime, i.e. it
+expects to be served alongside its sibling `examples/assets/` directory
+with the same relative layout: `examples/{web,assets}/`. See "Deploy"
+below for what that means when publishing to a host that doesn't preserve
+the repo layout as-is.
 
 ## Contents
 
@@ -19,26 +22,47 @@ branch", folder `/docs`, on this repository).
 | `index.html` | loader page (`<canvas id="bevy">` + module script) |
 | `wasm_demo.js` | wasm-bindgen JS glue (generated) |
 | `wasm_demo_bg.wasm` | the compiled demo (generated) |
-| `assets/models/retro_crt.glb` | CRT computer model (fetched at runtime) |
-| `assets/shaders/*.wgsl` | CRT / reflection shaders (fetched at runtime) |
+| `../assets/models/retro_crt.glb` | CRT computer model (fetched at runtime, sibling dir) |
+| `../assets/shaders/*.wgsl` | CRT / reflection shaders (fetched at runtime, sibling dir) |
+
+`index.html` and this README are hand-maintained; only `wasm_demo.js` /
+`wasm_demo_bg.wasm` are build outputs.
 
 ## Local preview
 
 WASM must be served over HTTP — opening `index.html` via `file://` fails
-(module scripts and `fetch()` of the `.wasm`/assets are blocked). From
-this directory, any static file server works:
+(module scripts and `fetch()` of the `.wasm`/assets are blocked). Because
+the demo fetches assets from the sibling `../assets/` directory, the
+server must be rooted at **`examples/`**, not this directory itself -
+rooting it here would put `assets/` outside what the server can serve at
+all:
 
 ```bash
-# Python (preinstalled almost everywhere)
+# From the repository root:
+cd examples
 python3 -m http.server 8080
-# then open http://127.0.0.1:8080/
+# then open http://127.0.0.1:8080/web/
 ```
 
-Alternatives: `npx serve .`, `caddy file-server --listen :8080`, or any
-equivalent. No special headers are required (no SharedArrayBuffer/COOP/
-COEP needed). First load fetches the `.wasm` (still ~24MB even optimized -
-be patient) plus the `.glb` model — watch the browser devtools
-Network/Console tabs if the canvas stays black.
+Alternatives: `npx serve .`, `caddy file-server --listen :8080` (run from
+`examples/`), or any equivalent static server. No special headers are
+required (no SharedArrayBuffer/COOP/COEP needed). First load fetches the
+`.wasm` (still ~24MB even optimized - be patient) plus the `.glb` model —
+watch the browser devtools Network/Console tabs if the canvas stays black
+(a 404 on `../assets/...` usually means the server wasn't rooted at
+`examples/`).
+
+## Deploy
+
+Upload BOTH `examples/web/` and `examples/assets/` to your host, preserving
+their sibling relationship (`<upload-root>/web/` + `<upload-root>/assets/`),
+and point visitors at `<upload-root>/web/`. Where `<upload-root>` lives is
+up to you — e.g. rename/copy `examples/` itself to the root of a
+`*.github.io` repo, or configure your host's document root at `examples/`.
+If your host can only serve a single directory and can't preserve this
+sibling layout, mirror both directories into a fresh directory of your
+own (e.g. `rsync -a examples/{web,assets} deploy/`) before uploading -
+just keep `web/` and `assets/` as siblings in whatever you upload.
 
 ## Rebuilding the generated files
 
@@ -49,7 +73,7 @@ size-reduction pass):
 
 ```bash
 cargo build --example wasm_demo --target wasm32-unknown-unknown --profile wasm-release
-wasm-bindgen --target web --no-typescript --out-dir docs \
+wasm-bindgen --target web --no-typescript --out-dir examples/web \
   target/wasm32-unknown-unknown/wasm-release/examples/wasm_demo.wasm
 
 # Shrink the binary in place (~31MB cargo output -> ~24MB). The
@@ -60,27 +84,24 @@ wasm-bindgen --target web --no-typescript --out-dir docs \
 wasm-opt -Oz --strip-debug --strip-producers \
   --enable-nontrapping-float-to-int --enable-bulk-memory --enable-sign-ext \
   --enable-mutable-globals --enable-simd --enable-reference-types \
-  -o docs/wasm_demo_bg.wasm docs/wasm_demo_bg.wasm
-
-# if the demo's runtime assets changed, re-copy them too:
-cp assets/models/retro_crt.glb docs/assets/models/
-cp assets/shaders/crt_extended.wgsl assets/shaders/unlit_blur.wgsl docs/assets/shaders/
+  -o examples/web/wasm_demo_bg.wasm examples/web/wasm_demo_bg.wasm
 ```
+
+No asset-copying step is needed anymore - `examples/assets/` is fetched
+directly at runtime from its sibling location, the same directory native
+builds read from (see `examples/retro_crt.rs`'s `build_app` doc comment).
 
 **After regenerating, bump `ASSET_VERSION` in `index.html`** (a `const` near
 the top of its `<script type="module">`) to any new value (e.g. today's
 date). `wasm_demo.js` and `wasm_demo_bg.wasm` are a matched pair from the
-same build; GitHub Pages sends `cache-control: max-age=600`, so a browser
-that visits again within that window while only one of the two files has
-changed can end up pairing a cached copy of one with a fresh copy of the
-other - `WebAssembly.instantiate` then fails with a `LinkError: function
-import requires a callable` (the mismatched JS glue and wasm binary
-disagree on import names). `index.html` fetches both through
-`?v=${ASSET_VERSION}`, so bumping it forces a re-fetch of both files
-together instead of silently mixing an old and a new one.
-
-`index.html` and this README are hand-maintained; only `wasm_demo.js` /
- `wasm_demo_bg.wasm` (and the copied assets) are build outputs.
+same build; a host that caches aggressively (GitHub Pages sends
+`cache-control: max-age=600`) could otherwise pair a cached copy of one
+with a fresh copy of the other on a revisit within that window -
+`WebAssembly.instantiate` then fails with a `LinkError: function import
+requires a callable` (the mismatched JS glue and wasm binary disagree on
+import names). `index.html` fetches both through `?v=${ASSET_VERSION}`, so
+bumping it forces a re-fetch of both files together instead of silently
+mixing an old and a new one.
 
 ### Binary size
 
@@ -121,7 +142,11 @@ already done to keep it as small as practical:
 The `.wasm` is tens of MB even after `wasm-opt`, so `index.html` shows a
 real progress bar (bytes downloaded vs. `Content-Length`, or an
 indeterminate sliding stripe if the server doesn't send one) instead of a
-static label that looks stuck partway through the load.
+static label that looks stuck partway through the load, and keeps a
+staged status message up (see `report_wasm_boot_status` in
+`examples/wasm_demo.rs`) through renderer init, asset loading, and shader
+compilation - the canvas stays black through all of that, so the overlay
+is the only feedback the page can give.
 
 ## Known WebGL2 differences vs. native
 

@@ -16,7 +16,7 @@
 //! use std::sync::Arc;
 //!
 //! // Load font from embedded bytes
-//! let font_data = include_bytes!("../assets/fonts/Mplus1Code-Regular.ttf");
+//! let font_data = include_bytes!("../examples/assets/fonts/Mplus1Code-Regular.ttf");
 //! let font = Font::new(font_data).expect("Failed to load font");
 //!
 //! // Create font collection with 16px height
@@ -42,6 +42,7 @@ use std::hash::BuildHasher;
 use std::hash::Hasher;
 use std::hash::RandomState;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use bevy::asset::io::Reader;
 use bevy::asset::{Asset, AssetLoader, LoadContext};
@@ -63,11 +64,11 @@ use rustybuzz::Face;
 /// use bevy_tui_texture::Font;
 ///
 /// // Embedded font data
-/// let font_data = include_bytes!("../assets/fonts/Mplus1Code-Regular.ttf");
+/// let font_data = include_bytes!("../examples/assets/fonts/Mplus1Code-Regular.ttf");
 /// let font = Font::new(font_data).expect("Failed to load font");
 ///
 /// // Runtime-loaded font data (no leaking required)
-/// let bytes = std::fs::read("assets/fonts/Mplus1Code-Regular.ttf").unwrap();
+/// let bytes = std::fs::read("examples/assets/fonts/Mplus1Code-Regular.ttf").unwrap();
 /// let font = Font::from_vec(bytes).expect("Failed to load font");
 /// ```
 #[derive(Clone)]
@@ -177,6 +178,36 @@ impl AssetLoader for TerminalFontAssetLoader {
     }
 }
 
+/// Shared CPU-side glyph cache state: the `Atlas` LRU slot allocator, the
+/// rustybuzz `PlanCache`, and queued-but-not-yet-uploaded glyph
+/// rasterizations. Owned by `Fonts` (behind a lazily-initialized `Mutex`,
+/// see [`Fonts::with_shared_cpu_state`]) rather than by each terminal's
+/// `BevyTerminalBackend`, so every terminal sharing the same `Arc<Fonts>`
+/// rasterizes and uploads each glyph exactly once instead of once per
+/// terminal (IMPROVEMENT.md C3). Living inside `Fonts` - reachable from
+/// `self.fonts` alone - rather than an external resource is what lets
+/// `BevyTerminalBackend`'s `ratatui::backend::Backend::flush` implementation
+/// reach it: that trait method's signature (`fn flush(&mut self)`) is fixed
+/// by ratatui and cannot take an extra Bevy system parameter, and shaping
+/// happens there - inside user-called `Tui::draw()` - not inside a
+/// library-owned system.
+pub(crate) struct SharedFontCpuState {
+    pub(crate) cached: crate::utils::text_atlas::Atlas,
+    pub(crate) plan_cache: crate::utils::plan_cache::PlanCache,
+    pub(crate) pending_cache_updates: Vec<(crate::utils::text_atlas::CacheRect, Vec<u32>)>,
+}
+
+impl SharedFontCpuState {
+    fn new(fonts: &Fonts) -> Self {
+        use crate::backend::{CACHE_HEIGHT, CACHE_WIDTH};
+        Self {
+            cached: crate::utils::text_atlas::Atlas::new(fonts, CACHE_WIDTH, CACHE_HEIGHT),
+            plan_cache: crate::utils::plan_cache::PlanCache::new(fonts.count().max(2)),
+            pending_cache_updates: Vec::new(),
+        }
+    }
+}
+
 /// A collection of fonts to use for rendering. Supports font fallback.
 pub struct Fonts {
     char_width: u32,
@@ -188,6 +219,11 @@ pub struct Fonts {
     bold: Vec<Font>,
     italic: Vec<Font>,
     bold_italic: Vec<Font>,
+
+    /// See [`SharedFontCpuState`]. `None` until first use -
+    /// `SharedFontCpuState::new` needs `&Fonts`, which doesn't exist yet
+    /// mid-construction in `Fonts::new`.
+    shared_cpu_state: Mutex<Option<SharedFontCpuState>>,
 }
 
 impl Fonts {
@@ -207,7 +243,35 @@ impl Fonts {
             bold: vec![],
             italic: vec![],
             bold_italic: vec![],
+            shared_cpu_state: Mutex::new(None),
         }
+    }
+
+    /// Stable identity for this `Fonts` instance - used to key the
+    /// render-world's per-font shared GPU atlas store (IMPROVEMENT.md C3).
+    /// Two terminals share GPU (and, via [`Fonts::with_shared_cpu_state`],
+    /// CPU) glyph-cache state exactly when they hold the same `Arc<Fonts>`
+    /// (this returns the same value for any two `&Fonts` borrowed from
+    /// clones of the same `Arc`, since they deref to the same address).
+    pub(crate) fn identity(&self) -> usize {
+        self as *const Self as usize
+    }
+
+    /// Runs `f` against this `Fonts`' shared CPU-side glyph cache state,
+    /// creating it on first use. Locks for the duration of `f` - callers
+    /// should do all of one flush's shaping/rasterization work inside a
+    /// single call rather than re-locking per row, since a flush touching
+    /// several rows would otherwise re-acquire the lock that many times.
+    pub(crate) fn with_shared_cpu_state<R>(
+        &self,
+        f: impl FnOnce(&mut SharedFontCpuState) -> R,
+    ) -> R {
+        let mut guard = self
+            .shared_cpu_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = guard.get_or_insert_with(|| SharedFontCpuState::new(self));
+        f(state)
     }
 
     /// Build from a loaded [`TerminalFontAsset`].
@@ -480,7 +544,7 @@ mod font_for_cell_tests {
     use ratatui::buffer::Cell;
     use ratatui::style::Modifier;
 
-    const FONT_DATA: &[u8] = include_bytes!("../assets/fonts/Mplus1Code-Regular.ttf");
+    const FONT_DATA: &[u8] = include_bytes!("../examples/assets/fonts/Mplus1Code-Regular.ttf");
 
     /// A fresh `Font` with its own random `id()` - loading the same bytes
     /// twice via `Font::from_vec` yields two distinguishable `Font`s (see

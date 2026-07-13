@@ -236,8 +236,6 @@ pub enum TerminalError {
 
 pub type Result<T> = ::std::result::Result<T, TerminalError>;
 
-type RandomState = std::hash::RandomState;
-
 // Convenience prelude for common imports
 pub mod prelude {
     // Plugin and components

@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use tracing::debug;
 use wgpu;
 
+use crate::backend::SharedFontGpuState;
 use crate::backend::TerminalDrawPayload;
 use crate::backend::TerminalGpuState;
 use crate::input::*;
@@ -209,6 +210,9 @@ impl Plugin for TerminalPlugin {
             render_app
                 .init_resource::<PendingTuiDraws>()
                 .init_resource::<TerminalGpuStore>()
+                .init_resource::<SharedFontGpuStore>()
+                .init_resource::<PendingFontUploads>()
+                .init_resource::<LiveFontKeys>()
                 .init_resource::<PendingTuiReadbacks>()
                 .insert_resource(TuiReadbackReceiver(std::sync::Mutex::new(readback_rx)))
                 .add_systems(ExtractSchedule, extract_tui_draws)
@@ -316,23 +320,73 @@ struct PendingTuiDraws(HashMap<AssetId<Image>, TerminalDrawPayload>);
 #[derive(Resource, Default)]
 struct TerminalGpuStore(HashMap<AssetId<Image>, TerminalGpuState>);
 
+/// Render-world resource: per-font glyph-atlas texture + compositor
+/// pipelines (IMPROVEMENT.md C3), keyed by [`crate::fonts::Fonts::identity`]
+/// rather than by destination image - terminals that share a `Fonts` share
+/// one entry here. Created lazily in `render_tui_textures`, evicted once no
+/// live `Tui` reports that font key anymore (see [`LiveFontKeys`]).
+#[derive(Resource, Default)]
+struct SharedFontGpuStore(HashMap<usize, SharedFontGpuState>);
+
+/// Render-world resource: glyph rasterizations queued by [`extract_tui_draws`]
+/// for each font, still waiting to be uploaded to that font's shared atlas.
+/// Multiple terminals sharing a font may all contribute here in the same
+/// frame (only the first one visited by `Fonts::with_shared_cpu_state`
+/// actually drains anything non-empty; see
+/// `Tui::take_shared_font_uploads`), so entries are appended to rather than
+/// overwritten. Drained (per font, once uploaded) by `render_tui_textures`.
+#[derive(Resource, Default)]
+struct PendingFontUploads(HashMap<usize, Vec<(crate::utils::text_atlas::CacheRect, Vec<u32>)>>);
+
+/// Render-world resource: every font key currently reported by a live `Tui`
+/// entity, recomputed from scratch each extract. Used by `render_tui_textures`
+/// to evict [`SharedFontGpuStore`] entries for fonts no longer in use by any
+/// terminal - unlike [`TerminalGpuStore`]'s per-destination eviction (which
+/// piggybacks on `RenderAssets<GpuImage>` naturally dropping a despawned
+/// terminal's image), a shared font's last user despawning leaves no asset
+/// to check against, so it needs this explicit liveness set instead.
+#[derive(Resource, Default)]
+struct LiveFontKeys(std::collections::HashSet<usize>);
+
 /// Extract system: drains each `Tui`'s pending draw payload (set by
 /// [`gpu_flush_system`] via [`Tui::flush`](crate::setup::Tui::flush)) into
-/// the render-world [`PendingTuiDraws`] map. Runs in the render world but
+/// the render-world [`PendingTuiDraws`] map, and (IMPROVEMENT.md C3) each
+/// `Tui`'s font key + any pending shared-atlas glyph uploads into
+/// [`LiveFontKeys`]/[`PendingFontUploads`]. Runs in the render world but
 /// mutates the main world through [`MainWorld`] (rather than the read-only
 /// `Extract<Query>>`) because draining the payload - so a static terminal's
 /// next frame doesn't re-push the same draw - requires `&mut Tui`.
-fn extract_tui_draws(mut main_world: ResMut<MainWorld>, mut pending: ResMut<PendingTuiDraws>) {
-    let mut query = main_world.query::<&mut Tui>();
+fn extract_tui_draws(
+    mut main_world: ResMut<MainWorld>,
+    mut pending: ResMut<PendingTuiDraws>,
+    mut font_uploads: ResMut<PendingFontUploads>,
+    mut live_fonts: ResMut<LiveFontKeys>,
+    mut query_state: Local<Option<QueryState<&'static mut Tui>>>,
+) {
+    // Cache the `QueryState` across frames (IMPROVEMENT.md D2) instead of
+    // constructing a fresh one (archetype matching from scratch) every
+    // frame - `QueryState::iter_mut` updates its archetype caches
+    // internally on every call, so no explicit `update_archetypes` is
+    // needed here.
+    let query = query_state.get_or_insert_with(|| main_world.query());
+    live_fonts.0.clear();
     for mut tui in query.iter_mut(&mut main_world) {
-        if let Some((dest, mut draw)) = tui.take_pending_draw() {
-            // An entry still in the map means `render_tui_textures` retained
-            // it because the destination `GpuImage` wasn't prepared yet. Its
-            // atlas uploads are one-shot - carry them forward or those
-            // glyphs render as garbage forever.
-            if let Some(undelivered) = pending.0.remove(&dest) {
-                draw.merge_undelivered(undelivered);
-            }
+        let (font_key, uploads) = tui.take_shared_font_uploads();
+        live_fonts.0.insert(font_key);
+        if !uploads.is_empty() {
+            font_uploads.0.entry(font_key).or_default().extend(uploads);
+        }
+
+        if let Some((dest, draw)) = tui.take_pending_draw() {
+            // Simply replaces any entry still in the map from a frame
+            // `render_tui_textures` skipped (destination `GpuImage` not
+            // prepared yet) - safe to drop that older payload's vertex
+            // data outright, since `draw` is this frame's full correct
+            // geometry regardless. (Before IMPROVEMENT.md C3 moved glyph
+            // rasterizations out of this payload and into the shared
+            // per-font state, an older payload's one-shot atlas uploads
+            // had to be merged forward here or those glyphs would render
+            // as garbage forever - no longer a concern for this map.)
             pending.0.insert(dest, draw);
         }
     }
@@ -352,37 +406,75 @@ fn extract_tui_draws(mut main_world: ResMut<MainWorld>, mut pending: ResMut<Pend
 /// extraction removes the `GpuImage`, and the next call here drops this
 /// store's now-orphaned GPU state (atlas texture, pipelines) right along
 /// with it. No entity-level bookkeeping needed.
+///
+/// Batches every terminal's draw into one `CommandEncoder` and submits it
+/// once at the end (IMPROVEMENT.md B3), instead of each terminal creating
+/// its own encoder and submitting separately. Skipped entirely on a frame
+/// with nothing pending, so a fully static scene still submits nothing.
+#[allow(clippy::too_many_arguments)]
 fn render_tui_textures(
     mut pending: ResMut<PendingTuiDraws>,
     mut store: ResMut<TerminalGpuStore>,
+    mut font_store: ResMut<SharedFontGpuStore>,
+    mut font_uploads: ResMut<PendingFontUploads>,
+    live_fonts: Res<LiveFontKeys>,
     gpu_images: Res<RenderAssets<GpuImage>>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
 ) {
+    // A font with no live `Tui` left using it (its last terminal despawned)
+    // has no destination image to key eviction off of the way
+    // `TerminalGpuStore` does below, hence the separate liveness set.
+    font_store.0.retain(|key, _| live_fonts.0.contains(key));
+
+    if pending.0.is_empty() {
+        store.0.retain(|dest, _| gpu_images.get(*dest).is_some());
+        font_uploads.0.clear();
+        return;
+    }
+
+    let mut encoder =
+        render_device
+            .wgpu_device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Terminal Draw Encoder (batched)"),
+            });
+
     pending.0.retain(|dest, draw| {
         let Some(gpu_image) = gpu_images.get(*dest) else {
             return true; // destination GpuImage not prepared yet - retry next frame
         };
 
-        let gpu_state = store.0.entry(*dest).or_insert_with(|| {
-            TerminalGpuState::new(
+        let shared = font_store.0.entry(draw.font_key()).or_insert_with(|| {
+            SharedFontGpuState::new(
                 render_device.wgpu_device(),
                 render_queue.0.as_ref(),
                 gpu_image.texture_descriptor.format,
-                gpu_image.texture_descriptor.size.width,
-                gpu_image.texture_descriptor.size.height,
             )
         });
+        if let Some(uploads) = font_uploads.0.remove(&draw.font_key()) {
+            shared.upload_glyphs(render_queue.0.as_ref(), &uploads);
+        }
+
+        let gpu_state = store
+            .0
+            .entry(*dest)
+            .or_insert_with(|| TerminalGpuState::new(render_device.wgpu_device(), shared));
         gpu_state.render(
             render_device.wgpu_device(),
             render_queue.0.as_ref(),
+            shared,
+            &mut encoder,
             &gpu_image.texture_view,
             draw,
         );
         false // rendered - drop from the pending map
     });
 
+    render_queue.0.submit(Some(encoder.finish()));
+
     store.0.retain(|dest, _| gpu_images.get(*dest).is_some());
+    font_uploads.0.clear();
 }
 
 // ============================================================================

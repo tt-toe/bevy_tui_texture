@@ -68,16 +68,18 @@ pub(crate) const CACHE_HEIGHT: u32 = 2048;
 // Compositor builders
 use wgpu::*;
 
-pub(crate) fn build_text_bg_compositor(
-    device: &Device,
-    screen_size: &Buffer,
-    format: TextureFormat,
-) -> TextCacheBgPipeline {
+pub(crate) fn build_text_bg_compositor(device: &Device, format: TextureFormat) -> TextCacheBgPipeline {
     let bg_shader = device.create_shader_module(ShaderModuleDescriptor {
         label: Some("BG Compositor Shader"),
         source: ShaderSource::Wgsl(include_str!("shaders/composite_bg.wgsl").into()),
     });
 
+    // Bind group 0 (the screen-size uniform) is intentionally per-terminal,
+    // not built here - screen size differs per terminal even when several
+    // share this pipeline/atlas (IMPROVEMENT.md C3), so each `TerminalGpuState`
+    // builds its own bind group against this layout (see
+    // `TerminalGpuState::new`) instead of one being baked in at pipeline
+    // creation.
     let bg_bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
         label: Some("BG Bind Group Layout"),
         entries: &[BindGroupLayoutEntry {
@@ -89,15 +91,6 @@ pub(crate) fn build_text_bg_compositor(
                 min_binding_size: None,
             },
             count: None,
-        }],
-    });
-
-    let bg_bind_group = device.create_bind_group(&BindGroupDescriptor {
-        label: Some("BG Bind Group"),
-        layout: &bg_bind_group_layout,
-        entries: &[BindGroupEntry {
-            binding: 0,
-            resource: screen_size.as_entire_binding(),
         }],
     });
 
@@ -140,18 +133,13 @@ pub(crate) fn build_text_bg_compositor(
         cache: None,
     });
 
-    TextCacheBgPipeline {
-        pipeline: bg_pipeline,
-        fs_uniforms: bg_bind_group,
-    }
+    TextCacheBgPipeline { pipeline: bg_pipeline }
 }
 
 pub(crate) fn build_text_fg_compositor(
     device: &Device,
-    screen_size: &Buffer,
     atlas_size: &Buffer,
     cache: &TextureView,
-    mask: &TextureView,
     sampler: &Sampler,
     format: TextureFormat,
 ) -> TextCacheFgPipeline {
@@ -160,6 +148,9 @@ pub(crate) fn build_text_fg_compositor(
         source: ShaderSource::Wgsl(include_str!("shaders/composite_fg.wgsl").into()),
     });
 
+    // Bind group 0 (the screen-size uniform) is per-terminal - see the
+    // comment in `build_text_bg_compositor` above; the same reasoning
+    // applies here, so only the layout is built in this function.
     let fg_bind_group_layout_0 = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
         label: Some("FG Bind Group Layout 0"),
         entries: &[BindGroupLayoutEntry {
@@ -174,30 +165,15 @@ pub(crate) fn build_text_fg_compositor(
         }],
     });
 
-    let fg_bind_group_0 = device.create_bind_group(&BindGroupDescriptor {
-        label: Some("FG Bind Group 0"),
-        layout: &fg_bind_group_layout_0,
-        entries: &[BindGroupEntry {
-            binding: 0,
-            resource: screen_size.as_entire_binding(),
-        }],
-    });
-
+    // Binding 1 is intentionally a gap here (used to be the color-glyph
+    // mask texture, removed - see IMPROVEMENT.md C1). wgpu does not
+    // require bind group entries to be contiguous; leaving the gap keeps
+    // this diff minimal and binding 2/3 unambiguous against the shader.
     let fg_bind_group_layout_1 = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
         label: Some("FG Bind Group Layout 1"),
         entries: &[
             BindGroupLayoutEntry {
                 binding: 0,
-                visibility: ShaderStages::FRAGMENT,
-                ty: BindingType::Texture {
-                    sample_type: TextureSampleType::Float { filterable: true },
-                    view_dimension: TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            },
-            BindGroupLayoutEntry {
-                binding: 1,
                 visibility: ShaderStages::FRAGMENT,
                 ty: BindingType::Texture {
                     sample_type: TextureSampleType::Float { filterable: true },
@@ -232,10 +208,6 @@ pub(crate) fn build_text_fg_compositor(
             BindGroupEntry {
                 binding: 0,
                 resource: BindingResource::TextureView(cache),
-            },
-            BindGroupEntry {
-                binding: 1,
-                resource: BindingResource::TextureView(mask),
             },
             BindGroupEntry {
                 binding: 2,
@@ -295,31 +267,17 @@ pub(crate) fn build_text_fg_compositor(
 
     TextCacheFgPipeline {
         pipeline: fg_pipeline,
-        fs_uniforms: fg_bind_group_0,
         atlas_bindings: fg_bind_group_1,
     }
 }
 
 use std::num::NonZeroU32;
 
-use tracing::error;
 use ratatui::style::Color;
-use wgpu::Adapter;
 use wgpu::BindGroup;
-#[cfg(test)]
-use wgpu::Buffer;
-#[cfg(test)]
-use wgpu::BufferDescriptor;
-#[cfg(test)]
-use wgpu::BufferUsages;
 use wgpu::Device;
 use wgpu::Extent3d;
 use wgpu::RenderPipeline;
-use wgpu::Surface;
-use wgpu::SurfaceConfiguration;
-use wgpu::SurfaceTexture;
-#[cfg(test)]
-use wgpu::Texture;
 use wgpu::TextureDescriptor;
 use wgpu::TextureDimension;
 use wgpu::TextureFormat;
@@ -356,233 +314,6 @@ pub enum Viewport {
     Shrink { width: u32, height: u32 },
 }
 
-mod private {
-    use wgpu::Surface;
-
-    #[cfg(test)]
-    use super::HeadlessSurface;
-    #[cfg(test)]
-    use super::HeadlessTarget;
-    use super::RenderTarget;
-
-    pub trait Sealed {}
-
-    pub struct Token;
-
-    impl Sealed for Surface<'_> {}
-    impl Sealed for RenderTarget {}
-
-    #[cfg(test)]
-    impl Sealed for HeadlessTarget {}
-
-    #[cfg(test)]
-    impl Sealed for HeadlessSurface {}
-}
-
-/// A Texture target that can be rendered to.
-pub trait RenderTexture: private::Sealed + Sized {
-    /// Gets a [`wgpu::TextureView`] that can be used for rendering.
-    fn get_view(&self, _token: private::Token) -> &TextureView;
-    /// Presents the rendered result if applicable.
-    fn present(self, _token: private::Token) {}
-}
-
-impl RenderTexture for RenderTarget {
-    fn get_view(&self, _token: private::Token) -> &TextureView {
-        &self.view
-    }
-
-    fn present(self, _token: private::Token) {
-        self.texture.present();
-    }
-}
-
-#[cfg(test)]
-impl RenderTexture for HeadlessTarget {
-    fn get_view(&self, _token: private::Token) -> &TextureView {
-        &self.view
-    }
-}
-
-/// A surface that can be rendered to.
-pub trait RenderSurface<'s>: private::Sealed {
-    type Target: RenderTexture;
-
-    fn wgpu_surface(&self, _token: private::Token) -> Option<&Surface<'s>>;
-
-    fn get_default_config(
-        &self,
-        adapter: &Adapter,
-        width: u32,
-        height: u32,
-        _token: private::Token,
-    ) -> Option<SurfaceConfiguration>;
-
-    fn configure(&mut self, device: &Device, config: &SurfaceConfiguration, _token: private::Token);
-
-    fn get_current_texture(&self, _token: private::Token) -> Option<Self::Target>;
-}
-
-pub struct RenderTarget {
-    texture: SurfaceTexture,
-    view: TextureView,
-}
-
-impl<'s> RenderSurface<'s> for Surface<'s> {
-    type Target = RenderTarget;
-
-    fn wgpu_surface(&self, _token: private::Token) -> Option<&Surface<'s>> {
-        Some(self)
-    }
-
-    fn get_default_config(
-        &self,
-        adapter: &Adapter,
-        width: u32,
-        height: u32,
-        _token: private::Token,
-    ) -> Option<SurfaceConfiguration> {
-        self.get_default_config(adapter, width, height)
-    }
-
-    fn configure(
-        &mut self,
-        device: &Device,
-        config: &SurfaceConfiguration,
-        _token: private::Token,
-    ) {
-        Surface::configure(self, device, config);
-    }
-
-    fn get_current_texture(&self, _token: private::Token) -> Option<Self::Target> {
-        // wgpu 29: get_current_texture returns an enum instead of a Result.
-        let output = match self.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(output)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(output) => output,
-            status => {
-                error!("surface texture unavailable: {status:?}");
-                return None;
-            }
-        };
-
-        let view = output
-            .texture
-            .create_view(&TextureViewDescriptor::default());
-
-        Some(RenderTarget {
-            texture: output,
-            view,
-        })
-    }
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-pub(crate) struct HeadlessTarget {
-    view: TextureView,
-}
-
-#[cfg(test)]
-pub(crate) struct HeadlessSurface {
-    pub(crate) texture: Option<Texture>,
-    pub(crate) buffer: Option<Buffer>,
-    pub(crate) buffer_width: u32,
-    pub(crate) width: u32,
-    pub(crate) height: u32,
-    pub(crate) format: TextureFormat,
-}
-
-#[cfg(test)]
-impl HeadlessSurface {
-    #[allow(dead_code)]
-    fn new(format: TextureFormat) -> Self {
-        Self {
-            format,
-            ..Default::default()
-        }
-    }
-}
-
-#[cfg(test)]
-impl Default for HeadlessSurface {
-    fn default() -> Self {
-        Self {
-            texture: Default::default(),
-            buffer: Default::default(),
-            buffer_width: Default::default(),
-            width: Default::default(),
-            height: Default::default(),
-            format: TextureFormat::Rgba8Unorm,
-        }
-    }
-}
-
-#[cfg(test)]
-impl RenderSurface<'static> for HeadlessSurface {
-    type Target = HeadlessTarget;
-
-    fn wgpu_surface(&self, _token: private::Token) -> Option<&Surface<'static>> {
-        None
-    }
-
-    fn get_default_config(
-        &self,
-        _adapter: &Adapter,
-        width: u32,
-        height: u32,
-        _token: private::Token,
-    ) -> Option<SurfaceConfiguration> {
-        Some(SurfaceConfiguration {
-            usage: TextureUsages::RENDER_ATTACHMENT,
-            format: self.format,
-            width,
-            height,
-            present_mode: wgpu::PresentMode::Immediate,
-            desired_maximum_frame_latency: 2,
-            alpha_mode: wgpu::CompositeAlphaMode::Auto,
-            view_formats: vec![],
-        })
-    }
-
-    fn configure(
-        &mut self,
-        device: &Device,
-        config: &SurfaceConfiguration,
-        _token: private::Token,
-    ) {
-        self.texture = Some(device.create_texture(&TextureDescriptor {
-            label: None,
-            size: Extent3d {
-                width: config.width,
-                height: config.height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: TextureDimension::D2,
-            format: self.format,
-            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
-            view_formats: &[],
-        }));
-
-        self.buffer_width = config.width * 4;
-        self.buffer = Some(device.create_buffer(&BufferDescriptor {
-            label: None,
-            size: (self.buffer_width * config.height) as u64,
-            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        }));
-        self.width = config.width;
-        self.height = config.height;
-    }
-
-    fn get_current_texture(&self, _token: private::Token) -> Option<Self::Target> {
-        self.texture.as_ref().map(|t| HeadlessTarget {
-            view: t.create_view(&TextureViewDescriptor::default()),
-        })
-    }
-}
-
 #[repr(C)]
 #[derive(bytemuck::Pod, bytemuck::Zeroable, Debug, Clone, Copy)]
 struct TextBgVertexMember {
@@ -603,18 +334,13 @@ struct TextVertexMember {
 
 pub(crate) struct TextCacheBgPipeline {
     pipeline: RenderPipeline,
-    fs_uniforms: BindGroup,
 }
 
 pub(crate) struct TextCacheFgPipeline {
     pipeline: RenderPipeline,
-    fs_uniforms: BindGroup,
     atlas_bindings: BindGroup,
 }
 
-pub(crate) struct WgpuState {
-    _text_dest_view: TextureView,
-}
 
 fn c2c(color: ratatui::style::Color, reset: Rgb) -> Rgb {
     match color {
@@ -640,40 +366,25 @@ fn c2c(color: ratatui::style::Color, reset: Rgb) -> Rgb {
     }
 }
 
-pub(crate) fn build_wgpu_state(
-    device: &Device,
-    drawable_width: u32,
-    drawable_height: u32,
-) -> WgpuState {
-    let text_dest = device.create_texture(&TextureDescriptor {
-        label: Some("Text Compositor Out"),
-        size: Extent3d {
-            width: drawable_width.max(1),
-            height: drawable_height.max(1),
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: TextureDimension::D2,
-        format: TextureFormat::Rgba8Unorm,
-        usage: TextureUsages::TEXTURE_BINDING | TextureUsages::RENDER_ATTACHMENT,
-        view_formats: &[],
-    });
-
-    let text_dest_view = text_dest.create_view(&TextureViewDescriptor::default());
-
-    WgpuState {
-        _text_dest_view: text_dest_view,
-    }
-}
-
-/// CPU-computed draw payload extracted from a dirty `Tui` each frame:
-/// pending glyph rasterizations to upload into the atlas texture, plus the
-/// background/foreground vertex+index data ratatui's diffed buffer produced
-/// this draw. Built by `BevyTerminalBackend::take_draw_payload` (main
-/// world), consumed by `TerminalGpuState::render` (render world). Fields
-/// are crate-private - callers outside `backend` only move this type
-/// around, they never need to inspect it.
+/// CPU-computed draw payload extracted from a dirty `Tui` each frame: the
+/// background/foreground vertex data ratatui's diffed buffer produced this
+/// draw, plus which font's shared atlas/pipelines to render it against.
+/// Built by `BevyTerminalBackend::take_draw_payload` (main world), consumed
+/// by `TerminalGpuState::render` (render world). Fields are crate-private -
+/// callers outside `backend` only move this type around, they never need
+/// to inspect it.
+///
+/// Carries no glyph rasterizations and no index buffer:
+/// - Glyph uploads queue in the shared per-font CPU state
+///   (`Fonts::with_shared_cpu_state`, IMPROVEMENT.md C3) instead of here,
+///   and are drained once per font per frame via
+///   `BevyTerminalBackend::take_shared_glyph_uploads` - not once per
+///   terminal, since multiple terminals can share the same font and thus
+///   the same atlas.
+/// - Quad indices are a pure function of vertex count (quad `i` ->
+///   `[4i, 4i+1, 4i+2, 4i+2, 4i+3, 4i+1]`), so `TerminalGpuState` derives
+///   them from one static, grow-only index buffer instead of this payload
+///   shipping a freshly rebuilt one every frame.
 pub(crate) struct TerminalDrawPayload {
     /// Pixel dimensions used for the screen-size uniform - the *drawable*
     /// area (viewport insets already applied), not necessarily the full
@@ -683,51 +394,31 @@ pub(crate) struct TerminalDrawPayload {
     /// Color to clear to when `text_vertices` is empty (nothing drawn yet,
     /// or mid-resize) - see `BevyTerminalBackend::initial_fill`.
     clear_color: [u8; 4],
-    glyph_uploads: Vec<(crate::utils::text_atlas::CacheRect, Vec<u32>, bool)>,
+    /// Identity of the `Fonts` this terminal renders with (see
+    /// [`crate::fonts::Fonts::identity`]) - the render world uses this to
+    /// find the correct shared atlas/pipelines (`SharedFontGpuStore`,
+    /// IMPROVEMENT.md C3) for this terminal's vertex data.
+    font_key: usize,
     bg_vertices: Vec<TextBgVertexMember>,
     text_vertices: Vec<TextVertexMember>,
-    text_indices: Vec<[u32; 6]>,
 }
 
 impl TerminalDrawPayload {
-    /// Fold an older, never-rendered payload into this (newer) one. The
-    /// vertex/index data is full-frame state, so the newer set simply wins -
-    /// but `glyph_uploads` are one-shot atlas writes the CPU-side `Atlas`
-    /// LRU already considers cached: dropping one leaves its atlas slot as
-    /// garbage *forever* (the glyph is never re-rasterized), which shows up
-    /// as permanently missing characters. Whenever a payload is about to be
-    /// replaced before the render world consumed it (`Tui::flush` on a
-    /// dirty-every-frame terminal while the renderer is still initializing,
-    /// or `extract_tui_draws` overwriting an entry whose destination
-    /// `GpuImage` isn't prepared yet), its uploads must be carried forward
-    /// through this method, never discarded.
-    ///
-    /// The older uploads are ordered *before* this payload's own: if an LRU
-    /// slot was reused in between, the later write is the live one and must
-    /// land last.
-    pub(crate) fn merge_undelivered(&mut self, older: TerminalDrawPayload) {
-        if older.glyph_uploads.is_empty() {
-            return;
-        }
-        tracing::debug!(
-            "carrying forward {} undelivered glyph upload(s) from a superseded draw payload",
-            older.glyph_uploads.len()
-        );
-        let mut uploads = older.glyph_uploads;
-        uploads.append(&mut self.glyph_uploads);
-        self.glyph_uploads = uploads;
-    }
-
-    /// Drop the vertex/index geometry (drawn at whatever grid size was
-    /// current at the time) while keeping `glyph_uploads` - used by
-    /// `Tui::apply_pending_resize`, where the just-taken payload's geometry
-    /// was computed at the OLD grid size and would render garbled against
-    /// the freshly resized destination texture, but its glyph-atlas uploads
-    /// remain valid pixel data regardless of grid size.
+    /// Drop the vertex geometry (drawn at whatever grid size was current at
+    /// the time) - used by `Tui::apply_pending_resize`, where the
+    /// just-taken payload's geometry was computed at the OLD grid size and
+    /// would render garbled against the freshly resized destination
+    /// texture.
     pub(crate) fn discard_stale_geometry(&mut self) {
         self.bg_vertices.clear();
         self.text_vertices.clear();
-        self.text_indices.clear();
+    }
+
+    /// Identity of the `Fonts` this terminal renders with - used by
+    /// `render_tui_textures` (`bevy_plugin.rs`) to look up the correct
+    /// [`SharedFontGpuState`] for this payload's vertex data.
+    pub(crate) fn font_key(&self) -> usize {
+        self.font_key
     }
 }
 
@@ -759,35 +450,79 @@ fn zero_init_texture(queue: &Queue, texture: &Texture, width: u32, height: u32, 
     );
 }
 
-/// Render-world GPU resources for one terminal: glyph atlas texture,
-/// background/foreground compositor pipelines, and the screen-size uniform
-/// buffer. Lazily created on a terminal's first extract (see
-/// `bevy_plugin.rs`'s render-world store), keyed by destination image -
-/// `target_format` mirrors whatever pixel format the destination `GpuImage`
-/// was actually created with, so this never has to guess.
-pub(crate) struct TerminalGpuState {
-    text_cache: Texture,
-    #[allow(dead_code)]
-    text_mask: Texture,
-    text_bg_compositor: TextCacheBgPipeline,
-    text_fg_compositor: TextCacheFgPipeline,
-    text_screen_size_buffer: Buffer,
-    #[allow(dead_code)]
-    wgpu_state: WgpuState,
+/// Starting capacity, in quads, for a terminal's index buffer (see
+/// `TerminalGpuState::index_buffer`) - grown (doubling) the first time a
+/// draw needs more. Covers a small static terminal without an immediate
+/// regrow; large or busy terminals pay one regrow the first time they
+/// exceed it, never again after that (grow-only, sized to the largest
+/// frame ever drawn).
+const INITIAL_INDEX_QUAD_CAPACITY: u32 = 64;
+
+/// Builds the index pattern for `quad_count` independent quads: quad `i`
+/// occupies vertices `[4i, 4i+1, 4i+2, 4i+3]` and is drawn as two
+/// triangles `(4i, 4i+1, 4i+2)` + `(4i+2, 4i+3, 4i+1)`. Pure function of
+/// the count - this is the entire reason the index buffer can be static
+/// and grow-only instead of rebuilt from a `TerminalDrawPayload` every
+/// frame (see IMPROVEMENT.md B2).
+fn build_quad_indices(quad_count: u32) -> Vec<[u32; 6]> {
+    (0..quad_count)
+        .map(|i| {
+            let base = i * 4;
+            [base, base + 1, base + 2, base + 2, base + 3, base + 1]
+        })
+        .collect()
 }
 
-impl TerminalGpuState {
-    pub(crate) fn new(
-        device: &Device,
-        queue: &Queue,
-        target_format: TextureFormat,
-        pixel_width: u32,
-        pixel_height: u32,
-    ) -> Self {
+/// Grows a persistent GPU buffer (grow-only, doubling) if it doesn't
+/// already cover `needed_bytes`, recreating it with the given `usage` and
+/// `label`. Shared by every per-terminal buffer that is rewritten every
+/// dirty frame but only needs to change *size* on the rare frame whose
+/// content is bigger than anything seen before (`TerminalGpuState`'s
+/// `bg_vertex_buffer`/`fg_vertex_buffer` - see IMPROVEMENT.md B1). Callers
+/// still need to `queue.write_buffer` the actual bytes after this returns;
+/// resizing alone does not upload anything.
+fn ensure_buffer_capacity(
+    device: &Device,
+    buffer: &mut Buffer,
+    capacity_bytes: &mut u64,
+    needed_bytes: u64,
+    usage: BufferUsages,
+    label: &str,
+) {
+    if needed_bytes <= *capacity_bytes {
+        return;
+    }
+    let new_capacity = needed_bytes.next_power_of_two();
+    *buffer = device.create_buffer(&BufferDescriptor {
+        label: Some(label),
+        size: new_capacity,
+        mapped_at_creation: false,
+        usage,
+    });
+    *capacity_bytes = new_capacity;
+}
+
+/// Render-world GPU resources shared by every terminal using the same
+/// `Fonts` (IMPROVEMENT.md C3): the glyph atlas texture and the
+/// background/foreground compositor pipelines (which bind to that same
+/// atlas texture view, so they must live and die with it). Keyed by font
+/// identity ([`crate::fonts::Fonts::identity`]) in the render-world store
+/// (`bevy_plugin.rs`), not by destination image - two terminals sharing a
+/// font share one 2048x2048 atlas and one pipeline pair instead of one
+/// each. `target_format` mirrors whatever pixel format terminal
+/// destination `GpuImage`s are actually created with (always
+/// `Rgba8Unorm` today - see `TerminalTexture::create` - so in practice
+/// every terminal's format matches regardless of font).
+pub(crate) struct SharedFontGpuState {
+    text_cache: Texture,
+    text_bg_compositor: TextCacheBgPipeline,
+    text_fg_compositor: TextCacheFgPipeline,
+}
+
+impl SharedFontGpuState {
+    pub(crate) fn new(device: &Device, queue: &Queue, target_format: TextureFormat) -> Self {
         use wgpu::util::{BufferInitDescriptor, DeviceExt};
-        use wgpu::{
-            AddressMode, BufferDescriptor, BufferUsages, FilterMode, SamplerDescriptor,
-        };
+        use wgpu::{AddressMode, FilterMode, SamplerDescriptor};
 
         let text_cache = device.create_texture(&TextureDescriptor {
             label: Some("Text Cache"),
@@ -807,37 +542,20 @@ impl TerminalGpuState {
         });
         let text_cache_view = text_cache.create_view(&TextureViewDescriptor::default());
 
-        let text_mask = device.create_texture(&TextureDescriptor {
-            label: Some("Text Mask"),
-            size: Extent3d {
-                width: CACHE_WIDTH,
-                height: CACHE_HEIGHT,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: TextureDimension::D2,
-            format: TextureFormat::R8Unorm,
-            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let text_mask_view = text_mask.create_view(&TextureViewDescriptor::default());
-
-        // Both atlas textures start as genuinely uninitialized GPU memory,
+        // The atlas texture starts as genuinely uninitialized GPU memory,
         // and glyph uploads only ever write small per-glyph sub-rectangles
-        // (`render`, below) - `text_mask` currently isn't written at all.
-        // Without this, the FIRST partial write/sample of an uninitialized
-        // subresource makes wgpu silently perform its own full-texture
-        // "lazy initialization" clear to satisfy the "reads see zero unless
-        // written" guarantee; on the GL/WebGL2 backend that clear surfaces
-        // as a console WARN ("texSubImage: Texture has not been
-        // initialized prior to a partial upload" / "is incurring lazy
-        // initialization"). Explicitly zeroing both textures up front here
-        // marks their subresources initialized in wgpu's tracker, so that
-        // implicit clear - and its warning - never triggers later. One-time
-        // cost per `Tui` (atlas creation, not per frame).
+        // (`upload_glyphs`, below). Without this, the FIRST partial
+        // write/sample of an uninitialized subresource makes wgpu silently
+        // perform its own full-texture "lazy initialization" clear to
+        // satisfy the "reads see zero unless written" guarantee; on the
+        // GL/WebGL2 backend that clear surfaces as a console WARN
+        // ("texSubImage: Texture has not been initialized prior to a
+        // partial upload" / "is incurring lazy initialization"). Explicitly
+        // zeroing it up front here marks its subresources initialized in
+        // wgpu's tracker, so that implicit clear - and its warning - never
+        // triggers later. One-time cost per font (atlas creation, not per
+        // frame, and shared by every terminal using this font).
         zero_init_texture(queue, &text_cache, CACHE_WIDTH, CACHE_HEIGHT, 4);
-        zero_init_texture(queue, &text_mask, CACHE_WIDTH, CACHE_HEIGHT, 1);
 
         let sampler = device.create_sampler(&SamplerDescriptor {
             address_mode_u: AddressMode::ClampToEdge,
@@ -849,65 +567,44 @@ impl TerminalGpuState {
             ..Default::default()
         });
 
-        let text_screen_size_buffer = device.create_buffer(&BufferDescriptor {
-            label: Some("Text Uniforms Buffer"),
-            size: std::mem::size_of::<[f32; 4]>() as u64,
-            mapped_at_creation: false,
-            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-        });
-
+        // Screen size varies per terminal (several terminals can share this
+        // font/atlas but each has its own pixel dimensions), so that
+        // uniform buffer - and its bind group - lives on `TerminalGpuState`
+        // instead, built against this pipeline's bind group 0 layout (see
+        // `TerminalGpuState::new`). Nothing screen-size-shaped is created
+        // here.
         let atlas_size_buffer = device.create_buffer_init(&BufferInitDescriptor {
             label: Some("Atlas Size buffer"),
             contents: bytemuck::cast_slice(&[CACHE_WIDTH as f32, CACHE_HEIGHT as f32, 0.0, 0.0]),
-            usage: BufferUsages::UNIFORM,
+            usage: wgpu::BufferUsages::UNIFORM,
         });
 
-        let text_bg_compositor =
-            build_text_bg_compositor(device, &text_screen_size_buffer, target_format);
+        let text_bg_compositor = build_text_bg_compositor(device, target_format);
         let text_fg_compositor = build_text_fg_compositor(
             device,
-            &text_screen_size_buffer,
             &atlas_size_buffer,
             &text_cache_view,
-            &text_mask_view,
             &sampler,
             target_format,
         );
 
-        let wgpu_state = build_wgpu_state(device, pixel_width, pixel_height);
-
         Self {
             text_cache,
-            text_mask,
             text_bg_compositor,
             text_fg_compositor,
-            text_screen_size_buffer,
-            wgpu_state,
         }
     }
 
-    /// Uploads pending glyph rasterizations to the atlas texture, then
-    /// records the background + foreground passes into `target`. Mirrors
-    /// the pre-Phase-B `BevyTerminalBackend::render_to_texture`, operating
-    /// on an extracted [`TerminalDrawPayload`] instead of backend fields.
-    pub(crate) fn render(
-        &mut self,
-        device: &Device,
+    /// Uploads pending glyph rasterizations (queued via
+    /// `Fonts::with_shared_cpu_state`, potentially by several terminals
+    /// sharing this font) to the shared atlas texture. Called once per
+    /// font per frame, before rendering any terminal that uses it.
+    pub(crate) fn upload_glyphs(
+        &self,
         queue: &Queue,
-        target: &TextureView,
-        draw: &TerminalDrawPayload,
+        uploads: &[(crate::utils::text_atlas::CacheRect, Vec<u32>)],
     ) {
-        use wgpu::util::{BufferInitDescriptor, DeviceExt};
-        use wgpu::{
-            BufferUsages, CommandEncoderDescriptor, IndexFormat, LoadOp, Operations,
-            RenderPassColorAttachment, RenderPassDescriptor, StoreOp,
-        };
-
-        let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
-            label: Some("Terminal Draw Encoder"),
-        });
-
-        for (cached, image, _is_emoji) in &draw.glyph_uploads {
+        for (cached, image) in uploads {
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &self.text_cache,
@@ -932,6 +629,154 @@ impl TerminalGpuState {
                 },
             );
         }
+    }
+}
+
+/// Render-world GPU resources for one terminal: the screen-size uniform,
+/// the quad index buffer, and the vertex buffers - everything that is
+/// genuinely per-terminal rather than shared by font (see
+/// [`SharedFontGpuState`] for the atlas texture and compositor pipelines,
+/// IMPROVEMENT.md C3). Lazily created on a terminal's first extract (see
+/// `bevy_plugin.rs`'s render-world store), keyed by destination image.
+pub(crate) struct TerminalGpuState {
+    text_screen_size_buffer: Buffer,
+    text_screen_size_bind_group: BindGroup,
+    /// Static, grow-only quad index buffer shared by the bg and fg passes
+    /// each render (their draw calls take independent index *ranges* out
+    /// of the same buffer - see `render`). Never rebuilt from scratch on a
+    /// steady-state frame; only regenerated, at a larger size, the first
+    /// time a frame needs more quads than `index_buffer_quad_capacity`.
+    index_buffer: Buffer,
+    index_buffer_quad_capacity: u32,
+    /// Persistent, grow-only vertex buffers - `queue.write_buffer`d with
+    /// this frame's data every dirty frame instead of recreated via
+    /// `create_buffer_init` (see IMPROVEMENT.md B1). Only resized (via
+    /// `ensure_buffer_capacity`) the first time a frame's data exceeds the
+    /// current capacity.
+    bg_vertex_buffer: Buffer,
+    bg_vertex_buffer_capacity_bytes: u64,
+    fg_vertex_buffer: Buffer,
+    fg_vertex_buffer_capacity_bytes: u64,
+}
+
+impl TerminalGpuState {
+    /// `shared`'s pipelines determine this terminal's screen-size bind
+    /// group layout (both compositors take the same layout for bind group
+    /// 0 - see `build_text_bg_compositor`/`build_text_fg_compositor`), so
+    /// this terminal's OWN screen-size buffer needs a bind group built
+    /// against that layout, distinct from `shared`'s own (placeholder)
+    /// one. Terminals sharing `shared` each get their own such bind group,
+    /// pointing at their own buffer.
+    pub(crate) fn new(device: &Device, shared: &SharedFontGpuState) -> Self {
+        use wgpu::util::{BufferInitDescriptor, DeviceExt};
+        use wgpu::{BufferDescriptor, BufferUsages};
+
+        let text_screen_size_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("Text Uniforms Buffer"),
+            size: std::mem::size_of::<[f32; 4]>() as u64,
+            mapped_at_creation: false,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        });
+
+        let text_screen_size_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Terminal Screen Size Bind Group"),
+            layout: &shared.text_bg_compositor.pipeline.get_bind_group_layout(0),
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: text_screen_size_buffer.as_entire_binding(),
+            }],
+        });
+
+        let index_buffer = device.create_buffer_init(&BufferInitDescriptor {
+            label: Some("Terminal Quad Indices"),
+            contents: bytemuck::cast_slice(&build_quad_indices(INITIAL_INDEX_QUAD_CAPACITY)),
+            usage: BufferUsages::INDEX,
+        });
+
+        let bg_vertex_buffer_capacity_bytes =
+            INITIAL_INDEX_QUAD_CAPACITY as u64 * 4 * std::mem::size_of::<TextBgVertexMember>() as u64;
+        let bg_vertex_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("Text Bg Vertices"),
+            size: bg_vertex_buffer_capacity_bytes,
+            mapped_at_creation: false,
+            usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+        });
+
+        let fg_vertex_buffer_capacity_bytes =
+            INITIAL_INDEX_QUAD_CAPACITY as u64 * 4 * std::mem::size_of::<TextVertexMember>() as u64;
+        let fg_vertex_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("Text Vertices"),
+            size: fg_vertex_buffer_capacity_bytes,
+            mapped_at_creation: false,
+            usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+        });
+
+        Self {
+            text_screen_size_buffer,
+            text_screen_size_bind_group,
+            index_buffer,
+            index_buffer_quad_capacity: INITIAL_INDEX_QUAD_CAPACITY,
+            bg_vertex_buffer,
+            bg_vertex_buffer_capacity_bytes,
+            fg_vertex_buffer,
+            fg_vertex_buffer_capacity_bytes,
+        }
+    }
+
+    /// Grows `index_buffer` (doubling) if it doesn't already cover
+    /// `needed_quads`. The index pattern is a pure function of quad count
+    /// (see `build_quad_indices`), so regenerating it at a larger size is
+    /// all growth ever needs - there is no shrink path; a terminal's
+    /// largest-ever frame sets the buffer size for the rest of its
+    /// lifetime.
+    fn ensure_index_capacity(&mut self, device: &Device, needed_quads: u32) {
+        if needed_quads <= self.index_buffer_quad_capacity {
+            return;
+        }
+        use wgpu::util::{BufferInitDescriptor, DeviceExt};
+
+        let new_capacity = needed_quads.next_power_of_two();
+        self.index_buffer = device.create_buffer_init(&BufferInitDescriptor {
+            label: Some("Terminal Quad Indices"),
+            contents: bytemuck::cast_slice(&build_quad_indices(new_capacity)),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        self.index_buffer_quad_capacity = new_capacity;
+    }
+
+    /// Records the background + foreground passes into `target`, against
+    /// `shared`'s atlas/pipelines. Glyph uploads are NOT handled here -
+    /// `SharedFontGpuState::upload_glyphs` must be called once per font
+    /// per frame before rendering any terminal sharing that font (see
+    /// `render_tui_textures` in `bevy_plugin.rs`).
+    pub(crate) fn render(
+        &mut self,
+        device: &Device,
+        queue: &Queue,
+        shared: &SharedFontGpuState,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &TextureView,
+        draw: &TerminalDrawPayload,
+    ) {
+        use wgpu::{
+            BufferUsages, IndexFormat, LoadOp, Operations, RenderPassColorAttachment,
+            RenderPassDescriptor, StoreOp,
+        };
+
+        // Shared by both branches below (IMPROVEMENT.md B3) - previously
+        // the vertices-exist branch cleared to hardcoded black while only
+        // the empty branch cleared to `initial_fill`, so a terminal with a
+        // non-black `initial_fill` flashed the wrong color on its very
+        // first (content-free) frame. Also what `flush()`'s bg-quad
+        // skipping compares against (`initial_fill_u32` there), so a
+        // skipped quad and an actual clear must produce the same pixels.
+        let [r, g, b, a] = draw.clear_color;
+        let clear_color = wgpu::Color {
+            r: r as f64 / 255.0,
+            g: g as f64 / 255.0,
+            b: b as f64 / 255.0,
+            a: a as f64 / 255.0,
+        };
 
         if !draw.text_vertices.is_empty() {
             queue.write_buffer(
@@ -940,21 +785,43 @@ impl TerminalGpuState {
                 bytemuck::cast_slice(&[draw.screen_width_px, draw.screen_height_px, 0.0, 0.0]),
             );
 
-            let bg_vertices = device.create_buffer_init(&BufferInitDescriptor {
-                label: Some("Text Bg Vertices"),
-                contents: bytemuck::cast_slice(&draw.bg_vertices),
-                usage: BufferUsages::VERTEX,
-            });
-            let fg_vertices = device.create_buffer_init(&BufferInitDescriptor {
-                label: Some("Text Vertices"),
-                contents: bytemuck::cast_slice(&draw.text_vertices),
-                usage: BufferUsages::VERTEX,
-            });
-            let indices = device.create_buffer_init(&BufferInitDescriptor {
-                label: Some("Text Indices"),
-                contents: bytemuck::cast_slice(&draw.text_indices),
-                usage: BufferUsages::INDEX,
-            });
+            let bg_quads = draw.bg_vertices.len() as u32 / 4;
+            let fg_quads = draw.text_vertices.len() as u32 / 4;
+            self.ensure_index_capacity(device, bg_quads.max(fg_quads));
+
+            // Persistent, grow-only vertex buffers (IMPROVEMENT.md B1):
+            // `write_buffer` this frame's bytes at offset 0 instead of
+            // creating a fresh buffer every dirty frame. A buffer whose
+            // capacity is larger than this frame's data is fine as-is -
+            // the draw calls below only ever read vertex indices within
+            // `0..quads*4` (via the index buffer), so stale bytes past the
+            // current frame's data in an oversized buffer are never
+            // sampled.
+            let bg_bytes = bytemuck::cast_slice::<_, u8>(&draw.bg_vertices).len() as u64;
+            ensure_buffer_capacity(
+                device,
+                &mut self.bg_vertex_buffer,
+                &mut self.bg_vertex_buffer_capacity_bytes,
+                bg_bytes,
+                BufferUsages::VERTEX | BufferUsages::COPY_DST,
+                "Text Bg Vertices",
+            );
+            if bg_bytes > 0 {
+                queue.write_buffer(&self.bg_vertex_buffer, 0, bytemuck::cast_slice(&draw.bg_vertices));
+            }
+
+            let fg_bytes = bytemuck::cast_slice::<_, u8>(&draw.text_vertices).len() as u64;
+            ensure_buffer_capacity(
+                device,
+                &mut self.fg_vertex_buffer,
+                &mut self.fg_vertex_buffer_capacity_bytes,
+                fg_bytes,
+                BufferUsages::VERTEX | BufferUsages::COPY_DST,
+                "Text Vertices",
+            );
+            if fg_bytes > 0 {
+                queue.write_buffer(&self.fg_vertex_buffer, 0, bytemuck::cast_slice(&draw.text_vertices));
+            }
 
             let mut text_render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("Terminal Text Render Pass"),
@@ -962,7 +829,7 @@ impl TerminalGpuState {
                     view: target,
                     resolve_target: None,
                     ops: Operations {
-                        load: LoadOp::Clear(wgpu::Color::BLACK),
+                        load: LoadOp::Clear(clear_color),
                         store: StoreOp::Store,
                     },
                     depth_slice: None,
@@ -970,26 +837,24 @@ impl TerminalGpuState {
                 ..Default::default()
             });
 
-            text_render_pass.set_index_buffer(indices.slice(..), IndexFormat::Uint32);
+            // Both passes draw out of the same static index buffer - it's
+            // large enough for the larger of the two quad counts (just
+            // ensured above), and each pass only ever draws its own
+            // `0..quads*6` range, so the shared buffer never mixes bg and
+            // fg indices.
+            text_render_pass.set_index_buffer(self.index_buffer.slice(..), IndexFormat::Uint32);
 
-            text_render_pass.set_pipeline(&self.text_bg_compositor.pipeline);
-            text_render_pass.set_bind_group(0, &self.text_bg_compositor.fs_uniforms, &[]);
-            text_render_pass.set_vertex_buffer(0, bg_vertices.slice(..));
-            text_render_pass.draw_indexed(0..(draw.bg_vertices.len() as u32 / 4) * 6, 0, 0..1);
+            text_render_pass.set_pipeline(&shared.text_bg_compositor.pipeline);
+            text_render_pass.set_bind_group(0, &self.text_screen_size_bind_group, &[]);
+            text_render_pass.set_vertex_buffer(0, self.bg_vertex_buffer.slice(..));
+            text_render_pass.draw_indexed(0..bg_quads * 6, 0, 0..1);
 
-            text_render_pass.set_pipeline(&self.text_fg_compositor.pipeline);
-            text_render_pass.set_bind_group(0, &self.text_fg_compositor.fs_uniforms, &[]);
-            text_render_pass.set_bind_group(1, &self.text_fg_compositor.atlas_bindings, &[]);
-            text_render_pass.set_vertex_buffer(0, fg_vertices.slice(..));
-            text_render_pass.draw_indexed(0..(draw.text_vertices.len() as u32 / 4) * 6, 0, 0..1);
+            text_render_pass.set_pipeline(&shared.text_fg_compositor.pipeline);
+            text_render_pass.set_bind_group(0, &self.text_screen_size_bind_group, &[]);
+            text_render_pass.set_bind_group(1, &shared.text_fg_compositor.atlas_bindings, &[]);
+            text_render_pass.set_vertex_buffer(0, self.fg_vertex_buffer.slice(..));
+            text_render_pass.draw_indexed(0..fg_quads * 6, 0, 0..1);
         } else {
-            let [r, g, b, a] = draw.clear_color;
-            let clear_color = wgpu::Color {
-                r: r as f64 / 255.0,
-                g: g as f64 / 255.0,
-                b: b as f64 / 255.0,
-                a: a as f64 / 255.0,
-            };
             let _clear_pass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("Terminal Clear Pass"),
                 color_attachments: &[Some(RenderPassColorAttachment {
@@ -1004,7 +869,5 @@ impl TerminalGpuState {
                 ..Default::default()
             });
         }
-
-        queue.submit(Some(encoder.finish()));
     }
 }

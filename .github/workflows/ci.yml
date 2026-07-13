@@ -15,7 +15,11 @@ jobs:
   # Vulkan implementation (lavapipe, via mesa-vulkan-drivers) so wgpu can
   # get a real (if slow) adapter. Without it, the one GPU-backed test
   # (`flush_renders_drawn_content_synchronously`) would fall back to its
-  # "no adapter" skip path instead of actually running.
+  # "no adapter" skip path instead of actually running. libfontconfig1-dev
+  # is needed only by jobs that build dev-dependencies (--all-targets /
+  # examples): font-kit (a non-wasm dev-dependency used by some examples
+  # for system font lookup) links yeslogic-fontconfig-sys on Linux, which
+  # needs fontconfig.pc on PKG_CONFIG_PATH to build at all.
   test:
     name: cargo test (all features)
     runs-on: ubuntu-latest
@@ -28,7 +32,8 @@ jobs:
             libasound2-dev libudev-dev \
             libx11-dev libxi-dev libxcursor-dev libxrandr-dev \
             libwayland-dev libxkbcommon-dev \
-            mesa-vulkan-drivers libgl1-mesa-dri
+            mesa-vulkan-drivers libgl1-mesa-dri \
+            libfontconfig1-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-features
@@ -44,7 +49,8 @@ jobs:
           sudo apt-get install -y \
             libasound2-dev libudev-dev \
             libx11-dev libxi-dev libxcursor-dev libxrandr-dev \
-            libwayland-dev libxkbcommon-dev
+            libwayland-dev libxkbcommon-dev \
+            libfontconfig1-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy

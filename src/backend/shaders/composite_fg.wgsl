@@ -25,14 +25,12 @@ struct FragmentOutput {
     @location(0) FragColor: vec4<f32>,
 }
 
-@group(1) @binding(0) 
+@group(1) @binding(0)
 var Atlas: texture_2d<f32>;
-@group(1) @binding(1) 
-var Mask: texture_2d<f32>;
-@group(1) @binding(2) 
+@group(1) @binding(2)
 var Sampler: sampler;
 
-@group(1) @binding(3) 
+@group(1) @binding(3)
 var<uniform> AtlasSize: vec4<f32>;
 
 fn unpack_color(color: u32) -> vec4<f32> {
@@ -61,9 +59,7 @@ fn fs_main(
     textureColor.a = alpha;
     fgColorUnpacked.a = alpha;
 
-    let mask = textureSample(Mask, Sampler, UV / AtlasSize.xy);
-
-    var fgColor = select(fgColorUnpacked, textureColor, mask.r == 1.0);
+    var fgColor = fgColorUnpacked;
 
     let yMax = UnderlinePos & 0xFFFFu;
     let yMin = UnderlinePos >> 16u;

@@ -497,7 +497,7 @@ fn bounding_box_hit_test(
 ) -> Option<HitTestResult> {
     // Get terminal size and scale factor
     // ComputedNode.size is in physical pixels, we need to convert to logical
-    let (width_px, height_px, _inverse_scale) = if let Some(comp) = computed {
+    let (width_px, height_px, inverse_scale) = if let Some(comp) = computed {
         let node_size = comp.unrounded_size();
         // Convert from physical to logical pixels using inverse_scale_factor
         (
@@ -524,7 +524,18 @@ fn bounding_box_hit_test(
     //   percent, ...), unlike reading `Node.left`/`Node.top` directly (which
     //   silently reads 0 for any axis anchored from the opposite edge).
     let (node_min_x, node_min_y) = if let Some(t) = ui_transform {
-        let center = t.translation;
+        // `UiGlobalTransform::translation` is in the same physical-pixel
+        // space as `ComputedNode.size` (bevy 0.19's taffy layout runs
+        // entirely in physical pixels) - must be scaled to logical pixels
+        // by the same `inverse_scale_factor` as `width_px`/`height_px`
+        // above, or the computed bounds are wrong by exactly the window's
+        // scale factor. Harmless at scale_factor 1.0 (common on non-Retina
+        // Windows/Linux setups), but on macOS's default Retina
+        // scale_factor of 2.0 this put the node's bounding box at 2x its
+        // real logical position, so clicks always missed - reproduced both
+        // natively and in wasm (wasm on a Retina Mac also reports
+        // `devicePixelRatio` 2).
+        let center = t.translation * inverse_scale;
         debug!(
             "UiGlobalTransform center=({:.1}, {:.1}), size=({:.1}x{:.1})",
             center.x, center.y, width_px, height_px
@@ -603,6 +614,49 @@ fn bounding_box_hit_test(
     debug!("Hit test result: col={}, row={}", col, row);
 
     Some(HitTestResult { col, row })
+}
+
+/// Coarse pre-check (IMPROVEMENT.md D1): does `world_ray` even reach the
+/// mesh entity's bounding box? Rejects most terminals with a few float ops
+/// before any mesh vertex data (positions/indices/UVs) is touched by the
+/// precise test in `ray_cast_hit_test_inner`.
+///
+/// Fails OPEN (`true`, i.e. "might hit, don't prune") whenever it lacks the
+/// information to answer confidently - no `Aabb` component, or a
+/// degenerate (e.g. zero-scale) transform - since pruning must never
+/// introduce a false negative that silently drops a real hit.
+///
+/// `Aabb` is stored in the mesh's own LOCAL/model space (see its doc
+/// comment in `bevy_camera::primitives`), so this transforms the
+/// WORLD-space ray into that same local space via the inverse of
+/// `mesh_transform`'s affine matrix - mirroring exactly how
+/// `ray_mesh_intersection` itself handles `mesh_transform` (it inverts the
+/// same affine and transforms the ray, not the mesh vertices), so scale,
+/// rotation, and translation are all accounted for consistently between
+/// the coarse and precise stages.
+#[cfg(all(feature = "mouse_input", feature = "3d"))]
+fn ray_intersects_aabb(
+    world_ray: &crate::input::ray::Ray,
+    mesh_transform: &bevy::transform::components::GlobalTransform,
+    aabb: Option<&bevy::camera::primitives::Aabb>,
+) -> bool {
+    use bevy::math::bounding::{Aabb3d, RayCast3d};
+    use bevy::math::{Dir3A, Vec3A};
+
+    let Some(aabb) = aabb else {
+        return true;
+    };
+
+    let world_to_local = mesh_transform.affine().inverse();
+    let local_origin = world_to_local.transform_point3(world_ray.origin);
+    let local_direction = world_to_local.transform_vector3(world_ray.direction);
+    let Ok(local_direction) = Dir3A::try_from(Vec3A::from(local_direction)) else {
+        return true;
+    };
+
+    let ray_cast = RayCast3d::new(local_origin, local_direction, f32::MAX);
+    let aabb3d = Aabb3d::new(aabb.center, aabb.half_extents);
+    ray_cast.aabb_intersection_at(&aabb3d).is_some()
 }
 
 /// Perform 3D ray-mesh hit test.
@@ -820,14 +874,52 @@ pub fn mouse_input_system(
         Option<&bevy::ui::UiGlobalTransform>,
         Option<&crate::bevy_plugin::TerminalDimensions>,
         Option<&bevy::ui::ZIndex>,
+        Option<&bevy::camera::visibility::ViewVisibility>,
+        Option<&bevy::camera::primitives::Aabb>,
     )>,
     surfaces: Query<&crate::setup::TuiSurface>,
     mut events: MessageWriter<TerminalEvent>,
+    // Change-detection gate (IMPROVEMENT.md D1): anything that can move a
+    // cursor→cell mapping without the cursor pixel position itself
+    // changing. `Query::is_empty()` is a cheap archetype check, not a full
+    // iteration.
+    camera_change_probe: Query<
+        (),
+        (
+            With<Camera>,
+            Or<(Changed<GlobalTransform>, Changed<Projection>, Changed<Camera>)>,
+        ),
+    >,
+    terminal_3d_changed: Query<(), (With<TerminalInput>, Changed<GlobalTransform>)>,
+    terminal_ui_changed: Query<
+        (),
+        (
+            With<TerminalInput>,
+            Or<(Changed<bevy::ui::ComputedNode>, Changed<bevy::ui::UiGlobalTransform>)>,
+        ),
+    >,
+    mut last_cursor_pos: Local<Option<Vec2>>,
+    mut last_hovered: Local<Option<(Entity, u16, u16)>>,
 ) {
     let cursor_pos = match cursor.position {
         Some(pos) => pos,
-        None => return,
+        None => {
+            *last_cursor_pos = None;
+            *last_hovered = None;
+            return;
+        }
     };
+
+    let cursor_moved = *last_cursor_pos != Some(cursor_pos);
+    let button_transition = buttons.get_just_pressed().len() > 0 || buttons.get_just_released().len() > 0;
+    let scene_changed = !camera_change_probe.is_empty()
+        || !terminal_3d_changed.is_empty()
+        || !terminal_ui_changed.is_empty();
+
+    if !cursor_moved && !button_transition && !scene_changed {
+        return;
+    }
+    *last_cursor_pos = Some(cursor_pos);
 
     // Build one ray per active camera whose viewport contains the cursor,
     // topmost-rendered camera first (highest `Camera::order`). Multi-camera
@@ -858,8 +950,20 @@ pub fn mouse_input_system(
 
     let mut hit_candidates: Vec<(Entity, HitTestResult, SortKey)> = Vec::new();
 
-    for (entity, input, transform, mesh2d, mesh3d, node, computed, ui_transform, dimensions, z_index) in
-        terminals.iter()
+    for (
+        entity,
+        input,
+        transform,
+        mesh2d,
+        mesh3d,
+        node,
+        computed,
+        ui_transform,
+        dimensions,
+        z_index,
+        view_visibility,
+        aabb,
+    ) in terminals.iter()
     {
         if !input.mouse {
             continue;
@@ -875,9 +979,25 @@ pub fn mouse_input_system(
                     continue; // no GlobalTransform - can't ray-cast
                 };
 
+                // Stage 1 (coarse->fine, IMPROVEMENT.md D1): visibility -
+                // bevy's own visibility system already computed this for
+                // the frame, so an invisible terminal is skipped before
+                // any per-camera work. Fail open (no component = not
+                // pruned) rather than assume visible/invisible.
+                if view_visibility.is_some_and(|v| !v.get()) {
+                    continue;
+                }
+
                 // Test cameras front-to-back; the first camera whose ray hits
                 // this terminal determines its hit (and camera priority).
                 for (camera_priority, ray) in world_rays.iter().enumerate() {
+                    // Stage 2: AABB bounding check - cheap rejection
+                    // before touching any mesh vertex data.
+                    if !ray_intersects_aabb(ray, transform, aabb) {
+                        continue;
+                    }
+
+                    // Stage 3: precise triangle-level intersection.
                     if let Some((hit_result, distance)) = mesh_handle.and_then(|handle| {
                         ray_cast_hit_test_inner(ray, transform, handle, &meshes, dimensions)
                     }) {
@@ -909,6 +1029,7 @@ pub fn mouse_input_system(
     }
 
     if hit_candidates.is_empty() {
+        *last_hovered = None;
         return;
     }
 
@@ -939,13 +1060,21 @@ pub fn mouse_input_system(
     }
 
     if let Some((entity, hit_result, _sort_key)) = hit_candidates.first() {
-        emit_mouse_move(
-            *entity,
-            hit_result.col,
-            hit_result.row,
-            &surfaces,
-            &mut events,
-        );
+        // Dedupe MouseMove (IMPROVEMENT.md D1): only emit when the
+        // hovered (entity, col, row) actually changed since the last
+        // recompute, so hovering inside one cell stops re-emitting on
+        // every gate-triggered recompute.
+        let hovered = (*entity, hit_result.col, hit_result.row);
+        if *last_hovered != Some(hovered) {
+            emit_mouse_move(
+                *entity,
+                hit_result.col,
+                hit_result.row,
+                &surfaces,
+                &mut events,
+            );
+            *last_hovered = Some(hovered);
+        }
         emit_button_events(
             *entity,
             hit_result.col,
@@ -979,11 +1108,34 @@ pub fn mouse_input_system(
     )>,
     surfaces: Query<&crate::setup::TuiSurface>,
     mut events: MessageWriter<TerminalEvent>,
+    // Change-detection gate (IMPROVEMENT.md D1) - no camera/3D probe
+    // needed here: `bounding_box_hit_test` is pure screen-space, it never
+    // reads a camera.
+    terminal_ui_changed: Query<
+        (),
+        (
+            With<TerminalInput>,
+            Or<(Changed<bevy::ui::ComputedNode>, Changed<bevy::ui::UiGlobalTransform>)>,
+        ),
+    >,
+    mut last_cursor_pos: Local<Option<Vec2>>,
+    mut last_hovered: Local<Option<(Entity, u16, u16)>>,
 ) {
     let cursor_pos = match cursor.position {
         Some(pos) => pos,
-        None => return,
+        None => {
+            *last_cursor_pos = None;
+            *last_hovered = None;
+            return;
+        }
     };
+
+    let cursor_moved = *last_cursor_pos != Some(cursor_pos);
+    let button_transition = buttons.get_just_pressed().len() > 0 || buttons.get_just_released().len() > 0;
+    if !cursor_moved && !button_transition && terminal_ui_changed.is_empty() {
+        return;
+    }
+    *last_cursor_pos = Some(cursor_pos);
 
     let mut hit_candidates: Vec<(Entity, HitTestResult, SortKey)> = Vec::new();
 
@@ -1001,19 +1153,24 @@ pub fn mouse_input_system(
     }
 
     if hit_candidates.is_empty() {
+        *last_hovered = None;
         return;
     }
 
     hit_candidates.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
 
     if let Some((entity, hit_result, _sort_key)) = hit_candidates.first() {
-        emit_mouse_move(
-            *entity,
-            hit_result.col,
-            hit_result.row,
-            &surfaces,
-            &mut events,
-        );
+        let hovered = (*entity, hit_result.col, hit_result.row);
+        if *last_hovered != Some(hovered) {
+            emit_mouse_move(
+                *entity,
+                hit_result.col,
+                hit_result.row,
+                &surfaces,
+                &mut events,
+            );
+            *last_hovered = Some(hovered);
+        }
         emit_button_events(
             *entity,
             hit_result.col,
@@ -1045,14 +1202,41 @@ pub fn mouse_input_system(
         Option<&Mesh2d>,
         Option<&Mesh3d>,
         Option<&crate::bevy_plugin::TerminalDimensions>,
+        Option<&bevy::camera::visibility::ViewVisibility>,
+        Option<&bevy::camera::primitives::Aabb>,
     )>,
     surfaces: Query<&crate::setup::TuiSurface>,
     mut events: MessageWriter<TerminalEvent>,
+    // Change-detection gate (IMPROVEMENT.md D1) - see the unified system's
+    // doc comment for the full rationale; no UI-layout probe needed here
+    // since there is no 2D UI terminal kind in this build.
+    camera_change_probe: Query<
+        (),
+        (
+            With<Camera>,
+            Or<(Changed<GlobalTransform>, Changed<Projection>, Changed<Camera>)>,
+        ),
+    >,
+    terminal_3d_changed: Query<(), (With<TerminalInput>, Changed<GlobalTransform>)>,
+    mut last_cursor_pos: Local<Option<Vec2>>,
+    mut last_hovered: Local<Option<(Entity, u16, u16)>>,
 ) {
     let cursor_pos = match cursor.position {
         Some(pos) => pos,
-        None => return,
+        None => {
+            *last_cursor_pos = None;
+            *last_hovered = None;
+            return;
+        }
     };
+
+    let cursor_moved = *last_cursor_pos != Some(cursor_pos);
+    let button_transition = buttons.get_just_pressed().len() > 0 || buttons.get_just_released().len() > 0;
+    let scene_changed = !camera_change_probe.is_empty() || !terminal_3d_changed.is_empty();
+    if !cursor_moved && !button_transition && !scene_changed {
+        return;
+    }
+    *last_cursor_pos = Some(cursor_pos);
 
     // See the unified system's doc comment for the multi-camera rationale -
     // identical here, just without any 2D UI terminals to also consider.
@@ -1077,7 +1261,9 @@ pub fn mouse_input_system(
 
     let mut hit_candidates: Vec<(Entity, HitTestResult, SortKey)> = Vec::new();
 
-    for (entity, input, transform, mesh2d, mesh3d, dimensions) in terminals.iter() {
+    for (entity, input, transform, mesh2d, mesh3d, dimensions, view_visibility, aabb) in
+        terminals.iter()
+    {
         if !input.mouse {
             continue;
         }
@@ -1086,7 +1272,19 @@ pub fn mouse_input_system(
             continue; // no GlobalTransform - can't ray-cast
         };
 
+        // Stage 1 (coarse->fine, IMPROVEMENT.md D1): visibility. Fail
+        // open (no component = not pruned).
+        if view_visibility.is_some_and(|v| !v.get()) {
+            continue;
+        }
+
         for (camera_priority, ray) in world_rays.iter().enumerate() {
+            // Stage 2: AABB bounding check.
+            if !ray_intersects_aabb(ray, transform, aabb) {
+                continue;
+            }
+
+            // Stage 3: precise triangle-level intersection.
             if let Some((hit_result, distance)) = mesh_handle.and_then(|handle| {
                 ray_cast_hit_test_inner(ray, transform, handle, &meshes, dimensions)
             }) {
@@ -1104,19 +1302,24 @@ pub fn mouse_input_system(
     }
 
     if hit_candidates.is_empty() {
+        *last_hovered = None;
         return;
     }
 
     hit_candidates.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
 
     if let Some((entity, hit_result, _sort_key)) = hit_candidates.first() {
-        emit_mouse_move(
-            *entity,
-            hit_result.col,
-            hit_result.row,
-            &surfaces,
-            &mut events,
-        );
+        let hovered = (*entity, hit_result.col, hit_result.row);
+        if *last_hovered != Some(hovered) {
+            emit_mouse_move(
+                *entity,
+                hit_result.col,
+                hit_result.row,
+                &surfaces,
+                &mut events,
+            );
+            *last_hovered = Some(hovered);
+        }
         emit_button_events(
             *entity,
             hit_result.col,

@@ -1,13 +1,13 @@
 [package]
 name = "bevy_tui_texture"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.96"
 authors = ["TTT"]
 autoexamples = false
 license = "MIT"
 keywords = ["gamedev", "bevy", "ratatui", "terminal", "tui"]
-categories = ["command-line-utilities", "game-development", "multimedia", "wasm"]
+categories = ["gui", "game-development", "multimedia", "wasm"]
 build = false
 readme = "README.md"
 description = "A Bevy plugin for rendering terminal-style UIs using ratatui and WGPU"
@@ -23,6 +23,15 @@ keyboard_input = []
 mouse_input = []
 bold_italic_fonts = []
 emoji = ["dep:unicode-properties"]
+# Bypasses rustybuzz shaping for rows where every cell is a single ASCII
+# printable byte with a glyph present in the row's font - see
+# IMPROVEMENT.md A3. Off by default: skipping real shaping means a glyph's
+# rustybuzz-computed x_offset (kerning/bearing) is assumed to be zero,
+# which holds for most monospace fonts' basic Latin glyphs but isn't
+# guaranteed for all of them. Requires `bold_italic_fonts` to stay
+# disabled (that feature makes per-cell font selection meaningful, which
+# this path's single-font-per-row assumption does not account for).
+ascii_fast_shaping = []
 
 # [profile.*] in a library manifest only affects builds *in this workspace*
 # (i.e. these examples/benchmarks) - Cargo ignores a dependency's own
@@ -165,6 +174,9 @@ path = "examples/helloworld.rs"
 [[example]]
 name = "benchmark"
 path = "examples/benchmark.rs"
+[[example]]
+name = "benchmark_partial"
+path = "examples/benchmark_partial.rs"
 [[example]]
 name = "shader_mesh"
 path = "examples/shader_mesh.rs"

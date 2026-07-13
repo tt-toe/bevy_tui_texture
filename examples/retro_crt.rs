@@ -20,6 +20,7 @@
 // Press ESC to quit (native only)
 
 use bevy::app::AppExit;
+use bevy::asset::AssetMetaCheck;
 #[cfg(not(target_arch = "wasm32"))]
 use bevy::core_pipeline::oit::OrderIndependentTransparencySettings;
 #[cfg(target_arch = "wasm32")]
@@ -44,6 +45,30 @@ use bevy_tui_texture::prelude::*;
 use bevy_tui_texture::Font as TerminalFont;
 
 pub fn main() {
+    #[cfg(not(target_arch = "wasm32"))]
+    build_app().run();
+    // Native-only entry point - `wasm_main` in wasm_demo.rs is the wasm32
+    // entry and calls `build_app` itself (it needs the wasm-only parameter
+    // below), so this branch never runs there; `main` still needs a body
+    // for wasm32's obligatory `fn main`, see wasm_demo.rs's own stub.
+    #[cfg(target_arch = "wasm32")]
+    build_app("assets").run();
+}
+
+/// Builds the fully configured scene `App` without running it. Split from
+/// `main` so examples/wasm_demo.rs can register its wasm-only boot-status
+/// reporting systems (which need this module's `CrtMaterial` type) on top
+/// before calling `run()` - keeping that browser plumbing out of this file.
+///
+/// `asset_file_path` (wasm32 only) is the asset root bevy's `AssetPlugin`
+/// fetches from, as a URL PATH RELATIVE TO THE HOSTING PAGE (not the
+/// filesystem) - e.g. `"../assets"` if the page lives one directory below
+/// the assets folder. Left for the caller to supply because it depends
+/// entirely on how the wasm build is hosted, which wasm_demo.rs - not this
+/// scene file - owns (see its module doc comment). Native has no such
+/// decision to make: assets are always read from `examples/assets`
+/// (relative to the crate root / `cargo run`'s cwd), hard-coded below.
+pub(crate) fn build_app(#[cfg(target_arch = "wasm32")] asset_file_path: &str) -> App {
     let window_plugin = WindowPlugin {
         primary_window: Some(Window {
             title: "CRT Effect with Mesh3d".to_string(),
@@ -61,7 +86,14 @@ pub fn main() {
 
     let mut app = App::new();
     #[cfg(not(target_arch = "wasm32"))]
-    app.add_plugins(DefaultPlugins.set(window_plugin));
+    app.add_plugins(DefaultPlugins.set(window_plugin).set(AssetPlugin {
+        file_path: "examples/assets".into(),
+        // This project ships no `.meta` sidecar files anywhere; checking
+        // for them just adds a failed lookup (a 404 over HTTP on wasm,
+        // logged as a console error) per asset for no benefit.
+        meta_check: AssetMetaCheck::Never,
+        ..default()
+    }));
     // `WgpuSettings::default()`'s `priority` is `Functionality`, which makes
     // `bevy_render::renderer::initialize_renderer` DISCARD the safe
     // `downlevel_webgl2_defaults()` limits it already computed and replace
@@ -74,15 +106,27 @@ pub fn main() {
     // downlevel limits/features instead of trusting the adapter's raw
     // report.
     #[cfg(target_arch = "wasm32")]
-    app.add_plugins(DefaultPlugins.set(window_plugin).set(bevy::render::RenderPlugin {
-        render_creation: bevy::render::settings::RenderCreation::Automatic(Box::new(
-            bevy::render::settings::WgpuSettings {
-                priority: bevy::render::settings::WgpuSettingsPriority::WebGL2,
+    app.add_plugins(
+        DefaultPlugins
+            .set(window_plugin)
+            .set(bevy::render::RenderPlugin {
+                render_creation: bevy::render::settings::RenderCreation::Automatic(Box::new(
+                    bevy::render::settings::WgpuSettings {
+                        priority: bevy::render::settings::WgpuSettingsPriority::WebGL2,
+                        ..default()
+                    },
+                )),
                 ..default()
-            },
-        )),
-        ..default()
-    }));
+            })
+            .set(AssetPlugin {
+                file_path: asset_file_path.into(),
+                // See the native branch above for why - same reasoning,
+                // and doubly worth it on wasm where the failed lookup is a
+                // visible 404 in the browser's network/console tabs.
+                meta_check: AssetMetaCheck::Never,
+                ..default()
+            }),
+    );
 
     app.add_plugins(MaterialPlugin::<CrtMaterial>::default())
         .add_plugins(MaterialPlugin::<BlurMaterial>::default())
@@ -105,13 +149,14 @@ pub fn main() {
         )
         .add_systems(Update, update_crt_uniforms)
         .add_systems(Update, update_blur_uniforms)
-        .add_systems(Update, update_directional_light)
-        .run();
+        .add_systems(Update, update_directional_light);
+
+    app
 }
 
 // CRT effect uniforms (matches WGSL memory layout)
 #[derive(Clone, Copy, Debug, ShaderType, Reflect)]
-struct CrtUniforms {
+pub(crate) struct CrtUniforms {
     effect_intensity: f32,     // 0.0 = off, 1.0 = full effect
     time: f32,                 // For animated scan lines
     scan_line_intensity: f32,  // How pronounced scan lines are
@@ -120,7 +165,7 @@ struct CrtUniforms {
 
 // Material extension for CRT effects
 #[derive(Asset, AsBindGroup, Clone, Reflect, Debug)]
-struct CrtExtension {
+pub(crate) struct CrtExtension {
     #[uniform(100)] // Binding 100 - safely above StandardMaterial's 0-30 range
     pub uniforms: CrtUniforms,
 }
@@ -131,8 +176,9 @@ impl MaterialExtension for CrtExtension {
     }
 }
 
-// Convenient type alias for our extended material
-type CrtMaterial = ExtendedMaterial<StandardMaterial, CrtExtension>;
+// Convenient type alias for our extended material (pub(crate): wasm_demo.rs's
+// boot-status reporting watches for this material landing on the screen mesh)
+pub(crate) type CrtMaterial = ExtendedMaterial<StandardMaterial, CrtExtension>;
 
 // Blur effect uniforms (matches WGSL memory layout)
 #[derive(Clone, Copy, Debug, ShaderType, Reflect)]
@@ -329,7 +375,7 @@ impl Default for AppState {
             button_clicked: false,
             button_click_count: 0,
             // Dim ambient light so the CRT screen (unlit + emissive) stands out
-            light_illuminance: 1500.0,
+            light_illuminance: 2000.0,
             shadows_enabled: true,          // shadows on by default
             camera_mode: CameraMode::Orbit, // default: orbiting camera
             selected_tab: 0,
@@ -379,7 +425,7 @@ fn setup(
     // Load font
     let font_data = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/assets/fonts/fusion-pixel-10px-monospaced-ja.ttf"
+        "/examples/assets/fonts/fusion-pixel-10px-monospaced-ja.ttf"
     ));
     let font = TerminalFont::new(font_data).expect("Failed to load font");
     let fonts = Arc::new(Fonts::new(font, 16));
@@ -464,7 +510,7 @@ fn setup(
     // from AppState every frame, so match its initial values here too)
     commands.spawn((
         DirectionalLight {
-            illuminance: 1500.0,
+            illuminance: 2000.0,
             shadow_maps_enabled: true, // bevy 0.19 rename
             ..default()
         },

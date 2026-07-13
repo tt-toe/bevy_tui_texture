@@ -12,14 +12,31 @@
       width: 100%;
       height: 100%;
       overflow: hidden;
+      /* Chrome/Firefox honor this and stop rubber-band/glow overscroll
+         chaining outright. Desktop Safari (macOS trackpads in particular)
+         still elastic-bounces the page past this - not fully suppressible
+         from CSS alone - so it's paired with the flex centering below as a
+         fallback: when a bounce reveals a sliver of html/body's background
+         past the canvas edge, centering the canvas (rather than the
+         default block-flow top/left anchoring) keeps that reveal
+         symmetric instead of only ever showing on one side. */
+      overscroll-behavior: none;
       background: #101014;
+      display: flex;
+      align-items: center;
+      justify-content: center;
     }
     /* The demo renders into this canvas (Window.canvas = "#bevy") and
-       follows its parent's size (fit_canvas_to_parent = true). */
+       follows its parent's size (fit_canvas_to_parent = true). Explicit
+       max-width/max-height keep it from ever exceeding the flex
+       container's box (matters once the container centers rather than
+       just stretching its single child to fill). */
     canvas#bevy {
       display: block;
       width: 100%;
       height: 100%;
+      max-width: 100%;
+      max-height: 100%;
       outline: none;
     }
     #loading {
@@ -77,16 +94,41 @@
     // from a previous deploy, `WebAssembly.instantiate` fails with a
     // `LinkError` ("function import requires a callable") because the
     // mismatched JS glue and wasm binary disagree on import/export names.
-    // Bump ASSET_VERSION (see docs/README.md's rebuild steps) every time
+    // Bump ASSET_VERSION (see examples/web/README.md's rebuild steps) every time
     // wasm_demo.js/wasm_demo_bg.wasm are regenerated, so browsers that
     // cached an older pair are forced to re-fetch both together instead of
     // silently mixing old and new.
-    const ASSET_VERSION = '2026-07-07-2';
+    const ASSET_VERSION = '0';
 
     const textEl = document.getElementById('loading-text');
     const fillEl = document.getElementById('progress-fill');
     const status = (msg) => {
       if (textEl) textEl.textContent = msg;
+    };
+
+    // Boot-progress hook called from the wasm side (`demo_status` /
+    // `report_wasm_boot_status` in examples/retro_crt.rs). The overlay stays
+    // up long past init(): engine startup, asset loading, and the synchronous
+    // WebGL2 shader compiles all still show a black canvas otherwise. The
+    // wasm sends staged milestone strings as they happen, and the special
+    // string 'ready' - sent one frame after the CRT model's material lands,
+    // i.e. after its first real render - finally removes the overlay.
+    window.__demoStatus = (msg) => {
+      if (msg === 'ready') {
+        document.getElementById('loading')?.remove();
+      } else {
+        status(msg);
+      }
+    };
+
+    // Shown when init() hands control to the engine (see below). Set BEFORE
+    // the first engine frame runs so this exact text is what stays frozen on
+    // screen while WebGL2 compiles the base pipelines synchronously (the
+    // browser cannot repaint during that stall - it may even show a
+    // "page unresponsive" dialog; waiting is the right call).
+    const engineStarting = () => {
+      fillEl.classList.add('indeterminate');
+      status('starting engine — compiling shaders … (the page may freeze for a while)');
     };
 
     // Fetches `url` while reporting download progress through `onProgress`
@@ -173,11 +215,16 @@
         // through to the deprecated branch and just warned (harmlessly) -
         // the current convention wraps it explicitly instead.
         await init({ module_or_path: wasmResponse });
-        document.getElementById('loading')?.remove();
+        // init() resolving/throwing only means the event loop is REGISTERED -
+        // renderer init, shader compiles, and asset loads all come after, on
+        // a still-black canvas. Keep the overlay; the wasm side reports
+        // progress via window.__demoStatus above and sends 'ready' once the
+        // CRT model has actually rendered.
+        engineStarting();
       } catch (e) {
         // winit's control-flow exception is expected on startup, not an error.
         if (`${e}`.includes('Using exceptions for control flow')) {
-          document.getElementById('loading')?.remove();
+          engineStarting();
         } else {
           status(`failed to start: ${e}`);
           throw e;

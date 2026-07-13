@@ -47,13 +47,19 @@ impl Deref for Entry {
 pub(crate) struct Atlas {
     lru: Lru<Key, CacheRect>,
     width: u32,
-    height: u32,
 
     entry_width: u32,
     entry_height: u32,
 
     next_entry: u32,
     max_entries: u32,
+
+    /// Bumped every time a slot is reassigned to a different key (eviction
+    /// in `get`, or a full `clear`) - see IMPROVEMENT.md A2. A cached
+    /// row's UV rects are only trustworthy as long as no reassignment has
+    /// happened since they were recorded; comparing this counter is how
+    /// `BevyTerminalBackend::flush` (the only reader) detects that.
+    generation: u64,
 }
 
 impl Atlas {
@@ -70,29 +76,17 @@ impl Atlas {
                 NonZeroUsize::new(max_entries as usize).expect("Max entries must be non-zero"),
             ),
             width,
-            height,
             entry_width,
             entry_height,
             next_entry: 0,
             max_entries,
+            generation: 0,
         }
     }
 
-    pub(crate) fn match_fonts(&mut self, fonts: &Fonts) {
-        self.clear();
-        self.entry_width = fonts.min_width_px() * 2;
-        self.entry_height = fonts.height_px();
-        self.max_entries = (self.width / self.entry_width) * (self.height / self.entry_height);
-
-        info!(
-            "Glyph atlas: {}x{}px in use, entries {}x{}px, capacity {}",
-            self.width, self.height, self.entry_width, self.entry_height, self.max_entries
-        );
-    }
-
-    fn clear(&mut self) {
-        self.lru.clear();
-        self.next_entry = 0;
+    /// Current generation counter - see the field doc on [`Atlas::generation`].
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub(crate) fn try_get(&mut self, key: &Key) -> Option<Entry> {
@@ -102,16 +96,19 @@ impl Atlas {
     pub(crate) fn get(&mut self, key: &Key, width: u32, height: u32) -> Entry {
         debug_assert_eq!(
             self.entry_height, height,
-            "Internal height not equal to provided height. Did you forget to call match_fonts?"
+            "Internal height not equal to provided height - entry size is fixed at Atlas::new time"
         );
         debug_assert_eq!(
             self.entry_width % width,
             0,
-            "Internal width not a multiple of provided width. Did you forget to call match_fonts?"
+            "Internal width not a multiple of provided width - entry size is fixed at Atlas::new time"
         );
 
         self.try_get(key).unwrap_or_else(|| {
             let rect = if self.next_entry == self.max_entries {
+                // Reassigning an existing slot to a new key - any row
+                // geometry caching that slot's old UV rect is now stale.
+                self.generation += 1;
                 self.lru.pop().expect("Atlas has zero max entries!").1
             } else {
                 let entry = self.next_entry;
@@ -150,7 +147,7 @@ mod tests {
         let fonts = Fonts::new(
             Font::new(include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/assets/fonts/Mplus1Code-Regular.ttf"
+                "/examples/assets/fonts/Mplus1Code-Regular.ttf"
             )))
             .unwrap(),
             24,

@@ -78,7 +78,7 @@ fn setup_terminal(mut commands: Commands) {
     // Load font
     let font_data = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/assets/fonts/Mplus1Code-Regular.ttf"
+        "/examples/assets/fonts/Mplus1Code-Regular.ttf"
     ));
 
     let font = TerminalFont::new(font_data).expect("Failed to load font");
@@ -760,6 +760,6 @@ fn rotate_plane(time: Res<Time>, mut query: Query<&mut Transform, With<RotatingP
     for mut transform in &mut query {
         // Seesaw rotation: oscillate ±45° around Z axis
         let angle = (time.elapsed_secs() * 0.8).sin() * std::f32::consts::FRAC_PI_4;
-        transform.rotation = Quat::from_rotation_z(angle);
+        transform.rotation = Quat::from_rotation_y(angle);
     }
 }

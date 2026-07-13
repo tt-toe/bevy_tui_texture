@@ -106,7 +106,7 @@ fn setup(
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.6, 0.4, 0.0)),
     ));
 
-    let font_data = include_bytes!("../assets/fonts/Mplus1Code-Regular.ttf");
+    let font_data = include_bytes!("assets/fonts/Mplus1Code-Regular.ttf");
     let font = TerminalFont::new(font_data).expect("failed to load font");
     let fonts = Arc::new(Fonts::new(font, 24));
 

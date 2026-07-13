@@ -7,17 +7,19 @@
 // what's specific to being loaded as a browser module:
 // - `#[wasm_bindgen(start)]` entry + `console_error_panic_hook`,
 // - a WebGL2 availability probe (see docs/index.html for the matching JS
-//   probe, which runs first and avoids fetching the wasm at all if it fails).
+//   probe, which runs first and avoids fetching the wasm at all if it fails),
+// - boot-progress reporting to the page's loading overlay (`boot_status`
+//   below) - registered on top of `retro_crt::build_app()` before `run()`.
 //
-// Build the browser-ready site into docs/ (see docs/README.md for local
-// preview instructions):
+// Build the browser-ready site into examples/web/ (see examples/web/README.md
+// for local preview instructions):
 //   cargo build --example wasm_demo --target wasm32-unknown-unknown --profile wasm-release
-//   wasm-bindgen --target web --no-typescript --out-dir docs \
+//   wasm-bindgen --target web --no-typescript --out-dir examples/web \
 //     target/wasm32-unknown-unknown/wasm-release/examples/wasm_demo.wasm
 //   wasm-opt -Oz --strip-debug --strip-producers --enable-nontrapping-float-to-int \
 //     --enable-bulk-memory --enable-sign-ext --enable-mutable-globals \
 //     --enable-simd --enable-reference-types \
-//     -o docs/wasm_demo_bg.wasm docs/wasm_demo_bg.wasm
+//     -o examples/web/wasm_demo_bg.wasm examples/web/wasm_demo_bg.wasm
 
 #[path = "retro_crt.rs"]
 mod retro_crt;
@@ -37,8 +39,9 @@ pub fn wasm_main() {
     // WebGL2 (e.g. Brave with aggressive fingerprinting shields, software-
     // rendering-only environments) panics deep inside wgpu surface
     // creation; per the demo's contract we instead report and exit.
-    // (index.html performs the same probe before even fetching the wasm -
-    // this is the defense for hosts that serve the module differently.)
+    // (examples/web/index.html performs the same probe before even
+    // fetching the wasm - this is the defense for hosts that serve the
+    // module differently.)
     let webgl2_available = (|| {
         use wasm_bindgen::JsCast;
         let canvas = web_sys::window()?
@@ -62,7 +65,124 @@ pub fn wasm_main() {
 
     suppress_canvas_escape_key();
     clamp_canvas_to_safe_texture_size();
-    retro_crt::main();
+    // The asset root, as a URL path relative to the hosting page - see
+    // `build_app`'s doc comment. examples/web/index.html is served one
+    // directory below examples/assets/ (httpd rooted at `examples/`; see
+    // examples/web/README.md), hence "../assets".
+    let mut app = retro_crt::build_app("../assets");
+    boot_status::register(&mut app);
+    app.run();
+}
+
+/// Boot-progress reporting to the page's loading overlay.
+/// examples/web/index.html keeps the overlay up long past wasm-bindgen's
+/// `init()` - the winit control-flow exception only means the event loop is
+/// REGISTERED; renderer init, the synchronous WebGL2 shader compiles, and
+/// all asset loads come after, on a still-black canvas - and waits for the
+/// milestone strings sent from here via `window.__demoStatus(msg)`. The
+/// special string `"ready"` makes it remove the overlay.
+///
+/// Lives here rather than in retro_crt.rs because it is pure browser
+/// plumbing: the scene only exposes `build_app()` (so `register` can add
+/// these systems before `run()`) and the `CrtMaterial` type.
+#[cfg(target_arch = "wasm32")]
+mod boot_status {
+    use bevy::prelude::*;
+    use bevy::world_serialization::WorldAssetRoot;
+
+    use crate::retro_crt::CrtMaterial;
+
+    /// Registers the milestone reporter.
+    pub fn register(app: &mut App) {
+        app.add_systems(Update, report_boot_status);
+    }
+
+    /// Forwards a milestone to `window.__demoStatus`. If the hook is absent
+    /// (a host serving the module without the overlay), silently no-ops.
+    fn demo_status(msg: &str) {
+        use wasm_bindgen::{JsCast, JsValue};
+        let Some(window) = web_sys::window() else {
+            return;
+        };
+        let Ok(hook) = js_sys::Reflect::get(&window, &"__demoStatus".into()) else {
+            return;
+        };
+        let Ok(hook) = hook.dyn_into::<js_sys::Function>() else {
+            return;
+        };
+        let _ = hook.call1(&JsValue::NULL, &msg.into());
+    }
+
+    /// Drives the loading overlay's staged status text. Timing note: on wasm
+    /// the main schedule and the render (where WebGL2 compiles shaders
+    /// synchronously, freezing the tab) run inside the same rAF callback, so
+    /// a message sent from an `Update` only paints AFTER that frame's
+    /// compile stall - each stage's text describes what comes NEXT, and the
+    /// text visible DURING a stall is whatever was set the frame before.
+    ///
+    /// - Stage 0: first `Update` ever - the base-pipeline compile stall is
+    ///   this same frame's render; announce the asset loading that follows.
+    /// - Stage 1: the glTF scene got spawned (`WorldAssetRoot` appeared).
+    /// - Stage 2: the CRT material landed on the monitor mesh. Landing does
+    ///   NOT mean the mesh renders yet: bevy skips a mesh whose specialized
+    ///   pipeline isn't compiled, and `CrtMaterial`'s pipeline can't even
+    ///   start compiling until `crt_extended.wgsl` finishes loading over
+    ///   HTTP.
+    /// - Stage 3: hold for a fixed `GRACE_PERIOD_SECONDS` after the material
+    ///   landed, then send "ready" - index.html removes the overlay.
+    ///
+    ///   An earlier version of this stage waited for a render-world pipeline
+    ///   cache counter to read zero instead of a fixed delay, to close the
+    ///   overlay exactly when the CRT screen's own pipeline finished
+    ///   compiling rather than guessing. That counted the ENTIRE
+    ///   `PipelineCache`, though, not just the CRT screen's pipeline - and
+    ///   in this scene (auto-orbit camera, moving shadows) something else
+    ///   keeps getting re-specialized every frame, so the global count
+    ///   never reliably reached zero. Confirmed in testing: the CRT screen
+    ///   was already rendering correctly while the overlay lingered for the
+    ///   full fallback timeout regardless. A plain fixed delay is both
+    ///   simpler and - per that same testing - actually more accurate here.
+    fn report_boot_status(
+        scene_spawned: Query<(), Added<WorldAssetRoot>>,
+        crt_material_added: Query<(), Added<MeshMaterial3d<CrtMaterial>>>,
+        time: Res<Time>,
+        mut stage: Local<u8>,
+        mut stage3_elapsed_secs: Local<f32>,
+    ) {
+        /// The CRT screen's own compile-and-first-render stall measured
+        /// under 1.5s total (as `requestAnimationFrame` "Violation" log
+        /// entries) on a fast native GPU in testing; tripled for headroom
+        /// on slower devices/GPUs.
+        const GRACE_PERIOD_SECONDS: f32 = 4.5;
+
+        match *stage {
+            0 => {
+                demo_status("loading 3D model (2.5 MB) …");
+                *stage = 1;
+            }
+            1 => {
+                if !scene_spawned.is_empty() {
+                    demo_status("compiling CRT shaders …");
+                    *stage = 2;
+                }
+            }
+            2 => {
+                if !crt_material_added.is_empty() {
+                    demo_status("waiting for material …");
+                    *stage = 3;
+                    *stage3_elapsed_secs = 0.0;
+                }
+            }
+            3 => {
+                *stage3_elapsed_secs += time.delta_secs();
+                if *stage3_elapsed_secs >= GRACE_PERIOD_SECONDS {
+                    demo_status("ready");
+                    *stage = 4;
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 // retro_crt.rs's `Window { canvas: "#bevy", fit_canvas_to_parent: true, .. }`
@@ -106,10 +226,7 @@ fn clamp_canvas_to_safe_texture_size() {
     let Some(window) = web_sys::window() else {
         return;
     };
-    let Some(canvas) = window
-        .document()
-        .and_then(|d| d.get_element_by_id("bevy"))
-    else {
+    let Some(canvas) = window.document().and_then(|d| d.get_element_by_id("bevy")) else {
         return;
     };
     let dpr = window.device_pixel_ratio();
@@ -139,8 +256,8 @@ fn clamp_canvas_to_safe_texture_size() {
 // doesn't exist there.
 #[cfg(target_arch = "wasm32")]
 fn suppress_canvas_escape_key() {
-    use wasm_bindgen::JsCast;
     use wasm_bindgen::closure::Closure;
+    use wasm_bindgen::JsCast;
 
     let Some(canvas) = web_sys::window()
         .and_then(|w| w.document())
@@ -152,14 +269,13 @@ fn suppress_canvas_escape_key() {
     // Leaked deliberately (`forget`): this listener must outlive the
     // function and live for the rest of the page's life, exactly like
     // wasm-bindgen's own generated glue does for its callbacks.
-    let closure = Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(
-        |event: web_sys::KeyboardEvent| {
+    let closure =
+        Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(|event: web_sys::KeyboardEvent| {
             if event.key() == "Escape" {
                 event.stop_immediate_propagation();
                 event.prevent_default();
             }
-        },
-    );
+        });
     let _ = canvas.add_event_listener_with_callback("keydown", closure.as_ref().unchecked_ref());
     closure.forget();
 }
