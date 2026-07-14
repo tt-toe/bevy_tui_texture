@@ -1483,7 +1483,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_tui_texture"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "bevy",
  "bitvec",
