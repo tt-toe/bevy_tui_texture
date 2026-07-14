@@ -4,6 +4,8 @@
 
 Seamlessly integrate terminal UIs into your Bevy applications. Display ratatui widgets on 2D sprites, 3D meshes, or UI elements with full GPU acceleration.
 
+**[WASM DEMO](https://tt-toe.github.io/bevy_tui_texture/examples/web/)**
+
 https://github.com/user-attachments/assets/64e1e136-7d2d-4e32-9c10-1da2cfb78ccd
 
 ## Features
