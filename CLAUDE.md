@@ -1,323 +1,196 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code (claude.ai/code) when working in this repository.
 
 ## Project Overview
 
-`bevy_tui_texture` is a Bevy plugin that renders ratatui terminal UIs as GPU textures using WGPU. It enables displaying terminal-style UIs on 2D sprites, 3D meshes, or UI elements with full GPU acceleration.
+`bevy_tui_texture` renders ratatui terminal UIs as GPU textures inside a
+Bevy app — on 2D UI nodes, 3D meshes, or existing glTF screens — with no
+CPU readback anywhere in the hot path.
 
-**Key Integration**: Bridges Bevy 0.19 + ratatui 0.30.2 + WGPU 29
+**Version pins**: bevy 0.19 + ratatui 0.30.2 + wgpu 29 (wgpu must exactly
+match bevy's pin — bump together; both are re-exported so downstream code
+can name matching types).
 
-## Build Commands
+## Build & Verify
 
 ```bash
-# Build the library
-cargo build
+cargo build                       # library
+cargo build --release             # LTO fat, codegen-units=1
 
-# Build with release optimizations (LTO enabled, single codegen unit)
-cargo build --release
-
-# Run examples (development). ALWAYS use `cargo run --example`, not the bare
-# binary in target/ — assets live in examples/assets/ (shared with the wasm
-# build, see "WASM Demo Architecture" below) and are resolved via an
-# `AssetPlugin { file_path: "examples/assets", .. }` override relative to
-# CARGO_MANIFEST_DIR (== `cargo run`'s cwd); a bare binary looks next to the
+# Examples: ALWAYS `cargo run --example`, never the bare target/ binary —
+# assets live in examples/assets/ (shared with the wasm build) and resolve
+# via an `AssetPlugin { file_path: "examples/assets", .. }` override
+# relative to CARGO_MANIFEST_DIR; a bare binary looks next to the
 # executable and e.g. shader_mesh renders black.
 cargo run --example helloworld          # minimal static terminal
 cargo run --example widget_catalog_2d   # 2D UI, mouse hit-testing, CJK, glyphs
 cargo run --example widget_catalog_3d   # 3D mesh terminal with interaction
-cargo run --example world_terminal      # world-unit-sized in-game screen (TuiRequest::world_quad)
+cargo run --example world_terminal      # world-unit screen (TuiRequest::world_quad)
 cargo run --example multiple_terminals  # several terminals + Tab focus cycling
 cargo run --example shader_mesh         # ExtendedMaterial CRT shader effects
-cargo run --example retro_crt           # full CRT demo: glTF + ExtendedMaterial shader,
-                                        #   additive reflection, overlay UI, camera modes
-cargo run --example resize              # Tui::request_resize following the window size live
-cargo run --example transparent_world_quad  # HUD-style see-through screen (transparent_reset_bg + AlphaMode::Blend)
-cargo run --example benchmark           # full-frame rendering throughput (every cell redrawn each frame)
-cargo run --example benchmark_partial   # BENCH_MODE=static|partial - isolates the cost of unchanged-frame
-                                        #   and partial-row redraws (see the module doc comment)
+cargo run --example retro_crt           # full CRT demo: glTF + shader + overlay UI
+cargo run --example resize              # Tui::request_resize following the window
+cargo run --example transparent_world_quad  # see-through HUD screen
+cargo run --example benchmark           # full-frame throughput
+cargo run --example benchmark_partial   # BENCH_MODE=static|partial redraw costs
 
-# Run tests (no dedicated test directory - uses inline #[cfg(test)] modules
-# next to the code they cover). Almost all are pure-CPU (HitRegions,
-# pixel_to_cell/uv_to_cell coordinate mapping, Fonts::font_for_cell
-# fallback order, staging-row padding math, resize, attach-churn, ...) and
-# need no GPU at all; the one GPU-backed test
-# (flush_renders_drawn_content_synchronously) skips gracefully if no
-# adapter is available.
+# Tests: inline #[cfg(test)] modules next to the code (no tests/ dir).
+# Pure CPU except one GPU-backed test that skips without an adapter.
 cargo test
 
-# Same checks CI runs (.github/workflows/ci.yml):
+# What CI runs (.github/workflows/ci.yml):
+cargo test --all-features
 cargo clippy --all-features --all-targets -- -D warnings
 cargo doc --no-deps --all-features
-cargo check --lib --no-default-features
-cargo check --lib --no-default-features --features 2d
-cargo check --lib --no-default-features --features 3d
-
-# Examples log at RUST_LOG level via the dev-dependency bevy "bevy_log"
-# feature (the lib's own bevy is default-features=false and logs nothing).
-
-# WASM demo (browser-ready site into examples/web/; see "WASM Demo Architecture")
-cargo build --example wasm_demo --target wasm32-unknown-unknown --profile wasm-release
-wasm-bindgen --target web --no-typescript --out-dir examples/web \
-  target/wasm32-unknown-unknown/wasm-release/examples/wasm_demo.wasm
-wasm-opt -Oz --strip-debug --strip-producers \
-  --enable-nontrapping-float-to-int --enable-bulk-memory --enable-sign-ext \
-  --enable-mutable-globals --enable-simd --enable-reference-types \
-  -o examples/web/wasm_demo_bg.wasm examples/web/wasm_demo_bg.wasm
+cargo check --lib --no-default-features            # + --features 2d / 3d variants
+cargo check --target wasm32-unknown-unknown --example wasm_demo
 ```
+
+Examples log at `RUST_LOG` level via the dev-dependency bevy's `bevy_log`
+feature (the lib's own bevy is default-features=false and logs nothing).
 
 ## Feature Flags
 
-- `2d` (default) - 2D UI terminals (`TuiUi`, `TuiKind::Ui`)
-- `3d` (default) - 3D mesh terminals (`TuiKind::WorldQuad`, `AttachTerminal`, mesh raycasting)
-- `keyboard_input` (default) - Keyboard event handling
-- `mouse_input` (default) - Mouse event handling for 2D UI and 3D mesh terminals
-- `bold_italic_fonts` (opt-in) - Real bold/italic font slots (`Fonts::add_bold_fonts`/`add_italic_fonts`/`add_bold_italic_fonts`); without it, bold/italic are faked from the regular font
-- `emoji` (opt-in, WIP) - Emoji-aware glyph handling (pulls in `unicode-properties`)
+- `2d` (default) — 2D UI terminals (`TuiUi`, `TuiKind::Ui`)
+- `3d` (default) — 3D mesh terminals (`TuiKind::WorldQuad`, `AttachTerminal`, mesh raycasting)
+- `keyboard_input` (default) — keyboard event handling
+- `mouse_input` (default) — mouse events for 2D UI and 3D mesh terminals;
+  touch rides the same path (touch position feeds `CursorPosition`, a tap
+  emulates the left button)
+- `bold_italic_fonts` (opt-in) — real bold/italic font slots
+  (`Fonts::add_bold_fonts`/`add_italic_fonts`/`add_bold_italic_fonts`);
+  otherwise bold/italic are faked from the regular font
+- `emoji` (opt-in, WIP) — emoji-aware glyph handling (pulls in `unicode-properties`)
+- `ascii_fast_shaping` (opt-in) — bypasses rustybuzz for rows that are all
+  single ASCII printable bytes (see IMPROVEMENT.md A3). Assumes zero
+  x_offset, which most monospace fonts satisfy but isn't guaranteed.
+  Silently inert when `bold_italic_fonts` is enabled (that feature makes
+  per-cell font selection meaningful; this path assumes one font per row)
 
-`TuiKind`'s variants gate individually (`Ui` needs `2d`, `WorldQuad` needs
-`3d`, `Headless` is always available). Build with only one display surface,
-e.g.:
-```bash
-cargo build --no-default-features --features "3d,keyboard_input,mouse_input"
-```
-
-## WASM Demo Architecture
-
-`examples/wasm_demo.rs` is a thin wasm-bindgen shim around the full retro
-CRT scene (glTF model + `ExtendedMaterial` CRT shader + additive
-reflection + overlay UI + camera modes), packaged as a static site in
-`examples/web/`.
-
-**Assets are shared between native and wasm** via a single
-`examples/assets/` directory (models, shaders, fonts) - there is no
-per-target copy to keep in sync. `examples/retro_crt.rs`'s `build_app`
-configures bevy's `AssetPlugin { file_path, .. }` per target: native reads
-`examples/assets` (relative to `cargo run`'s cwd == `CARGO_MANIFEST_DIR`);
-wasm fetches assets over HTTP relative to the *hosting page's URL*, via a
-`file_path` value `build_app` takes as a parameter (cfg-gated to wasm32
-only) rather than hard-coding - `wasm_demo.rs` supplies `"../assets"`,
-since `examples/web/index.html` is served one directory below
-`examples/assets/` (see "Local preview" below for the httpd root this
-requires). Compile-time-embedded fonts (`include_bytes!`) are unaffected
-by this - they reference `examples/assets/fonts/...` directly and need no
-`AssetPlugin` involvement.
-
-**The scene itself lives only in `examples/retro_crt.rs`** -
-`wasm_demo.rs` pulls it in with `#[path = "retro_crt.rs"] mod retro_crt;`
-and calls `retro_crt::build_app(..)` (marked `pub(crate)` for exactly this
-reason) instead of duplicating the source. `retro_crt.rs`'s few
-wasm32/WebGL2-only branches live inline behind
-`#[cfg(target_arch = "wasm32")]` in that one file - there is nothing left
-to keep in sync by hand:
-- the `Window { canvas: Some("#bevy"), fit_canvas_to_parent: true, .. }`
-  fields (harmless no-ops on native, so unconditional),
-- OIT (`OrderIndependentTransparencySettings`) cfg-gated OFF on wasm -
-  it needs storage buffers, which WebGL2 does not have,
-- `Tonemapping::KhronosPbrNeutral` set explicitly on the camera on wasm
-  (instead of `Camera3d`'s default `TonyMcMapface`) - see "Binary size"
-  below.
-
-`wasm_demo.rs` itself only adds what's specific to being loaded as a
-browser module: the `#[wasm_bindgen(start)]` entry + `console_error_panic_hook`,
-the Rust-side WebGL2 probe (see "Common Gotchas" below), the `"../assets"`
-`AssetPlugin` override described above, and the `boot_status` module —
-staged loading-overlay milestones sent to `window.__demoStatus` in
-examples/web/index.html, which keeps the overlay up past wasm-bindgen
-`init()` (that only means the event loop got registered) until the CRT
-screen mesh is actually drawable. "Drawable" is detected via a
-render-world system counting pending `PipelineCache` compiles into a shared
-atomic — a merely-inserted material does NOT mean its mesh renders (bevy
-skips meshes whose specialized pipeline is still compiling / whose WGSL is
-still loading over HTTP).
-
-**Build pipeline** (no trunk; plain cargo + wasm-bindgen CLI, whose
-version must exactly match `Cargo.lock`'s `wasm-bindgen`, then `wasm-opt`
-from binaryen for size reduction):
-```bash
-cargo build --example wasm_demo --target wasm32-unknown-unknown --profile wasm-release
-wasm-bindgen --target web --no-typescript --out-dir examples/web \
-  target/wasm32-unknown-unknown/wasm-release/examples/wasm_demo.wasm
-wasm-opt -Oz --strip-debug --strip-producers \
-  --enable-nontrapping-float-to-int --enable-bulk-memory --enable-sign-ext \
-  --enable-mutable-globals --enable-simd --enable-reference-types \
-  -o examples/web/wasm_demo_bg.wasm examples/web/wasm_demo_bg.wasm
-```
-Generated (gitignored, `*.wasm` + `wasm_demo.js`): `examples/web/wasm_demo.js`
-+ `examples/web/wasm_demo_bg.wasm`. Hand-maintained and committed:
-`examples/web/index.html`, `examples/web/README.md` (deploy + local preview
-instructions), `examples/web/.nojekyll`. No asset-copying step -
-`examples/assets/` is fetched directly from its sibling location at
-runtime, so there is nothing to duplicate or fall out of sync.
-
-**Local preview**: `examples/web/index.html` fetches assets from the
-sibling `../assets/`, so the httpd **must be rooted at `examples/`**, not
-`examples/web/` itself (`python3 -m http.server 8080` from inside
-`examples/`, then open `http://127.0.0.1:8080/web/`); `file://` does not
-work for module scripts/wasm fetch either way. Details in
-`examples/web/README.md`.
-
-**Loading UI** (`examples/web/index.html`): the `.wasm` is tens of MB even
-after `wasm-opt`, so the loading screen shows a real progress bar, not just
-a static "loading…" label that looks stuck. It fetches
-`wasm_demo_bg.wasm` itself via a wrapped `ReadableStream` that reports
-bytes-read as they arrive, re-packages them into a fresh `Response` (so
-`WebAssembly.instantiateStreaming` still gets used - no need to buffer the
-whole file first), and passes that `Response` into wasm-bindgen's `init()`.
-Falls back to an indeterminate sliding-stripe animation if the server
-doesn't send `Content-Length`.
-
-**Overlay panel collapse**: clicking the overlay's title bar (registered
-as `Hit::PanelTitleBar` in `retro_crt.rs`, spanning the full top border
-row in both states) toggles `AppState::panel_collapsed`, which
-`render_overlay_terminal` acts on via `Tui::request_resize(cols, 1)` -
-folding the panel down to just its title bar. No manual Node-size
-bookkeeping needed: `request_resize` recreates the destination `Image` in
-place at the new pixel size, and bevy_ui's image-content-size system
-re-measures the `ImageNode` from the (now smaller) `Image` every frame, so
-the on-screen Node shrinks/grows to match automatically.
-
-**Binary size** (~31MB raw cargo output -> ~24MB final, see
-`examples/web/README.md`'s "Binary size" section for the full breakdown): the
-`wasm-opt -Oz` pass above accounts for most of the reduction (~15%); the
-rest comes from `examples/wasm_demo.rs`'s wasm-only `bevy` dev-dependency
-(Cargo.toml's `[target.'cfg(target_arch = "wasm32")'.dev-dependencies]`
-block) dropping the `tonemapping_luts`/`zstd_rust` features (a ~680KB
-embedded LUT + ktx2/zstd decoder, needed by `Camera3d`'s default
-tonemapper but not by `Tonemapping::KhronosPbrNeutral`) and the native-only
-`x11` feature. `#![no_std]` is not achievable here - Bevy and this crate's
-own rendering/font stack (`raqote`, `rustybuzz`, `ratatui`) depend on
-`std` throughout; there is no build-flag path to `no_std` short of forking
-those crates.
+`TuiKind` variants gate individually: `Ui` needs `2d`, `WorldQuad` needs
+`3d`, `Headless` is always available. One-surface builds work:
+`cargo build --no-default-features --features "3d,keyboard_input,mouse_input"`.
 
 ## Core Architecture
 
-### Abstraction Ladder
+### Abstraction ladder (src/setup.rs)
 
-1. **`TerminalTexture` + `Tui::from_texture_state`** (src/setup.rs) - manual
-   entity spawning, maximum flexibility (see `examples/tui_component.rs`,
-   `examples/shader_mesh.rs`). User manages: entity spawning, input
-   components, materials.
-
-2. **`TuiRequest`** (src/setup.rs) - declarative spawning: spawn the
-   request component (plus any `Node`/`Transform`/markers), the plugin's
-   `materialize_tui_requests` system creates the texture and inserts the
-   terminal components next frame - **no render resources in user code**.
-   `TuiKind::Ui` (feature `2d`), `TuiKind::WorldQuad { height }` (feature
-   `3d`, world-unit-sized quad, width follows texture aspect ratio),
-   `TuiKind::Headless` (a `Tui` with no surface of its own). Fonts come as
+1. **`TuiRequest`** (default choice) — declarative: spawn the component
+   (plus any `Node`/`Transform`/markers), `materialize_tui_requests`
+   creates the texture and inserts the terminal components next frame — no
+   render resources in user code. `TuiKind::Ui` (2D), `TuiKind::WorldQuad
+   { height }` (world-unit quad, width follows texture aspect),
+   `TuiKind::Headless` (a `Tui` with no surface). Fonts arrive as
    `Arc<Fonts>` (`TuiFontSource::Ready`, via `Into`) or through the
-   AssetServer (`TuiFontSource::Asset` - the Wasm-safe path; the request
+   AssetServer (`TuiFontSource::Asset` — the Wasm-safe path; the request
    stays pending until the `.ttf` loads).
+2. **`AttachTerminal` + `AttachMaterial`** (feature `3d`) — put a
+   (typically headless) `Tui` on an *existing* mesh, e.g. a glTF
+   primitive. `attach_terminal_system` re-claims the material every frame
+   until the async loader stops overwriting it, then tracks the installed
+   handle in `TuiAttached` and goes idle (no archetype churn once settled).
+3. **`TerminalTexture::create` + `Tui::from_texture_state`** — manual
+   escape hatch (`examples/tui_component.rs`, `examples/shader_mesh.rs`).
 
-3. **`AttachTerminal` + `AttachMaterial`** (src/setup.rs, feature `3d`) -
-   attach a `Tui` to an *existing* mesh (e.g. a glTF primitive) instead of
-   spawning one; `attach_terminal_system` re-claims the material every frame
-   until a loader-driven overwrite (e.g. async glTF) stops recurring.
-   Combine with a `TuiKind::Headless` request for the `Tui` entity itself.
+All three share the same per-frame path below.
 
-All three levels share the same per-frame path: `Tui::draw()` (draws into
-ratatui's buffer, marks dirty) + the plugin's `gpu_flush_system` (pure CPU,
-extracts a draw payload for the render world to render - zero
-render-resource parameters needed in user draw systems, no material
-touching anywhere).
+### Rendering pipeline (the load-bearing part)
 
-### Module Organization
+1. `Tui::draw(|frame| ...)` / `draw_with_hits` — pure CPU, fills ratatui's
+   buffer, marks the `Tui` dirty **only if the diff changed a cell**.
+   Byte-identical redraws are free all the way down: ratatui always calls
+   `Backend::flush()`, but `BevyTerminalBackend::flush()` early-returns
+   before any shaping/vertex work when nothing changed. Calling `draw`
+   every frame is the intended pattern.
+2. If dirty, the plugin's `gpu_flush_system` (main world, pure CPU)
+   extracts a `TerminalDrawPayload` (pending glyph rasterizations +
+   vertex/index data); it also applies any pending `Tui::request_resize`
+   first (recreates the destination `Image` in place at the same handle,
+   syncs `TerminalDimensions`; `resize_world_quad_meshes` then fixes a
+   world quad's aspect on `Changed<TerminalDimensions>`).
+3. Render world: `extract_tui_draws` + `render_tui_textures`
+   (src/bevy_plugin.rs) render the payload — two passes, background quads
+   then glyphs (`TerminalGpuState::render` in src/backend/mod.rs) —
+   **directly into the destination `Image`'s own `GpuImage::texture_view`**,
+   the same texture any material's bind group already references. No asset
+   mutation, no material touching, for `StandardMaterial`,
+   `ExtendedMaterial`, or any custom `Material`. Both 2D (`ImageNode`) and
+   3D terminals update through this one path.
 
-**Backend Layer** (src/backend/):
-- `bevy_backend.rs` - Main ratatui backend implementation (`BevyTerminalBackend`)
-- `rasterize.rs` - Glyph rasterization using rustybuzz + raqote
-- `programmatic_glyphs/` - Box-drawing, braille, block elements, powerline (procedurally generated)
-- Two-pass rendering: background quads → foreground glyphs with alpha blending
+**Same-frame latency is structural**: `render_tui_textures` runs in the
+`RenderGraph` schedule's `RenderGraphSystems::Begin` set, chained strictly
+before `RenderGraphSystems::Render` (camera passes) and
+`RenderGraphSystems::Submit` (one batched submit for terminal and camera
+commands alike — `flush_tui_commands`, riding the shared `RenderContext`
+encoder). A material samples this frame's content, not last frame's. The
+only CPU readback is the explicit opt-in `Tui::read_back_blocking`.
 
-**Plugin Layer** (src/bevy_plugin.rs):
-- `TerminalPlugin` - Main Bevy plugin with input configuration
-- `TerminalSystemSet` - Execution order: Input → UserUpdate → Render
-- `gpu_flush_system` - plugin-owned per-`Tui` draw-payload extraction (pure
-  CPU, main world); also applies any pending `Tui::request_resize` before
-  flushing (recreates the destination `Image` in place, syncs the sibling
-  `TerminalDimensions` component); `extract_tui_draws` + `render_tui_textures`
-  (render world) do the actual GPU render, directly into the destination
-  `GpuImage`; `resize_world_quad_meshes` (feature `3d`, after
-  `gpu_flush_system`, keyed on `Changed<TerminalDimensions>`) recomputes a
-  `TuiKind::WorldQuad` mesh's aspect ratio after a resize;
-  `attach_terminal_system` (src/setup.rs, feature `3d`) - re-claims
-  materials for `AttachTerminal`
-- Components: `TerminalDimensions`, `TuiSurface`, `WorldQuadHeight` (feature `3d`)
+### Render-world GPU state & eviction
 
-**Input System** (src/input/):
-- Event-driven architecture using Bevy messages (`TerminalEvent`)
-- Focus management with Tab-key cycling
-- Unified mouse handling: auto-detects 2D UI vs 3D mesh via raycasting
-  (src/input/ray.rs, feature `3d`) when both `2d` and `3d` are enabled;
-  single-purpose `mouse_input_system` variants otherwise
+- `TerminalGpuStore` — per-terminal state (screen-size uniform, persistent
+  grow-only vertex/index buffers, `write_buffer`d in place), keyed by
+  destination `Image` asset id; created lazily on first render, evicted
+  when that `GpuImage` disappears.
+- `SharedFontGpuStore` — glyph atlas + bg/fg compositor pipelines, keyed
+  by `Fonts::identity()`: terminals sharing a `Fonts` share one atlas and
+  rasterize each glyph once. Evicted via the `LiveFontKeys` liveness set
+  once no live `Tui` reports that font key.
 
-**Font System** (src/fonts.rs):
-- TrueType font loading with rustybuzz
-- Unicode support including CJK characters
-- Font metrics: `min_width_px()`, `height_px()` for texture sizing
+### Partial redraw
 
-**Utilities** (src/utils/):
-- `text_atlas.rs` - GPU texture cache (2048x2048px, square, WebGL2-safe max) for rendered glyphs
-- `plan_cache.rs` - Text shaping cache for performance
+`flush()` re-shapes only the rows `dirty_rows` marks changed, reusing a
+per-row vertex cache (`RowGeometry`). `take_draw_payload` emits either a
+full payload (every row, `LoadOp::Clear`) — used whenever the destination
+texture can't be trusted (`full_redraw_needed`: just created / resized /
+cleared / fonts swapped / pending-payload overwrite) — or a partial one
+(only dirty rows, each preceded by a synthesized row-clear quad,
+`LoadOp::Load`). CPU concatenation and GPU upload both scale with dirty
+rows. Glyph-atlas eviction is LRU (`evictor` crate).
 
-### Critical Rendering Flow
+### Other modules
 
-1. User calls `tui.draw(|frame| { ... })` (or `draw_with_hits`) - draws into
-   ratatui's buffer only, marks the `Tui` dirty *only if the diff actually
-   changed a cell*. No GPU work, cheap every frame either way.
-2. If dirty: the plugin's `gpu_flush_system` (main world, pure CPU) extracts
-   a `TerminalDrawPayload` (pending glyph rasterizations + vertex/index
-   data) from the backend.
-3. A render-world system (`extract_tui_draws` + `render_tui_textures` in
-   `bevy_plugin.rs`) renders that payload (two-pass: backgrounds → glyphs,
-   `TerminalGpuState::render` in `backend/mod.rs`) directly into the
-   destination `Image`'s own `GpuImage::texture_view` - the same texture
-   any material's bind group already references. No asset mutation, no
-   material touching, for any material type.
+- **src/backend/** — `bevy_backend.rs` (ratatui `Backend` impl),
+  `rasterize.rs` (rustybuzz + raqote), `programmatic_glyphs/`
+  (box-drawing, braille, block elements, powerline — procedural)
+- **src/bevy_plugin.rs** — `TerminalPlugin`, `TerminalSystemSet`
+  (Input → UserUpdate → Render in `Update`), the systems above
+- **src/input/** — message-driven (`TerminalEvent` via `MessageReader`,
+  bevy 0.18+ messages, not legacy events); focus management with Tab
+  cycling; unified mouse handling that auto-detects 2D UI vs 3D mesh via
+  raycasting (src/input/ray.rs) when both features are on; touch fallback
+  (see Gotchas)
+- **src/fonts.rs** — TrueType via rustybuzz; CJK; metrics
+  `min_width_px()` / `height_px()` for texture sizing
+- **src/utils/** — `text_atlas.rs` (glyph cache texture),
+  `plan_cache.rs` (shaping cache)
 
-Same-frame latency: `render_tui_textures` runs in the `RenderGraph`
-schedule's `RenderGraphSystems::Begin` set, chained strictly before
-`RenderGraphSystems::Render` (where bevy_core_pipeline's `camera_driver`
-runs the camera passes) and `RenderGraphSystems::Submit` (where every
-recorded command buffer, terminal and camera alike, is submitted together
-- see `flush_tui_commands`). So the draw payload extracted this frame is
-rendered and submitted before this same frame's camera passes, and a
-material samples this frame's content, not the previous frame's - a
-structural guarantee from the schedule's set ordering, not a system-order-
-plus-submit-timing coincidence. There is no CPU readback anywhere in this
-path (see `Tui::read_back_blocking` for the explicit opt-in exception).
-
-## Key Implementation Patterns
-
-### Terminal Setup Pattern
+## Key Patterns
 
 ```rust
-// Setup system signature - no render resources at all
+// Setup: no render resources anywhere in the signature.
 fn setup(mut commands: Commands) {
-    // Font loading - from embedded bytes/file (or TuiFontSource::Asset)
-    let font = Font::new(font_bytes)?;
-    let fonts = Arc::new(Fonts::new(font, font_size));
-
-    // Declarative terminal - materializes next frame
+    let fonts = Arc::new(Fonts::new(Font::new(font_bytes)?, font_size));
     commands.spawn((TuiRequest::ui(cols, rows, fonts), Node::default()));
+}
+
+// Per-frame draw. `else return` is REQUIRED: TuiRequest materializes one
+// frame after spawn.
+fn render_terminal(mut screens: Query<&mut Tui, With<MyTerminal>>) {
+    let Ok(mut term) = screens.single_mut() else { return };
+    term.draw(|frame| { /* ratatui widgets */ });
 }
 ```
 
-### System Ordering
-
-All terminal systems MUST use `TerminalSystemSet` for proper execution order:
+User systems MUST be placed in `TerminalSystemSet` (`Input` →
+`UserUpdate` → `Render`):
 
 ```rust
 .add_systems(Update, handle_input.in_set(TerminalSystemSet::UserUpdate))
 .add_systems(Update, render_terminal.in_set(TerminalSystemSet::Render))
 ```
 
-Order: `Input` → `UserUpdate` → `Render`
-
-### Input Event Handling
-
-Input uses Bevy's message system (v0.18+), not legacy events:
+Input events:
 
 ```rust
 fn handle_events(mut events: MessageReader<TerminalEvent>) {
@@ -331,125 +204,197 @@ fn handle_events(mut events: MessageReader<TerminalEvent>) {
 }
 ```
 
-### Terminal Rendering: Render World Only, No Material Touch
-
-The main world does **zero** GPU work - rendering happens entirely in the
-render world, directly into the destination `Image`'s own `GpuImage`
-texture:
-
-1. `Tui::draw()` renders into ratatui's buffer only (no GPU work), and
-   marks the terminal dirty *only if the diff actually changed a cell*
-   (a byte-identical redraw is a free no-op - ratatui itself always calls
-   `Backend::flush()`, but `BevyTerminalBackend::flush()` early-returns
-   before any shaping/vertex work when `cells_changed_last_draw` is
-   false, so the "free" part holds all the way down, not just at the
-   GPU-dirty gate).
-2. The plugin's `gpu_flush_system` (main world, pure CPU) extracts a
-   `TerminalDrawPayload` (glyph rasterizations + vertex/index data) from
-   dirty terminals via `Tui::flush`/`BevyTerminalBackend::take_draw_payload`.
-3. A render-world system (`extract_tui_draws` + `render_tui_textures` in
-   `bevy_plugin.rs`) picks up each payload and renders it (background pass,
-   foreground pass, `TerminalGpuState::render` in `backend/mod.rs`) directly
-   into the destination `Image`'s `GpuImage::texture_view` - the very
-   texture any material's bind group already references. No asset mutation
-   happens, so there is nothing for Bevy's change detection to miss and
-   nothing to re-touch, for `StandardMaterial`, `ExtendedMaterial`, or any
-   other fully custom `Material` impl.
-4. Render-world GPU state is split across two stores, each with its own
-   key and eviction rule:
-   - `TerminalGpuStore` - per-terminal state (screen-size uniform, index
-     buffer, vertex buffers), keyed by destination `Image` asset id.
-     Created lazily on first render, evicted automatically once that
-     `GpuImage` disappears (the `Tui` despawned and its last
-     `Handle<Image>` dropped) - no entity-level bookkeeping needed.
-   - `SharedFontGpuStore` - the glyph atlas texture and background/foreground
-     compositor pipelines, keyed by `Fonts::identity()` rather than by
-     destination image, so terminals that share a `Fonts` share one glyph
-     atlas and rasterize each glyph only once. Evicted once no live `Tui`
-     reports that font key anymore (tracked via a `LiveFontKeys` liveness
-     set, since a shared font's last user despawning leaves no destination
-     image to key eviction off of).
-
-```rust
-fn render_terminal(mut screens: Query<&mut Tui, With<MyTerminal>>) {
-    let Ok(mut term) = screens.single_mut() else { return };
-    term.draw(|frame| { /* ... */ }); // zero render-resource parameters
-}
-```
-
-Both 2D (`ImageNode`) and 3D (any material) terminals update automatically
-through this same path - no per-material-type plugin registration needed.
-
-## Font Requirements
-
-- Fonts must be TrueType (.ttf) format
-- Default example font: `assets/fonts/Mplus1Code-Regular.ttf`
-- Font must support ASCII + any Unicode characters used
-- Programmatic glyphs (box-drawing, braille) are procedurally generated if enabled
-- Loading: `Font::new(&'static [u8])` for embedded data (`include_bytes!`),
-  `Font::from_vec(Vec<u8>)` for runtime-loaded data (Arc-backed, no leaking)
+Fonts: TrueType only. `Font::new(&'static [u8])` for `include_bytes!`,
+`Font::from_vec(Vec<u8>)` for runtime-loaded data (Arc-backed, never
+`Box::leak`). Default example font:
+`examples/assets/fonts/Mplus1Code-Regular.ttf`.
 
 ## Common Gotchas
 
-1. **Terminal creation needs no `RenderDevice`/`RenderQueue`** - `TerminalTexture::create` is pure CPU (`cols, rows, fonts, programmatic_glyphs, &mut Assets<Image>`); the GPU pipelines are built lazily in the render world on first render
-2. **Same-frame GPU updates** - `gpu_flush_system` (main world) extracts a draw payload the same frame a terminal is dirty; the render world renders it in the `RenderGraph` schedule's `RenderGraphSystems::Begin` set, chained strictly before the camera passes (`RenderGraphSystems::Render`) and the frame's batched submit (`RenderGraphSystems::Submit`), so there is no display lag behind `Tui::draw()`. There is no CPU readback anywhere in the hot path (see "Terminal Rendering: Render World Only, No Material Touch" above) - the only blocking readback is the explicit opt-in `Tui::read_back_blocking` (screenshots/tests, never call it every frame; goes through a request/response channel to the render world, so call it from a different thread than the one driving `App::update()` unless using `PipelinedRenderingPlugin`)
-3. **Material updates need no touching at all** - not for `StandardMaterial`, not for custom materials. See "Terminal Rendering: Render World Only, No Material Touch" above
-4. **System ordering** - Always use `TerminalSystemSet` or rendering may occur before input
-5. **Font loading errors** - Verify font file exists and is valid TrueType format
-6. **API signatures take `&mut Assets<...>`** (not `&mut ResMut<...>`) - callers with `ResMut` pass `&mut resmut` and deref coercion handles it; exclusive systems with direct `Assets` access work too
-7. **Multi-camera mouse picking** - `mouse_input_system` builds rays per active camera via `Camera::viewport_to_world`, prioritized by descending `Camera::order` then hit distance (works with overlay-camera setups and any `ScalingMode`)
-8. **Attaching a terminal to a glTF mesh** (see examples/retro_crt.rs; the model `assets/models/retro_crt.glb` is a remix of CrazyDrPants' "Retro CRT Computer", CC 4.0 — credit shown in the overlay):
-   - glTF loading is async — a material inserted when the node's `Name` appears gets OVERWRITTEN by the loader's material later. Keep re-claiming (query entities that still carry the loader's `MeshMaterial3d<StandardMaterial>` each frame) until yours sticks. Once claimed, `attach_terminal_system` tracks the installed handle in a `TuiAttached` bookkeeping component and skips the remove+insert entirely on frames where nothing has changed — no per-frame archetype churn once settled, even for `AttachMaterial::standard()` targets that keep matching the query forever.
-   - **Mesh-primitive entities are named `<MESH name>.<MATERIAL name>`** (e.g. `Object_2.Monitor_Glass`), NOT after the glTF node. Node names sit on parent entities without `MeshMaterial3d`. Target the primitive name exactly, or match the node name and walk descendants. Prefix matching is dangerous (`Object_2` also hits `Object_20`).
-   - Model screens may sample a sub-rectangle of a texture atlas and/or be rotated; verify with the four-quadrant calibration pattern (`CRT_CALIBRATE=1`). To fix orientation prefer rewriting the mesh's `TEXCOORD_0` over `uv_transform`: the input hit-test uses raw mesh UVs, so `uv_transform` desyncs display from mouse picking. (The shipped retro_crt.glb has full-range upright UVs — no correction needed.)
-   - Spawning glTF scenes in 0.19 (`WorldAssetRoot`; `Gltf::scenes` is `Vec<Handle<WorldAsset>>`) requires bevy features `bevy_world_serialization` + `reflect_auto_register` (panics on unregistered types without the latter) + image formats (`png`, `jpeg`).
-9. **Custom `Material` with vertex colors** (see `BlurMaterial` in examples/retro_crt.rs):
-   - Declaring `@location(1) color` in WGSL is NOT enough — without an explicit vertex layout in `Material::specialize` (`layout.0.get_layout(&[ATTRIBUTE_POSITION.at_shader_location(0), ATTRIBUTE_COLOR.at_shader_location(1), ...])` assigned to `descriptor.vertex.buffers`), bevy's default attribute order feeds NORMAL into location 1 and vertex colors silently have no effect.
-   - A custom vertex layout breaks bevy's prepass/shadow pipelines: enabling shadows then dies with `prepass_pipeline` validation errors (0.19 quits the app on render errors). Insert `bevy::light::NotShadowCaster` + `NotShadowReceiver` on such meshes.
-   - For additive blending (`BlendFactor::One/One`), modulate ALL light terms by the vertex color before output — any constant term added outside the multiply visibly ignores the vertex-color fade.
-   - **Check the model for authored `COLOR_0` before generating vertex colors at runtime** — the glTF loader imports it as `ATTRIBUTE_COLOR` automatically. The `_0` reflection mesh ships a diamond fade (corners black, edge midpoints white). Design note: this reflection is unlit additive glow, so a fully custom material with explicit One/One blending is appropriate; use `ExtendedMaterial` + emissive-style addition instead when PBR lighting must be preserved.
-10. **A wasm build MUST enable bevy's `bevy_winit` feature explicitly** (see the comment on the wasm32 dev-dependencies in Cargo.toml). On native it rides in via `x11`; trimming a wasm feature list "because x11 is native-only" silently drops the event-loop runner itself. Without WinitPlugin, `App::run()`'s fallback runner busy-spins `while plugins_state() == Adding {}` on the browser main thread — the `spawn_local`'d renderer-init future can then never run, so the tab hard-hangs with ZERO console output right after the wasm loads ("This page is slowing down Firefox", eventually "Script terminated by timeout" with the stack topping out in `bevy_app::App::plugins_state`); the hang looks exactly like a GPU/driver or upstream-Bevy failure but isn't. Related trap while debugging it: `.cargo/config.toml` sets `rustflags = ["-C","strip=symbols"]` for wasm32, so hang stacks are unreadable `wasm-function[N]` by default — and CLI `--config target....rustflags=[]` can NOT cancel it (cargo merges rustflags arrays); prefix `RUSTFLAGS=""` (env replaces config rustflags) plus `--config 'profile.wasm-release.strip="none"'` to get named stacks.
+1. **Terminal creation needs no `RenderDevice`/`RenderQueue`** —
+   `TerminalTexture::create` is pure CPU; GPU pipelines build lazily in
+   the render world on first render.
+2. **No material touching, ever** — see "Rendering pipeline" above. Also
+   no per-material-type plugin registration.
+3. **API signatures take `&mut Assets<...>`**, not `&mut ResMut<...>` —
+   pass `&mut resmut` and deref coercion handles it.
+4. **Multi-camera mouse picking** — rays are built per active camera via
+   `Camera::viewport_to_world` (correct for any projection/`ScalingMode`),
+   prioritized by descending `Camera::order`, then hit distance.
+5. **Touch input** — winit never synthesizes mouse events from touches.
+   `update_cursor_position_system` falls back to the first active touch's
+   position (and, on the release frame, the just-released touch's last
+   position), and `emit_button_events` treats a tap as a left-button
+   press/release. Consumers reading `CursorPosition` instead of
+   `Window::cursor_position()` get touch support for free (see
+   `update_camera_rotation` in examples/retro_crt.rs).
+6. **`Tui::read_back_blocking(&channel)`** (screenshots/tests only, never
+   per frame) blocks on a request/response channel to the render world —
+   call it from a different thread than the one driving `App::update()`
+   unless `PipelinedRenderingPlugin` is active.
+7. **Attaching to a glTF mesh** (examples/retro_crt.rs; the model
+   `retro_crt.glb` is a remix of CrazyDrPants' "Retro CRT Computer",
+   CC 4.0 — credit shown in the overlay):
+   - glTF loading is async — a material inserted early gets OVERWRITTEN by
+     the loader later. `attach_terminal_system` keeps re-claiming until it
+     sticks (see "Abstraction ladder").
+   - **Mesh-primitive entities are named `<MESH>.<MATERIAL>`** (e.g.
+     `Object_2.Monitor_Glass`), NOT after the glTF node. Node names sit on
+     parent entities without `MeshMaterial3d`. Exact-match the primitive
+     name; prefix matching is dangerous (`Object_2` also hits `Object_20`).
+   - Model screens may sample an atlas sub-rect and/or be rotated; verify
+     with the calibration pattern (`CRT_CALIBRATE=1`). Prefer rewriting
+     `TEXCOORD_0` over `uv_transform` — the hit-test uses raw mesh UVs, so
+     `uv_transform` desyncs display from picking. (The shipped
+     retro_crt.glb has full-range upright UVs.)
+   - For a self-illuminating screen, route the terminal texture through
+     the **emissive channel** (`emissive_texture` + white `emissive`,
+     black `base_color`) — bevy_pbr adds emissive after the
+     light-dependent terms, so content stays visible at any scene light
+     level while metallic/roughness/reflectance still give a glass
+     specular highlight (see `claim_object2_screen`).
+   - Spawning glTF scenes in 0.19 (`WorldAssetRoot`; `Gltf::scenes` is
+     `Vec<Handle<WorldAsset>>`) requires bevy features
+     `bevy_world_serialization` + `reflect_auto_register` (panics without
+     the latter) + image formats (`png`, `jpeg`).
+8. **Custom `Material` with vertex colors** (`BlurMaterial` in
+   examples/retro_crt.rs):
+   - Declaring `@location(1) color` in WGSL is NOT enough — without an
+     explicit vertex layout in `Material::specialize`, bevy feeds NORMAL
+     into location 1 and vertex colors silently do nothing.
+   - A custom vertex layout breaks the prepass/shadow pipelines (0.19
+     quits the app on render errors) — insert `NotShadowCaster` +
+     `NotShadowReceiver`.
+   - For additive blending (`One/One`), modulate ALL light terms by the
+     vertex color, or the constant term visibly ignores the fade.
+   - Check the model for authored `COLOR_0` before generating vertex
+     colors at runtime — the glTF loader imports it as `ATTRIBUTE_COLOR`
+     (the `_0` reflection mesh ships a diamond fade).
+9. **A wasm build MUST enable bevy's `bevy_winit` feature explicitly**
+   (see the wasm32 dev-dependencies comment in Cargo.toml). On native it
+   rides in via `x11`; dropping it on wasm silently drops the event-loop
+   runner — `App::run()`'s fallback busy-spins on the browser main thread
+   and the tab hard-hangs with ZERO console output (stack topping out in
+   `bevy_app::App::plugins_state`). Looks exactly like a GPU/driver
+   failure but isn't. Debugging trap: `.cargo/config.toml` strips wasm
+   symbols, and CLI `--config target....rustflags=[]` can NOT cancel it
+   (cargo merges arrays) — use `RUSTFLAGS=""` (env replaces config) plus
+   `--config 'profile.wasm-release.strip="none"'` for named stacks.
 
-## GPU Texture Architecture
+## GPU Texture Facts
 
-- **Glyph Atlas**: 2048x2048px RGBA8 texture, square and pinned to the WebGL2-safe `max_texture_dimension_2d` ceiling (see `CACHE_WIDTH`, `CACHE_HEIGHT` in src/backend/mod.rs) - same on native and wasm, so this surface never has a wasm-only failure mode. Shared across every terminal using the same `Fonts` (keyed by `Fonts::identity()` in the render world's `SharedFontGpuStore`), so terminals with a shared font rasterize and upload each glyph only once instead of duplicating the atlas per terminal
-- **Terminal Textures**: Size = `cols * char_width_px` × `rows * char_height_px` (this one's aspect ratio is dictated by the caller's grid, not squared - unlike the atlas it isn't just a cache, so distorting it would distort the rendered content); callers requesting a very large grid/font combination are responsible for staying under whatever `max_texture_dimension_2d` their target GPU/backend reports
-- **Render Pipelines**: Separate WGSL shaders for backgrounds (`composite_bg.wgsl`) and foreground text (`composite_fg.wgsl`)
-- **Format**: Always `TextureFormat::Rgba8Unorm`
+- **Glyph atlas**: 2048×2048 RGBA8 (`CACHE_WIDTH`/`CACHE_HEIGHT` in
+  src/backend/mod.rs) — square and pinned to the WebGL2-guaranteed
+  `max_texture_dimension_2d`, identical on native and wasm, so it has no
+  wasm-only failure mode. Shared per `Fonts::identity()`; LRU-evicted.
+- **Terminal textures**: `cols·char_w × rows·char_h`, `Rgba8Unorm`.
+  Staying under the target GPU's `max_texture_dimension_2d` for huge
+  grid/font combinations is the caller's responsibility.
+- **Shaders**: `composite_bg.wgsl` (backgrounds) + `composite_fg.wgsl`
+  (glyphs).
 
-## Performance Considerations
+## WASM Demo Architecture
 
-- `BevyTerminalBackend::flush()` early-returns when a draw changed no cells
-  (byte-identical redraws are free), and re-shapes only the rows
-  `dirty_rows` marks changed, reusing a per-row vertex cache
-  (`RowGeometry`) otherwise
-- Partial redraw: `take_draw_payload` concatenates `row_geometry` into
-  either a full payload (every row, `LoadOp::Clear`) or a partial one
-  (only the rows dirty since the last take, each preceded by a synthesized
-  row-clear quad, `LoadOp::Load` to preserve every other row's existing
-  pixels) - a full payload is used whenever the destination texture's
-  content can't be trusted (`full_redraw_needed` - just created / resized /
-  cleared / fonts swapped, or a main-world pending-payload overwrite) or
-  every row happens to be dirty anyway. On a redraw touching only a few
-  rows, both the CPU-side vertex concatenation and the GPU-side upload/fill
-  scale with dirty rows instead of the whole grid
-- Glyph cache eviction uses LRU policy (via the `evictor` crate); the atlas
-  itself is shared across every terminal using the same `Fonts` (see "GPU
-  Texture Architecture" above), so a shared font's glyphs are rasterized
-  and uploaded once, not once per terminal
-- Per-terminal vertex/index GPU buffers are persistent and grow-only
-  (`queue.write_buffer`d in place instead of recreated every dirty frame)
-- Every dirty terminal's draw is recorded via the render world's shared
-  `RenderContext` encoder (`render_tui_textures`, `RenderGraphSystems::Begin`)
-  and rides the frame's single batched submit
-  (`RenderGraphSystems::Submit`) alongside the camera passes' own commands,
-  instead of creating and submitting a separate `CommandEncoder` per frame
-- Release builds use `lto = "fat"` and `codegen-units = 1` for maximum optimization
+`examples/wasm_demo.rs` is a thin wasm-bindgen shim around the full retro
+CRT scene, packaged as a static site in `examples/web/`.
+
+**One scene, one asset tree.** The scene lives only in
+`examples/retro_crt.rs`; `wasm_demo.rs` pulls it in via `#[path]` and
+calls `retro_crt::build_app(asset_path)`. Assets are shared through the
+single `examples/assets/` directory: native reads it relative to `cargo
+run`'s cwd, wasm fetches over HTTP relative to the hosting page —
+`wasm_demo.rs` passes `"../assets"` because `examples/web/index.html` is
+served one directory below. Compile-time `include_bytes!` fonts bypass
+`AssetPlugin` entirely. `retro_crt.rs`'s few wasm-only branches live
+inline behind `#[cfg(target_arch = "wasm32")]`: the `Window { canvas:
+Some("#bevy"), fit_canvas_to_parent: true, .. }` fields (no-ops on
+native, so unconditional), OIT cfg'd OFF (needs storage buffers, absent
+on WebGL2), and `Tonemapping::KhronosPbrNeutral` (see "Binary size").
+
+**`wasm_demo.rs` adds only browser-module concerns**:
+- `#[wasm_bindgen(start)]` entry; a panic hook that both logs to the
+  console AND forwards `panicked (heap N MB): ...` to the loading overlay
+  via `window.__demoStatus` — on mobile Safari the overlay is often the
+  only visible console. (A true OOM abort — failed `memory.grow` — never
+  runs the hook; it traps to a JS "Unreachable code" RuntimeError, which
+  index.html annotates as probable OOM.)
+- A WebGL2 probe on a throwaway canvas (probing `#bevy` would take its
+  context and break wgpu's later `getContext`).
+- `boot_status`: staged loading milestones sent to `window.__demoStatus`.
+  The overlay stays up past wasm-bindgen `init()` until the CRT screen is
+  actually drawable — detected by a render-world system counting pending
+  `PipelineCache` compiles (an inserted material does NOT mean its mesh
+  renders). Waiting stages emit a once-per-second heartbeat with elapsed
+  seconds + heap MB; a failed `.glb` load is surfaced on the overlay
+  instead of stalling forever.
+- **Surface-size clamps** (`MAX_PHYSICAL_PX = 2032`, deliberately under
+  the 2048 WebGL2 ceiling — Safari's winit path measures css×DPR with its
+  own rounding and an exact clamp can tip past the cap, leaving the
+  surface unconfigured and panicking on the next `get_current_texture`):
+  1. `clamp_canvas_to_safe_texture_size` caps the canvas's CSS
+     `max-width`/`max-height` at `MAX_PHYSICAL_PX / devicePixelRatio`
+     (spoofing `window.devicePixelRatio` does NOT work — winit measures
+     via `ResizeObserver`'s `devicePixelContentBoxSize`).
+  2. `clamp_initial_window_resolution` also caps bevy's initial
+     `WindowResolution` before `run()` — bevy configures the FIRST
+     frame's surface from that value × real DPR before any
+     ResizeObserver report, so on a DPR-3 phone 1024×768 becomes
+     3072×2304 and fails; the clamped (briefly distorted) size lives
+     only until `fit_canvas_to_parent` takes over.
+- `suppress_canvas_escape_key`: a DOM `keydown` listener registered on
+  the canvas BEFORE `App::run()` calls `stop_immediate_propagation()` so
+  winit (which registers lazily at window creation) never sees Escape —
+  same-target DOM listeners fire in registration order.
+
+**`examples/web/index.html`** (hand-maintained, committed, alongside
+`README.md` and `.nojekyll`; `wasm_demo.js` + `*.wasm` are generated and
+gitignored): real download progress bar (wraps the `.wasm` fetch in a
+counting `ReadableStream`, still feeds `instantiateStreaming`);
+`touch-action: none` on the canvas so mobile Safari doesn't claim taps;
+fatal-error latch (first panic/error wins — post-trap rethrows would
+overwrite the root cause); `error`/`unhandledrejection`/
+`webglcontextlost` listeners with an OOM explainer; a spinner+seconds
+liveness ticker (distinguishes "main thread alive, async step stuck" from
+"main thread stalled"); and mirroring of the first few + latest
+`console.warn/error` lines into the overlay. Bump `ASSET_VERSION` on
+every redeploy — the JS glue and wasm are a matched pair and stale caches
+mixing versions fail with `LinkError`.
+
+**Build pipeline** (no trunk; wasm-bindgen CLI version must exactly match
+`Cargo.lock`'s `wasm-bindgen`):
+
+```bash
+cargo build --example wasm_demo --target wasm32-unknown-unknown --profile wasm-release
+wasm-bindgen --target web --no-typescript --out-dir examples/web \
+  target/wasm32-unknown-unknown/wasm-release/examples/wasm_demo.wasm
+wasm-opt -Oz --strip-debug --strip-producers \
+  --enable-nontrapping-float-to-int --enable-bulk-memory --enable-sign-ext \
+  --enable-mutable-globals --enable-simd --enable-reference-types \
+  -o examples/web/wasm_demo_bg.wasm examples/web/wasm_demo_bg.wasm
+```
+
+**Local preview**: the page fetches `../assets/`, so the httpd must be
+rooted at `examples/` (`python3 -m http.server 8080` from `examples/`,
+open `http://127.0.0.1:8080/web/`); `file://` cannot work. Details in
+`examples/web/README.md`.
+
+**Binary size**: ~31MB raw → ~24MB after `wasm-opt -Oz` plus the wasm-only
+bevy dev-dependency dropping `tonemapping_luts`/`zstd_rust` (a ~680KB LUT
++ decoder needed only by the default tonemapper — hence
+`KhronosPbrNeutral`) and native-only `x11`. `#![no_std]` is not
+achievable (bevy, raqote, rustybuzz, ratatui need `std`). Full breakdown
+in `examples/web/README.md`.
+
+**Overlay panel collapse**: clicking the overlay's title bar
+(`Hit::PanelTitleBar`) toggles a `Tui::request_resize(cols, 1)` — the
+`Image` is recreated in place and bevy_ui re-measures the `ImageNode`
+automatically, no manual Node bookkeeping.
 
 ## Version Compatibility
 
-| bevy  | ratatui | wgpu | bevy_tui_texture |
-|-------|---------|------|------------------|
-| 0.19  | 0.30.2  | 29   | 0.3              |
+| bevy | ratatui | wgpu | bevy_tui_texture |
+|------|---------|------|------------------|
+| 0.19 | 0.30.2  | 29   | 0.3              |
 
-Rust edition: 2024, `rust-version = "1.96"` (tracks bevy 0.19's own MSRV, not this crate's own code - see README.md's "MSRV policy")
+Rust edition 2024, `rust-version = "1.96"` — tracks bevy 0.19's MSRV, not
+this crate's own code (see README.md "MSRV policy").

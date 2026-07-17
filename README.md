@@ -1,8 +1,6 @@
 # bevy_tui_texture
 
-> A Bevy plugin for rendering terminal-style UIs using ratatui and WGPU
-
-Seamlessly integrate terminal UIs into your Bevy applications. Display ratatui widgets on 2D sprites, 3D meshes, or UI elements with full GPU acceleration.
+> Render ratatui terminal UIs as GPU textures in Bevy — on 2D UI nodes, 3D meshes, or existing glTF screens.
 
 **[WASM DEMO](https://tt-toe.github.io/bevy_tui_texture/examples/web/)**
 
@@ -10,13 +8,13 @@ https://github.com/user-attachments/assets/64e1e136-7d2d-4e32-9c10-1da2cfb78ccd
 
 ## Features
 
-- **GPU-Accelerated Terminal Rendering** - Render ratatui terminal UIs as GPU textures using WGPU
-- **Flexible Display Options** - Render terminals on Bevy UI nodes, 2D sprites, or 3D meshes
-- **Full Unicode Support** - Complete support for CJK (Chinese, Japanese, Korean) characters
-- **Interactive Input** - Built-in keyboard and mouse input handling with focus management
-- **Programmatic Glyphs** - Automatic rendering of box-drawing, block elements, and Braille patterns
-- **Real-time Updates** - Efficient real-time terminal content updates with minimal overhead
-- **Declarative Spawning** - `TuiRequest` component: spawn it, the plugin materializes the terminal - no render resources in your setup system
+- **GPU-accelerated rendering** — terminal content is drawn entirely in the render world, directly into the destination texture; no CPU readback, no per-frame material updates
+- **Declarative spawning** — spawn a `TuiRequest` component and the plugin materializes the terminal; no render resources in your systems
+- **Flexible display targets** — Bevy UI nodes, world-unit 3D quads, or attach to an existing mesh (e.g. a glTF screen) via `AttachTerminal`
+- **Interactive input** — keyboard, mouse, and touch (taps emulate left-click) with focus management and per-widget hit testing
+- **Full Unicode** — CJK support, font fallback chains, and procedural box-drawing / block / Braille / powerline glyphs
+- **Efficient updates** — dirty-cell tracking, partial row redraws, and a glyph atlas shared across terminals using the same fonts
+- **WebAssembly** — runs in the browser on WebGL2
 
 ## Quick Start
 
@@ -29,7 +27,7 @@ font-kit = "0.14"
 bevy_tui_texture = "0.3"
 ```
 
-### Hello World Example
+### Hello World
 
 Mirrors `examples/helloworld.rs` (also embedded as this crate's Quick Start doctest):
 
@@ -95,40 +93,27 @@ fn render_terminal(mut screens: Query<&mut Tui, With<HelloTerminal>>) {
 
 ## Examples
 
-The `examples/` directory contains comprehensive demonstrations:
-
-### Basic Examples
-
-- **`helloworld.rs`** - Minimal example showing basic terminal rendering
-
-### Widget Examples
-
-- **`widget_catalog_2d.rs`** - Interactive showcase of ratatui widgets in 2D UI
-- **`widget_catalog_3d.rs`** - Interactive showcase of ratatui widgets on rotating 3D mesh
-
-### Advanced Examples
-
-- **`multiple_terminals.rs`** - Managing multiple independent terminals
-- **`world_terminal.rs`** - World-unit-sized in-game screen (`TuiRequest::world_quad` + `TuiFontSource::Asset`)
-- **`shader_mesh.rs`** - Custom shader effects and mesh3d with terminal textures
-- **`retro_crt.rs`** - glTF model + `ExtendedMaterial` CRT shader + overlay UI + camera modes
-- **`tui_component.rs`** - Manual entity spawning with `TerminalTexture` (no spawn helpers)
-- **`resize.rs`** - `Tui::request_resize` following the window size live
-- **`transparent_world_quad.rs`** - HUD-style see-through screen (`transparent_reset_bg` + `AlphaMode::Blend`)
-- **`benchmark.rs`** - Full-frame rendering throughput (every cell redrawn each frame)
-- **`benchmark_partial.rs`** - `BENCH_MODE=static|partial` - isolates the cost of unchanged-frame and partial-row redraws
-
-### WebAssembly
-
-- **`wasm_demo.rs`** - the full retro CRT scene running in a browser (WebGL2)
-
-## Run examples with
+| Example | Shows |
+|---|---|
+| `helloworld.rs` | Minimal static terminal |
+| `widget_catalog_2d.rs` | ratatui widget showcase in 2D UI with mouse interaction |
+| `widget_catalog_3d.rs` | Widget showcase on a rotating 3D mesh |
+| `multiple_terminals.rs` | Several independent terminals + Tab focus cycling |
+| `world_terminal.rs` | World-unit in-game screen (`TuiRequest::world_quad` + `TuiFontSource::Asset`) |
+| `shader_mesh.rs` | Custom shader effects on a terminal texture |
+| `retro_crt.rs` | glTF model + `ExtendedMaterial` CRT shader + overlay UI + camera modes |
+| `tui_component.rs` | Manual spawning with `TerminalTexture` (no helpers) |
+| `resize.rs` | `Tui::request_resize` following the window size live |
+| `transparent_world_quad.rs` | HUD-style see-through screen (`transparent_reset_bg` + `AlphaMode::Blend`) |
+| `benchmark.rs` | Full-frame rendering throughput |
+| `benchmark_partial.rs` | `BENCH_MODE=static\|partial` — unchanged-frame and partial-row redraw costs |
+| `wasm_demo.rs` | The full retro CRT scene running in a browser (WebGL2) |
 
 ```bash
 cargo run --example helloworld
-cargo run --example widget_catalog_3d
+cargo run --example retro_crt
 
-# For the WASM demo (browser-ready site in examples/web/ - see
+# WASM demo (browser-ready site in examples/web/ - see
 # examples/web/README.md for deploy + local preview instructions)
 rustup target add wasm32-unknown-unknown
 cargo install wasm-bindgen-cli   # version must match Cargo.lock's wasm-bindgen
@@ -147,53 +132,43 @@ wasm-opt -Oz --strip-debug --strip-producers \
 
 ## Feature Flags
 
-Configure features in your `Cargo.toml`:
-
 ```toml
 [dependencies.bevy_tui_texture]
 version = "0.3"
 default-features = false
-features = ["2d", "3d", "keyboard_input", "mouse_input"]
+features = ["3d", "keyboard_input", "mouse_input"]   # e.g. a 3D-only app
 ```
 
-Available features:
+- **`2d`** (default) — 2D UI terminals (`TuiUi`, `TuiKind::Ui`)
+- **`3d`** (default) — 3D mesh terminals (`TuiKind::WorldQuad`, `AttachTerminal`, mesh raycasting)
+- **`keyboard_input`** (default) — keyboard event handling
+- **`mouse_input`** (default) — mouse events for 2D UI and 3D mesh terminals; touch taps ride the same path (a tap emulates a left-button click at the touch position)
+- **`bold_italic_fonts`** — real bold/italic font slots; without it, bold/italic are faked from the regular font
+- **`emoji`** — emoji and extended Unicode support (WIP)
+- **`ascii_fast_shaping`** — skip text shaping for all-ASCII rows (assumes zero glyph offsets, true for most monospace fonts; inert when `bold_italic_fonts` is enabled)
 
-- **`2d`** (default) - 2D UI terminals (`TuiUi`, `TuiKind::Ui`)
-- **`3d`** (default) - 3D mesh terminals (`TuiKind::WorldQuad`, `AttachTerminal`, mesh raycasting)
-- **`keyboard_input`** (default) - Enable keyboard event handling
-- **`mouse_input`** (default) - Enable mouse event handling for both 2D UI and 3D mesh terminals
-- **`bold_italic_fonts`** - Enable fake bold and italic font rendering support
-- **`emoji`** - Enable emoji and extended Unicode character support (WIP)
-
-`TuiRequest`'s `TuiKind` variants gate individually (`Ui` needs `2d`,
-`WorldQuad` needs `3d`, `Headless` is always available); build with just
-one display surface by disabling the other, e.g.
-`features = ["3d", "keyboard_input", "mouse_input"]` for a 3D-only app.
+`TuiKind` variants gate individually: `Ui` needs `2d`, `WorldQuad` needs `3d`, `Headless` is always available.
 
 ## Performance
 
-This library is designed for real-time rendering with:
+- Dirty-cell tracking: byte-identical redraws cost nothing, and redraws touching only a few rows upload only those rows
+- Glyph atlas shared across terminals using the same fonts — each glyph is rasterized and uploaded once
+- Persistent, grow-only GPU buffers; all terminal draws ride the frame's single batched submit alongside the camera passes
+- Terminal content lands in the same frame it is drawn (no one-frame lag)
 
-- Efficient GPU texture updates
-- Cached glyph rendering with text atlas
-- Minimal CPU-GPU data transfer
-- Smart dirty tracking for terminal cells
-
-See `examples/benchmark.rs` for performance metrics.
+See `examples/benchmark.rs` and `examples/benchmark_partial.rs`.
 
 ## Requirements
 
-- Rust 1.96 or later (2024 edition)
-- Bevy 0.19
-- Ratatui 0.30
-- A GPU with WGPU support
+- Rust 1.96+ (2024 edition), Bevy 0.19, Ratatui 0.30, a GPU with WGPU support
+- Platforms: Windows, macOS, Linux, and Web (WebGL2)
+- Fonts must be TrueType (`.ttf`)
 
 **MSRV policy**: the declared `rust-version` tracks whichever dependency
-needs the newest compiler - currently bevy 0.19 itself, not anything this
+needs the newest compiler — currently bevy 0.19 itself, not anything this
 crate's own code requires (edition 2024's floor is 1.85; ratatui 0.30.2
-declares 1.88.0). Bumping bevy/ratatui may raise this floor further;
-there's no separate "N versions behind latest stable" policy on top of
-that.
+declares 1.88.0). Bumping bevy/ratatui may raise this floor; there is no
+separate "N versions behind stable" policy on top.
 
 | `bevy` | `ratatui` | `wgpu` | `bevy_tui_texture` |
 |--------|-----------|--------|--------------------|
@@ -201,41 +176,21 @@ that.
 | `0.18` | `0.30`    | `27`   | `0.2`              |
 | `0.17` | `0.29`    | `26`   | `0.1`              |
 
-`wgpu` must exactly match the version bevy itself is pinned to (see the
-comment above the `wgpu` dependency in `Cargo.toml`) - bump together.
+`wgpu` must exactly match the version bevy itself pins (see the comment
+above the `wgpu` dependency in `Cargo.toml`) — bump together.
 
 ## Font Licensing
 
 The example/test fonts under `examples/assets/fonts/` are SIL OFL
-1.1-licensed, not MIT (this crate's own `license = "MIT"` covers the Rust
-code only): `Mplus1Code-Regular.ttf`
+1.1-licensed, not MIT (this crate's `license = "MIT"` covers the Rust code
+only): `Mplus1Code-Regular.ttf`
 (`examples/assets/fonts/LICENSE/mplus1code.txt`) and
 `fusion-pixel-10px-monospaced-ja.ttf` (`examples/assets/fonts/OFL.txt` +
 `examples/assets/fonts/LICENSE/*.txt` for its bundled source fonts).
 
-## Platform Support
-
-- **Windows** - Full support
-- **macOS** - Full support
-- **Linux** - Full support
-
-## WebAssembly Support
-
-The library renders ratatui terminal UIs as GPU textures, which works in WebGL2 environments. The WASM demo showcases a interactive widget catalog running on a rotating 3D plane in your browser.
-
-### What Works
-
-- Bevy 0.19 + WGPU 29.0 (WebGL2 backend)
-- Full ratatui widget rendering (Tabs, Lists, Charts, Gauges, etc.)
-- Keyboard and mouse input handling
-- 3D ray casting for mouse interaction on 3D meshes
-- Programmatic glyphs (box-drawing, block elements, Braille)
-- Real-time animations and updates
-- Font embedding via `include_bytes!()`
-
 ## Contributing
 
-Contributions are welcome! Please feel free to submit issues or pull requests.
+Contributions are welcome! Feel free to submit issues or pull requests.
 
 ## License
 
@@ -243,18 +198,14 @@ Contributions are welcome! Please feel free to submit issues or pull requests.
 
 ## Acknowledgments
 
-This library builds on the excellent work of:
-
-- **[Bevy](https://bevyengine.org/)** - A refreshingly simple data-driven game engine
-- **[ratatui](https://ratatui.rs/)** - A Rust library for cooking up terminal user interfaces
-- **[WGPU](https://wgpu.rs/)** - Safe and portable GPU abstraction in Rust
-- **[ratatui-wgpu](https://github.com/Jesterhearts/ratatui-wgpu)** - Ratatui WGPU backend that inspired this work
-- **[rio](https://rioterm.com/)** - Beautiful glyph rendering
+- **[Bevy](https://bevyengine.org/)** — a refreshingly simple data-driven game engine
+- **[ratatui](https://ratatui.rs/)** — terminal user interfaces in Rust
+- **[WGPU](https://wgpu.rs/)** — safe and portable GPU abstraction
+- **[ratatui-wgpu](https://github.com/Jesterhearts/ratatui-wgpu)** — the WGPU backend that inspired this work
+- **[rio](https://rioterm.com/)** — beautiful glyph rendering
 
 ## Related Projects
 
-- [bevy_egui](https://github.com/mvlabat/bevy_egui) - Egui integration for Bevy
-- [egui_ratatui](https://github.com/gold-silver-copper/egui_ratatui) - Egui widget + ratatui backend
-- [bevy_ui](https://github.com/bevyengine/bevy/tree/main/crates/bevy_ui) - Native Bevy UI
-- [tui-rs](https://github.com/fdehau/tui-rs) - Original terminal UI library
-
+- [bevy_egui](https://github.com/mvlabat/bevy_egui) — Egui integration for Bevy
+- [egui_ratatui](https://github.com/gold-silver-copper/egui_ratatui) — Egui widget + ratatui backend
+- [bevy_ui](https://github.com/bevyengine/bevy/tree/main/crates/bevy_ui) — native Bevy UI

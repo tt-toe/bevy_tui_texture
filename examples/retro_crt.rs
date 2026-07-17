@@ -310,6 +310,9 @@ enum Hit {
     CameraRadio(u8),
     /// The overlay panel's title bar - click to toggle `panel_collapsed`.
     PanelTitleBar,
+    /// The `light_illuminance` slider's track (between and including its
+    /// `[`/`]` brackets) - press-and-drag anywhere on it to set the value.
+    LightSlider,
 }
 
 impl From<Hit> for u64 {
@@ -322,6 +325,7 @@ impl From<Hit> for u64 {
             Hit::ShadowsCheckbox => 0x05_00,
             Hit::CameraRadio(i) => 0x06_00 | i as u64,
             Hit::PanelTitleBar => 0x07_00,
+            Hit::LightSlider => 0x08_00,
         }
     }
 }
@@ -337,6 +341,7 @@ impl TryFrom<u64> for Hit {
             0x05_00 => Ok(Hit::ShadowsCheckbox),
             0x06_00 => Ok(Hit::CameraRadio((v & 0xff) as u8)),
             0x07_00 => Ok(Hit::PanelTitleBar),
+            0x08_00 => Ok(Hit::LightSlider),
             _ => Err(()),
         }
     }
@@ -348,6 +353,82 @@ const OVERLAY_COLS: u16 = 32;
 const OVERLAY_ROWS: u16 = 21;
 const OVERLAY_ROWS_COLLAPSED: u16 = 1;
 
+/// `light_illuminance` slider geometry, in the overlay terminal's own
+/// (0,0)-rooted grid coordinates - `render_overlay_terminal` always draws
+/// this panel at `frame.area()` with a 1-cell `Block::bordered()` border,
+/// so these are exact fixed columns/row, not read back from `HitRegions`.
+/// Kept in one place so the drawn bar, its `HitRegions` rect, and the
+/// column→value math used while dragging can't drift out of sync.
+const LIGHT_SLIDER_PREFIX: &str = "Light [";
+const LIGHT_SLIDER_TRACK_COLS: u16 = 15;
+const LIGHT_SLIDER_BORDER_LEFT: u16 = 1;
+/// Column of the first character INSIDE the track's brackets.
+const LIGHT_SLIDER_TRACK_X0: u16 =
+    LIGHT_SLIDER_BORDER_LEFT + LIGHT_SLIDER_PREFIX.len() as u16;
+/// Inner-area row the slider's `Line` is drawn on (see `status_lines` in
+/// `render_overlay_terminal` - index 3, right after the FX/Shadow/FPS row).
+const LIGHT_SLIDER_ROW: u16 = 3;
+// A floor of 0 is deliberately NOT used here (unlike the earlier linear
+// version): log10(0) is undefined, and a slider that must represent "off"
+// as an infinitely-small fraction of its travel is a bad slider anyway.
+// 1.0 lux is near-total darkness for this scene's purposes (the emissive
+// CRT screen stays fully lit regardless - see `claim_object2_screen` -
+// only the DirectionalLight's own glass specular highlight actually goes
+// to nothing at the low end).
+const LIGHT_ILLUMINANCE_MIN: f32 = 1.0;
+const LIGHT_ILLUMINANCE_MAX: f32 = 10_000.0;
+
+/// Maps an absolute terminal column to a `light_illuminance` value using
+/// the slider's fixed track geometry. Clamped at both ends, so dragging
+/// past either edge of the track pins the value at MIN/MAX instead of
+/// wrapping or panicking on the `saturating_sub`.
+///
+/// Logarithmic, not linear: perceived brightness and the range of useful
+/// scene-light values both span decades, so a linear mapping would spend
+/// most of the track on values well above anything visually distinct and
+/// leave almost no usable travel near the dark end. Interpolating
+/// `log10(value)` linearly with the column fraction (then exponentiating
+/// back) spends equal slider travel per decade instead - the inverse of
+/// this is [`light_slider_line`]'s fill-fraction calculation.
+fn light_illuminance_from_col(col: u16) -> f32 {
+    let offset = col.saturating_sub(LIGHT_SLIDER_TRACK_X0);
+    let frac = (offset as f32 / (LIGHT_SLIDER_TRACK_COLS - 1) as f32).clamp(0.0, 1.0);
+    let log_min = LIGHT_ILLUMINANCE_MIN.log10();
+    let log_max = LIGHT_ILLUMINANCE_MAX.log10();
+    10f32.powf(log_min + frac * (log_max - log_min))
+}
+
+/// Builds the `light_illuminance` slider's `Line`: `Light [████░░░] 2.0k`.
+/// The inverse of [`light_illuminance_from_col`] - fill count from value,
+/// rather than value from column.
+fn light_slider_line(value: f32) -> Vec<Span<'static>> {
+    let log_min = LIGHT_ILLUMINANCE_MIN.log10();
+    let log_max = LIGHT_ILLUMINANCE_MAX.log10();
+    // `.max(LIGHT_ILLUMINANCE_MIN)` guards `log10` against a value at or
+    // below zero - can't happen from `light_illuminance_from_col` itself,
+    // but `AppState::light_illuminance` is a plain `f32` field, not clamped
+    // at the type level.
+    let frac = ((value.max(LIGHT_ILLUMINANCE_MIN).log10() - log_min) / (log_max - log_min))
+        .clamp(0.0, 1.0);
+    let track_cols = LIGHT_SLIDER_TRACK_COLS as usize;
+    let filled = (frac * track_cols as f32).round() as usize;
+    let bar = "█".repeat(filled) + &"░".repeat(track_cols - filled);
+    // Below 1k, "{:.1}k" would render everything as a useless "0.0k" -
+    // the whole bottom decade of a log scale needs a plain-number format
+    // to stay readable.
+    let label = if value >= 1000.0 {
+        format!("{:.1}k", value / 1000.0)
+    } else {
+        format!("{value:.0}")
+    };
+    vec![
+        Span::raw(LIGHT_SLIDER_PREFIX),
+        Span::styled(bar, Style::default().fg(RatatuiColor::Yellow)),
+        Span::raw("] "),
+        Span::styled(label, Style::default().fg(RatatuiColor::Yellow).bold()),
+    ]
+}
+
 #[derive(Resource)]
 struct AppState {
     effects_enabled: bool,
@@ -356,6 +437,11 @@ struct AppState {
     button_clicked: bool,
     button_click_count: u32,
     light_illuminance: f32,
+    /// Set while a press on `Hit::LightSlider` is held; subsequent
+    /// `MouseMove` events (even ones that stray off the slider's row, as
+    /// long as the button stays down) keep updating `light_illuminance`
+    /// until `MouseRelease`.
+    light_slider_dragging: bool,
     shadows_enabled: bool,
     camera_mode: CameraMode,
     // CRT screen tabs (STATUS / EFFECTS / TABLE), switchable by click or arrow keys
@@ -376,6 +462,7 @@ impl Default for AppState {
             button_click_count: 0,
             // Dim ambient light so the CRT screen (unlit + emissive) stands out
             light_illuminance: 2000.0,
+            light_slider_dragging: false,
             shadows_enabled: true,          // shadows on by default
             camera_mode: CameraMode::Orbit, // default: orbiting camera
             selected_tab: 0,
@@ -401,9 +488,11 @@ struct MainDirectionalLight;
 #[derive(Component)]
 struct GltfModel;
 
-/// GLTF asset handle component
+/// GLTF asset handle component (pub(crate): wasm_demo.rs's boot_status
+/// polls its load state to surface a failed model download on the loading
+/// overlay instead of stalling on "loading 3D model" forever)
 #[derive(Component)]
-struct GltfAsset(Handle<Gltf>);
+pub(crate) struct GltfAsset(pub(crate) Handle<Gltf>);
 
 /// Marker for the main CRT screen's `Tui` entity. Object_2's mesh attaches
 /// to this via `AttachTerminal`, rather than carrying the `Tui` itself. Its
@@ -672,19 +761,34 @@ fn claim_object2_screen(
             terminal: main_screen,
             material: AttachMaterial::custom(move |image| CrtMaterial {
                 base: StandardMaterial {
-                    base_color: bevy::color::Color::WHITE,
-                    base_color_texture: Some(image),
+                    // Self-illuminating screen: the terminal texture goes
+                    // through the EMISSIVE channel, not base_color_texture.
+                    // bevy_pbr's apply_pbr_lighting adds emissive_light
+                    // AFTER the light-dependent diffuse/specular terms
+                    // (bevy_pbr-0.19.0/src/render/pbr_functions.wgsl:863:
+                    // `... + emissive_light`, no light-intensity factor
+                    // anywhere in that term) - so the screen content stays
+                    // fully visible even at `light_illuminance = 0`, same
+                    // as the additive Monitor_Reflection overlay
+                    // (unlit_blur.wgsl, a fully custom Material that never
+                    // samples scene lights at all - see
+                    // `claim_monitor_reflection`).
+                    //
+                    // base_color stays black (no diffuse response to
+                    // scene light) while metallic/roughness/reflectance
+                    // below are kept so the DirectionalLight can still add
+                    // a dielectric glass specular highlight ON TOP of the
+                    // emissive content - that highlight is the one part of
+                    // this material that's legitimately light-dependent,
+                    // since it represents light bouncing off the glass,
+                    // not the screen's own picture.
+                    base_color: bevy::color::Color::BLACK,
+                    emissive_texture: Some(image),
+                    emissive: bevy::color::Color::WHITE.to_linear(),
                     unlit: false,
                     alpha_mode: AlphaMode::Opaque,
                     double_sided,
                     cull_mode,
-                    // Dielectric glass, not the glTF material's own values:
-                    // low roughness + raised reflectance so the
-                    // DirectionalLight's PBR specular highlight ("light
-                    // reflected in the screen") reads clearly through
-                    // apply_pbr_lighting, on top of which the scan-line/
-                    // vignette pass in crt_extended.wgsl still multiplies
-                    // unchanged.
                     metallic: 0.0,
                     perceptual_roughness: 0.15,
                     reflectance: 0.9,
@@ -830,59 +934,79 @@ fn handle_terminal_events(
         {
             // Overlay terminal events - hit-tested via HitRegions, not
             // parallel Rect bookkeeping.
-            if let TerminalEventType::MousePress { position, .. } = &event.event {
-                info!(
-                    "Overlay terminal mouse click at col={}, row={}",
-                    position.0, position.1
-                );
+            match &event.event {
+                TerminalEventType::MousePress { position, .. } => {
+                    info!(
+                        "Overlay terminal mouse click at col={}, row={}",
+                        position.0, position.1
+                    );
 
-                match overlay_tui.hit_regions().hit_at::<Hit>(*position) {
-                    Some(Hit::CrtCheckbox) => {
-                        app_state.effects_enabled = !app_state.effects_enabled;
-                        info!(
-                            "🎯 CRT Effects: {}",
-                            if app_state.effects_enabled {
-                                "ON"
-                            } else {
-                                "OFF"
-                            }
-                        );
-                    }
-                    Some(Hit::ShadowsCheckbox) => {
-                        app_state.shadows_enabled = !app_state.shadows_enabled;
-                        info!(
-                            "🎯 Shadows: {}",
-                            if app_state.shadows_enabled {
-                                "ON"
-                            } else {
-                                "OFF"
-                            }
-                        );
-                    }
-                    Some(Hit::CameraRadio(i)) => {
-                        let new_mode = [
-                            CameraMode::MouseFollow,
-                            CameraMode::Fixed,
-                            CameraMode::Orbit,
-                        ][i as usize];
-                        if app_state.camera_mode != new_mode {
-                            app_state.camera_mode = new_mode;
-                            info!("🎯 Camera: {:?}", new_mode);
+                    match overlay_tui.hit_regions().hit_at::<Hit>(*position) {
+                        Some(Hit::CrtCheckbox) => {
+                            app_state.effects_enabled = !app_state.effects_enabled;
+                            info!(
+                                "🎯 CRT Effects: {}",
+                                if app_state.effects_enabled {
+                                    "ON"
+                                } else {
+                                    "OFF"
+                                }
+                            );
                         }
-                    }
-                    Some(Hit::PanelTitleBar) => {
-                        app_state.panel_collapsed = !app_state.panel_collapsed;
-                        info!(
-                            "🎯 Panel {}",
-                            if app_state.panel_collapsed {
-                                "collapsed"
-                            } else {
-                                "expanded"
+                        Some(Hit::ShadowsCheckbox) => {
+                            app_state.shadows_enabled = !app_state.shadows_enabled;
+                            info!(
+                                "🎯 Shadows: {}",
+                                if app_state.shadows_enabled {
+                                    "ON"
+                                } else {
+                                    "OFF"
+                                }
+                            );
+                        }
+                        Some(Hit::CameraRadio(i)) => {
+                            let new_mode = [
+                                CameraMode::MouseFollow,
+                                CameraMode::Fixed,
+                                CameraMode::Orbit,
+                            ][i as usize];
+                            if app_state.camera_mode != new_mode {
+                                app_state.camera_mode = new_mode;
+                                info!("🎯 Camera: {:?}", new_mode);
                             }
-                        );
+                        }
+                        Some(Hit::PanelTitleBar) => {
+                            app_state.panel_collapsed = !app_state.panel_collapsed;
+                            info!(
+                                "🎯 Panel {}",
+                                if app_state.panel_collapsed {
+                                    "collapsed"
+                                } else {
+                                    "expanded"
+                                }
+                            );
+                        }
+                        Some(Hit::LightSlider) => {
+                            app_state.light_slider_dragging = true;
+                            app_state.light_illuminance = light_illuminance_from_col(position.0);
+                            info!("🎯 Light: {:.0}", app_state.light_illuminance);
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
+                // Only meaningful while a `LightSlider` drag is in progress
+                // (`Hit::LightSlider`'s press sets the flag above) - the
+                // column is applied unconditionally, without re-hit-testing
+                // against row 3, so the drag keeps tracking even if the
+                // cursor strays off the slider's row, matching ordinary GUI
+                // slider behaviour.
+                TerminalEventType::MouseMove { position } if app_state.light_slider_dragging => {
+                    app_state.light_illuminance = light_illuminance_from_col(position.0);
+                }
+                TerminalEventType::MouseRelease { .. } => {
+                    app_state.light_slider_dragging = false;
+                }
+                _ => {}
             }
         } else {
             info!(
@@ -1452,13 +1576,7 @@ fn render_overlay_terminal(
                 ),
             ]),
             Line::from(""),
-            Line::from(vec![
-                Span::raw("Light:"),
-                Span::styled(
-                    format!("{:.0}k", app_state.light_illuminance / 1000.0),
-                    Style::default().fg(RatatuiColor::Yellow).bold(),
-                ),
-            ]),
+            Line::from(light_slider_line(app_state.light_illuminance)),
             Line::from(""),
             Line::from(vec![
                 radio_span(app_state.camera_mode == CameraMode::MouseFollow),
@@ -1547,6 +1665,19 @@ fn render_overlay_terminal(
             },
         );
 
+        // Light illuminance slider track (row 3, includes both brackets).
+        // `- 1` backs up from the first bar char (`LIGHT_SLIDER_PREFIX`'s
+        // length, which already counts the '[') onto the '[' itself.
+        hits.add(
+            Hit::LightSlider,
+            ratatui::layout::Rect {
+                x: inner_area.x + LIGHT_SLIDER_PREFIX.len() as u16 - 1,
+                y: inner_area.y + LIGHT_SLIDER_ROW,
+                width: LIGHT_SLIDER_TRACK_COLS + 2, // '[' + track + ']'
+                height: 1,
+            },
+        );
+
         // Camera mode radio buttons (rows 5-7)
         hits.add(
             Hit::CameraRadio(0), // MouseFollow
@@ -1583,6 +1714,7 @@ fn update_camera_rotation(
     app_state: Res<AppState>,
     mut camera_query: Query<&mut Transform, (With<OrbitCamera>, With<Camera3d>)>,
     windows: Query<&Window>,
+    cursor: Res<CursorPosition>,
 ) {
     let Ok(mut transform) = camera_query.single_mut() else {
         return;
@@ -1592,7 +1724,14 @@ fn update_camera_rotation(
     transform.translation = match app_state.camera_mode {
         CameraMode::MouseFollow => {
             let Ok(window) = windows.single() else { return };
-            let Some(cursor_pos) = window.cursor_position() else {
+            // `window.cursor_position()` is None on touch devices - no
+            // mouse cursor exists there, so Mouse Follow would never move.
+            // `CursorPosition` (this crate's own tracked resource) already
+            // falls back to the first active touch's position on such
+            // devices (see its doc comment / `update_cursor_position_system`),
+            // so a touch-and-drag on a phone drives this the same way a
+            // mouse move does on desktop.
+            let Some(cursor_pos) = cursor.position else {
                 return;
             };
 

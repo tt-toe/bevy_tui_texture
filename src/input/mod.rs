@@ -148,7 +148,9 @@ impl Default for TerminalInputConfig {
 /// Cached cursor position in window coordinates.
 ///
 /// Updated by `update_cursor_position_system` and used by `mouse_input_system`
-/// for hit-testing.
+/// for hit-testing. On touch devices (where no mouse cursor exists) this
+/// holds the first active touch's position instead - see
+/// [`update_cursor_position_system`].
 #[derive(Resource, Default, Debug)]
 pub struct CursorPosition {
     /// Current cursor position, or None if cursor is outside window
@@ -270,13 +272,27 @@ fn remap_to_tui(entity: Entity, surfaces: &Query<&crate::setup::TuiSurface>) -> 
 ///
 /// This system reads the cursor position from the primary window and updates
 /// the `CursorPosition` resource for use by other input systems.
+///
+/// Falls back to the first active touch's position when no mouse cursor is
+/// available: on touch devices (mobile browsers in particular) winit reports
+/// taps as touch events only and never moves a mouse cursor, so without
+/// this fallback a tap would never hit-test at all. Touch positions arrive
+/// in the same logical-pixel, top-left-origin window space as
+/// `Window::cursor_position()` (bevy_winit converts with `to_logical`).
+/// The frame a touch ends, `first_pressed_position` is already `None`, but
+/// `mouse_input_system` still needs a position to emit `MouseRelease` at -
+/// hence the second fallback to the just-released touch's last position.
 pub fn update_cursor_position_system(
     mut cursor_pos: ResMut<CursorPosition>,
     windows: Query<&Window>,
+    touches: Res<Touches>,
 ) {
     // Get primary window
     if let Ok(window) = windows.single() {
-        cursor_pos.position = window.cursor_position();
+        cursor_pos.position = window
+            .cursor_position()
+            .or_else(|| touches.first_pressed_position())
+            .or_else(|| touches.iter_just_released().next().map(|t| t.position()));
     }
 }
 
@@ -792,6 +808,7 @@ fn emit_button_events(
     col: u16,
     row: u16,
     buttons: &ButtonInput<MouseButton>,
+    touches: &Touches,
     focus: &mut TerminalFocus,
     config: &TerminalInputConfig,
     surfaces: &Query<&crate::setup::TuiSurface>,
@@ -799,7 +816,11 @@ fn emit_button_events(
 ) {
     let target = remap_to_tui(surface_entity, surfaces);
     for button in [MouseButton::Left, MouseButton::Right, MouseButton::Middle] {
-        if buttons.just_pressed(button) {
+        // Touch taps emulate the left mouse button: winit never synthesizes
+        // mouse events from touches, so without this a tap hit-tests (via
+        // the CursorPosition touch fallback) but never presses anything.
+        let touch = button == MouseButton::Left;
+        if buttons.just_pressed(button) || (touch && touches.any_just_pressed()) {
             emit_focus_events(
                 surface_entity,
                 &mut focus.focused,
@@ -818,7 +839,7 @@ fn emit_button_events(
             });
         }
 
-        if buttons.just_released(button) {
+        if buttons.just_released(button) || (touch && touches.any_just_released()) {
             events.write(TerminalEvent {
                 target,
                 event: TerminalEventType::MouseRelease {
@@ -853,6 +874,7 @@ fn emit_button_events(
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn mouse_input_system(
     buttons: Res<ButtonInput<MouseButton>>,
+    touches: Res<Touches>,
     cursor: Res<CursorPosition>,
     config: Res<TerminalInputConfig>,
     mut focus: ResMut<TerminalFocus>,
@@ -910,7 +932,10 @@ pub fn mouse_input_system(
     };
 
     let cursor_moved = *last_cursor_pos != Some(cursor_pos);
-    let button_transition = buttons.get_just_pressed().len() > 0 || buttons.get_just_released().len() > 0;
+    let button_transition = buttons.get_just_pressed().len() > 0
+        || buttons.get_just_released().len() > 0
+        || touches.any_just_pressed()
+        || touches.any_just_released();
     let scene_changed = !camera_change_probe.is_empty()
         || !terminal_3d_changed.is_empty()
         || !terminal_ui_changed.is_empty();
@@ -1079,6 +1104,7 @@ pub fn mouse_input_system(
             hit_result.col,
             hit_result.row,
             &buttons,
+            &touches,
             &mut focus,
             &config,
             &surfaces,
@@ -1093,6 +1119,7 @@ pub fn mouse_input_system(
 #[allow(clippy::type_complexity)]
 pub fn mouse_input_system(
     buttons: Res<ButtonInput<MouseButton>>,
+    touches: Res<Touches>,
     cursor: Res<CursorPosition>,
     config: Res<TerminalInputConfig>,
     mut focus: ResMut<TerminalFocus>,
@@ -1130,7 +1157,10 @@ pub fn mouse_input_system(
     };
 
     let cursor_moved = *last_cursor_pos != Some(cursor_pos);
-    let button_transition = buttons.get_just_pressed().len() > 0 || buttons.get_just_released().len() > 0;
+    let button_transition = buttons.get_just_pressed().len() > 0
+        || buttons.get_just_released().len() > 0
+        || touches.any_just_pressed()
+        || touches.any_just_released();
     if !cursor_moved && !button_transition && terminal_ui_changed.is_empty() {
         return;
     }
@@ -1175,6 +1205,7 @@ pub fn mouse_input_system(
             hit_result.col,
             hit_result.row,
             &buttons,
+            &touches,
             &mut focus,
             &config,
             &surfaces,
@@ -1189,6 +1220,7 @@ pub fn mouse_input_system(
 #[allow(clippy::type_complexity)]
 pub fn mouse_input_system(
     buttons: Res<ButtonInput<MouseButton>>,
+    touches: Res<Touches>,
     cursor: Res<CursorPosition>,
     config: Res<TerminalInputConfig>,
     mut focus: ResMut<TerminalFocus>,
@@ -1230,7 +1262,10 @@ pub fn mouse_input_system(
     };
 
     let cursor_moved = *last_cursor_pos != Some(cursor_pos);
-    let button_transition = buttons.get_just_pressed().len() > 0 || buttons.get_just_released().len() > 0;
+    let button_transition = buttons.get_just_pressed().len() > 0
+        || buttons.get_just_released().len() > 0
+        || touches.any_just_pressed()
+        || touches.any_just_released();
     let scene_changed = !camera_change_probe.is_empty() || !terminal_3d_changed.is_empty();
     if !cursor_moved && !button_transition && !scene_changed {
         return;
@@ -1324,6 +1359,7 @@ pub fn mouse_input_system(
             hit_result.col,
             hit_result.row,
             &buttons,
+            &touches,
             &mut focus,
             &config,
             &surfaces,

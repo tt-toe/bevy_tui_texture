@@ -25,11 +25,12 @@ downstream code can name matching types without pinning its own copies).
   marks the component dirty only if cells actually changed (byte-identical
   redraws are free; calling it every frame is the intended pattern).
 - The plugin renders dirty terminals **entirely in the render world**,
-  directly into the destination `Image`'s `GpuImage` (one frame of
-  latency). There is **no CPU readback, no GPU→GPU copy, and no material
-  touching** anywhere — any material type (`StandardMaterial`,
-  `ExtendedMaterial`, fully custom) updates automatically with zero
-  registration.
+  directly into the destination `Image`'s `GpuImage` — in the **same frame**
+  as the draw, before the camera passes (a structural guarantee from
+  render-graph set ordering). There is **no CPU readback, no GPU→GPU copy,
+  and no material touching** anywhere — any material type
+  (`StandardMaterial`, `ExtendedMaterial`, fully custom) updates
+  automatically with zero registration.
 - User systems never need `RenderDevice`, `RenderQueue`, `Assets<Image>`,
   `Assets<Mesh>`, or `Assets<StandardMaterial>` — not at spawn time, not
   per frame.
@@ -60,7 +61,10 @@ downstream code can name matching types without pinning its own copies).
    re-claims automatically until the async glTF loader stops overwriting
    the material, then goes idle (no archetype churn once settled).
    `AttachMaterial::standard(AlphaMode::Opaque)` or
-   `::custom(|image| MyMaterial { ... })`.
+   `::custom(|image| MyMaterial { ... })`. For a self-illuminating screen,
+   route `image` through the material's EMISSIVE channel (black
+   `base_color`, white `emissive`) so content stays visible regardless of
+   scene lighting — see `claim_object2_screen` in `examples/retro_crt.rs`.
 3. **`TerminalTexture::create(cols, rows, fonts, programmatic_glyphs,
    transparent_reset_bg, initial_fill, &mut images)` +
    `Tui::from_texture_state(...)`** — low-level escape hatch only (see
@@ -147,6 +151,13 @@ Variants: `KeyPress { key, modifiers }`, `CharInput { character }`,
   `KeyPress`/`CharInput`. Clicking a terminal focuses it
   (`TerminalInputConfig::focus_button`, default left); Tab cycles focus
   when `auto_focus` is on. Mouse events need no focus.
+- **Touch works with no extra code**: `CursorPosition` (the crate's
+  tracked resource) falls back to the first active touch's position (and
+  the just-released touch's last position on the release frame), and a
+  tap emits left-button `MousePress`/`MouseRelease`. In your own systems,
+  read `Res<CursorPosition>` instead of `Window::cursor_position()` —
+  the latter is `None` on touch devices (see `update_camera_rotation` in
+  `examples/retro_crt.rs`).
 - **Plugin constructors**: `TerminalPlugin::default()` (all input),
   `::new(TerminalInputConfig { keyboard_enabled, mouse_enabled,
   auto_focus, focus_button })`, `::without_keyboard()`,
@@ -162,7 +173,11 @@ Variants: `KeyPress { key, modifiers }`, `CharInput { character }`,
 Per-widget hit testing: `tui.draw_with_hits(|frame, hits| {
 hits.add(id, rect); ... })` then
 `tui.hit_regions().hit_at::<MyId>((col, row))` (topmost/last wins; a
-failed id decode returns `None`, it does not fall through).
+failed id decode returns `None`, it does not fall through). For a
+press-and-drag widget (e.g. a slider), latch a `bool` on `MousePress` over
+the region, apply `MouseMove` positions unconditionally while latched, and
+clear on `MouseRelease` — see `Hit::LightSlider` in
+`examples/retro_crt.rs`.
 
 ## WASM / WebGL2 (hard-won — read before shipping a browser build)
 
@@ -179,22 +194,38 @@ failed id decode returns `None`, it does not fall through).
   default `Functionality` priority trusts raw adapter limits + enables
   experimental features, which has produced unrecoverable startup traps
   on WebGL2.
-- **Keep the canvas ≤ 2048 physical pixels per dimension.** WebGL2's
-  guaranteed `max_texture_dimension_2d` is 2048, and
-  `fit_canvas_to_parent` multiplies CSS size by `devicePixelRatio` — on
-  Retina (DPR 2) a ~1100 CSS-px window already exceeds the cap, the
-  surface fails validation, and bevy 0.19 quits to a black screen.
-  Clamp the canvas's CSS `max-width`/`max-height` to
-  `2048 / devicePixelRatio` (see `clamp_canvas_to_safe_texture_size` in
-  `examples/wasm_demo.rs`). Spoofing `window.devicePixelRatio` via
-  `Object.defineProperty` does NOT work — winit measures via
-  `ResizeObserver`'s `devicePixelContentBoxSize`, which bypasses the JS
-  property.
+- **Keep every surface dimension under ~2032 physical pixels — and clamp
+  in TWO places.** WebGL2's guaranteed `max_texture_dimension_2d` is
+  2048, and `fit_canvas_to_parent` multiplies CSS size by
+  `devicePixelRatio`. An over-limit `Surface::configure` fails, the
+  surface stays unconfigured, and the next `get_current_texture` panics.
+  1. CSS ceiling on the live canvas: `max-width`/`max-height` =
+     `MAX_PHYSICAL_PX / devicePixelRatio`
+     (`clamp_canvas_to_safe_texture_size` in `examples/wasm_demo.rs`).
+     Use a margin below 2048 (the demo uses 2032): Safari lacks
+     `devicePixelContentBoxSize`, so winit computes css×DPR with its own
+     rounding and an exact clamp can tip past the cap. Spoofing
+     `window.devicePixelRatio` does NOT work — winit measures via
+     `ResizeObserver`.
+  2. **Bevy's initial `WindowResolution` too**
+     (`clamp_initial_window_resolution`): the FIRST frame's surface is
+     configured from that value × real DPR before any ResizeObserver
+     report — a 1024×768 default on a DPR-3 phone requests 3072×2304 and
+     dies before the CSS clamp ever applies. Rewrite the `PrimaryWindow`'s
+     resolution before `App::run()`.
 - The **glyph atlas is already WebGL2-safe by construction** (2048×2048,
   exactly the cap — same on native and wasm, so it has no wasm-only
   failure mode). The per-terminal destination texture is
   `cols·char_w × rows·char_h`; staying under the GPU cap for huge
   grid/font combinations is the caller's responsibility.
+- **Give mobile users a diagnosable boot**: on mobile Safari there is no
+  reachable console, so the demo forwards panics (with wasm heap MB — a
+  climbing heap ending in an "unreachable" RuntimeError is the OOM
+  signature), glTF load failures, per-stage heartbeats, and mirrored
+  `console.warn/error` lines to the loading overlay, latching the FIRST
+  fatal message (post-trap rethrows are noise). Set `touch-action: none`
+  on the canvas or Safari claims taps for scrolling/zoom. Patterns in
+  `examples/wasm_demo.rs` + `examples/web/index.html`.
 - **Suppressing browser-hostile keys** (e.g. an Escape handler that
   quits): register your own DOM `keydown` listener on the canvas BEFORE
   `App::run()` and call `stop_immediate_propagation()` — same-target DOM
@@ -214,6 +245,7 @@ failed id decode returns `None`, it does not fall through).
 - All terminal textures are `Rgba8Unorm`; the render is a two-pass
   (background quads, then glyphs) directly into the destination
   `GpuImage::texture_view`.
+- Partial redraws upload only dirty rows; unchanged frames upload nothing.
 
 ## Invariants agents must not break
 
@@ -235,8 +267,10 @@ failed id decode returns `None`, it does not fall through).
   `<MESH>.<MATERIAL>` (e.g. `Object_2.Monitor_Glass`), not after the node;
   exact-match, never prefix-match (`Object_2` also hits `Object_20`).
 - **Feature gates**: `2d`/`3d`/`keyboard_input`/`mouse_input` (all
-  default), plus opt-in `bold_italic_fonts` and `emoji`. `TuiKind::Ui`
-  needs `2d`, `WorldQuad` needs `3d`, `Headless` is always available.
+  default), plus opt-in `bold_italic_fonts`, `emoji`, and
+  `ascii_fast_shaping` (shaping bypass for all-ASCII rows; silently inert
+  when `bold_italic_fonts` is on). `TuiKind::Ui` needs `2d`, `WorldQuad`
+  needs `3d`, `Headless` is always available.
 
 ## Stale patterns (training-data API — DELETED, do not write these)
 
@@ -249,15 +283,18 @@ failed id decode returns `None`, it does not fall through).
 | Per-material-type plugin registration for texture updates | Nothing — works for any `Material` impl |
 | `EventReader<TerminalEvent>` | `MessageReader<TerminalEvent>` (bevy 0.18+ messages) |
 | `Font::new(bytes.leak())` for runtime fonts | `Font::from_vec(bytes)` |
+| `window.cursor_position()` for terminal picking | `Res<CursorPosition>` (has the touch fallback) |
 | 1800×1200 atlas constants | 2048×2048 (`CACHE_WIDTH`/`CACHE_HEIGHT`) |
 
 ## Verification (what CI runs — .github/workflows/ci.yml)
 
 ```bash
-cargo test --all-features                       # 60 tests, GPU-free except 1 skip-capable
+cargo test --all-features                       # inline #[cfg(test)] modules;
+                                                # GPU-free except 1 skip-capable
 cargo clippy --all-features --all-targets -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 cargo check --lib --no-default-features         # + --features 2d / 3d variants
+cargo check --target wasm32-unknown-unknown --example wasm_demo
 cargo run --example helloworld                  # ALWAYS cargo run, never the bare
                                                 # binary (assets resolve via CARGO_MANIFEST_DIR)
 ```
@@ -273,5 +310,5 @@ runtime, so local preview must serve from `examples/` (not
 `examples/web/` itself), see `examples/web/README.md`.
 
 Deeper reference: `examples/` (one per feature — `resize.rs`, `transparent_world_quad.rs`,
-`world_terminal.rs` for async fonts, `retro_crt.rs` for glTF attach,
-`wasm_demo.rs` for the browser shim).
+`world_terminal.rs` for async fonts, `retro_crt.rs` for glTF attach + drag
+slider, `wasm_demo.rs` for the browser shim + boot diagnostics).

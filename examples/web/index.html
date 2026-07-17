@@ -38,6 +38,10 @@
       max-width: 100%;
       max-height: 100%;
       outline: none;
+      /* Hand every touch gesture to the canvas (winit's pointer listeners):
+         without this, mobile Safari can claim a tap for scrolling or
+         double-tap zoom before the page ever sees pointerdown. */
+      touch-action: none;
     }
     #loading {
       position: absolute;
@@ -53,6 +57,17 @@
       pointer-events: none;
       text-align: center;
       padding: 0 1em;
+    }
+    /* Most recent console.warn/console.error line, mirrored under the
+       status text - on mobile Safari there is no reachable console without
+       a tethered desktop inspector, so this is often the only way to see
+       engine/wgpu errors at all. */
+    #loading-console {
+      max-width: min(600px, 90vw);
+      font-size: 0.75em;
+      color: #bf9f7f;
+      overflow-wrap: anywhere;
+      white-space: pre-wrap;
     }
     #progress-track {
       width: min(320px, 80vw);
@@ -84,6 +99,7 @@
   <div id="loading">
     <div id="loading-text">loading wasm_demo_bg.wasm …</div>
     <div id="progress-track"><div id="progress-fill"></div></div>
+    <div id="loading-console"></div>
   </div>
   <canvas id="bevy"></canvas>
   <script type="module">
@@ -102,7 +118,9 @@
 
     const textEl = document.getElementById('loading-text');
     const fillEl = document.getElementById('progress-fill');
+    let currentMsg = 'loading wasm_demo_bg.wasm …';
     const status = (msg) => {
+      currentMsg = msg;
       if (textEl) textEl.textContent = msg;
     };
 
@@ -113,13 +131,110 @@
     // wasm sends staged milestone strings as they happen, and the special
     // string 'ready' - sent one frame after the CRT model's material lands,
     // i.e. after its first real render - finally removes the overlay.
+    // Latched by the FIRST fatal report (a Rust panic forwarded through
+    // __demoStatus, or one of the error listeners below). After a wasm trap,
+    // every subsequent call into the poisoned module rethrows the same
+    // generic "Unreachable code should not be executed" RuntimeError once
+    // per rAF - without the latch, that noise immediately overwrites the
+    // one message that actually says what went wrong.
+    let fatalShown = false;
+    const reportFatal = (desc) => {
+      if (fatalShown) return;
+      fatalShown = true;
+      status(desc);
+    };
+
     window.__demoStatus = (msg) => {
       if (msg === 'ready') {
         document.getElementById('loading')?.remove();
-      } else {
+      } else if (msg.startsWith('panicked')) {
+        reportFatal(msg);
+      } else if (!fatalShown) {
         status(msg);
       }
     };
+
+    // Late-failure diagnostics: without these the overlay freezes on the
+    // last milestone with no hint of WHY (observed on iPhone Safari, whose
+    // GPU/WebGL memory caps sit well below iPad's). Rust panics are
+    // forwarded to __demoStatus by the wasm side's own panic hook; these
+    // listeners catch what that hook can't:
+    // - JS exceptions escaping the engine's rAF callbacks - including the
+    //   "unreachable" trap of an OUT-OF-MEMORY abort, which never runs the
+    //   panic hook (a failed memory.grow kills the module directly),
+    // - WebGL context loss (mobile Safari revokes the context under memory
+    //   pressure - the tab survives but rendering silently stops).
+    // (winit's "Using exceptions for control flow" startup exception is
+    // expected, not an error - filtered here just like in the catch below.)
+    const describeError = (raw) => {
+      if (`${raw}`.includes('Unreachable code should not be executed')) {
+        return `error: ${raw} — the wasm module crashed hard. No "panicked:" `
+          + 'message before this usually means an out-of-memory abort '
+          + '(memory.grow failed; watch the "heap" figure in the loading '
+          + 'status - iPhone Safari caps per-tab memory well below iPad).';
+      }
+      return `error: ${raw}`;
+    };
+    window.addEventListener('error', (e) => {
+      if (`${e.message}`.includes('Using exceptions for control flow')) return;
+      reportFatal(describeError(e.message));
+    });
+    window.addEventListener('unhandledrejection', (e) => {
+      if (`${e.reason}`.includes('Using exceptions for control flow')) return;
+      reportFatal(describeError(e.reason));
+    });
+    document.getElementById('bevy').addEventListener('webglcontextlost', () => {
+      reportFatal('WebGL context lost — the browser revoked GPU resources, '
+        + 'usually memory pressure (iOS Safari’s GPU memory cap is much lower '
+        + 'on iPhone than iPad).');
+    });
+
+    // Main-thread liveness ticker: appends a spinner + elapsed seconds to
+    // whatever status is showing. Timers share the main thread with the
+    // engine's rAF frames, so during a boot stall this splits the two
+    // possible worlds at a glance:
+    // - spinner keeps turning, status text never advances → the main thread
+    //   is alive but an async step never completes (e.g. wgpu renderer
+    //   init stuck - the known Bevy 0.19 wasm startup hang looks like this),
+    // - spinner frozen too → the main thread itself is stalled (synchronous
+    //   shader compile, busy-wait, or the tab is about to be killed).
+    const bootT0 = Date.now();
+    const SPIN = ['|', '/', '—', '\\'];
+    let spinI = 0;
+    setInterval(() => {
+      if (fatalShown || !textEl || !document.getElementById('loading')) return;
+      const secs = Math.round((Date.now() - bootT0) / 1000);
+      textEl.textContent = `${currentMsg} ${SPIN[spinI++ % SPIN.length]} ${secs}s`;
+    }, 250);
+
+    // Mirror console.warn/console.error lines into the overlay (see
+    // #loading-console's CSS comment). bevy_log routes engine/wgpu warnings
+    // and errors here on wasm; the panic hook's console output lands here
+    // too. Keeps the FIRST few distinct lines plus the latest one - the
+    // first error is usually the root cause (e.g. the surface-configure
+    // failure) and everything after it cascade noise (e.g. the
+    // get_current_texture panic repeating every frame); showing only the
+    // last line buried exactly the line that mattered.
+    const conEl = document.getElementById('loading-console');
+    const conFirst = [];
+    let conLast = '';
+    const conRender = () => {
+      if (!conEl) return;
+      const lines = [...conFirst];
+      if (conLast && !conFirst.includes(conLast)) lines.push('⋮', conLast);
+      conEl.textContent = lines.join('\n');
+    };
+    for (const level of ['warn', 'error']) {
+      const orig = console[level].bind(console);
+      console[level] = (...args) => {
+        orig(...args);
+        const line =
+          `console.${level}: ${args.map(String).join(' ')}`.slice(0, 300);
+        if (conFirst.length < 3 && !conFirst.includes(line)) conFirst.push(line);
+        conLast = line;
+        conRender();
+      };
+    }
 
     // Shown when init() hands control to the engine (see below). Set BEFORE
     // the first engine frame runs so this exact text is what stays frozen on

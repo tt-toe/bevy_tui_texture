@@ -31,7 +31,20 @@ use wasm_bindgen::prelude::*;
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen(start)]
 pub fn wasm_main() {
-    console_error_panic_hook::set_once();
+    // Panics: log to the console (console_error_panic_hook) AND forward to
+    // the loading overlay. On mobile Safari there is no reachable console
+    // without a tethered desktop inspector, so the overlay is often the
+    // only place a panic message can be seen at all - without this, a
+    // panic just freezes the overlay on whatever milestone was last sent.
+    // The heap size distinguishes a logic panic from one triggered at the
+    // edge of the browser's memory cap. (An out-of-memory ABORT - a failed
+    // memory.grow - never runs this hook at all: it traps straight to a
+    // JS-side "Unreachable code should not be executed" RuntimeError, which
+    // index.html's error listener annotates as probable OOM.)
+    std::panic::set_hook(Box::new(|info| {
+        console_error_panic_hook::hook(info);
+        demo_status(&format!("panicked (heap {} MB): {info}", wasm_heap_mb()));
+    }));
 
     // WebGL2 availability probe, on a THROWAWAY canvas - probing #bevy
     // itself would take its context and break wgpu's own getContext later
@@ -70,8 +83,38 @@ pub fn wasm_main() {
     // directory below examples/assets/ (httpd rooted at `examples/`; see
     // examples/web/README.md), hence "../assets".
     let mut app = retro_crt::build_app("../assets");
+    clamp_initial_window_resolution(&mut app);
     boot_status::register(&mut app);
     app.run();
+}
+
+/// Current wasm linear-memory size in MB (`memory_size` counts 64KiB
+/// pages). This is the number iOS Safari's per-tab memory cap judges:
+/// wasm memory only ever grows, so a climbing figure in the loading
+/// heartbeat that ends in an "unreachable" RuntimeError is the signature
+/// of an out-of-memory abort.
+#[cfg(target_arch = "wasm32")]
+fn wasm_heap_mb() -> usize {
+    core::arch::wasm32::memory_size(0) * 64 / 1024
+}
+
+/// Forwards a milestone to `window.__demoStatus`. If the hook is absent
+/// (a host serving the module without the overlay), silently no-ops.
+/// File-scope (not inside `boot_status`) because the panic hook in
+/// `wasm_main` forwards panic messages through it too.
+#[cfg(target_arch = "wasm32")]
+fn demo_status(msg: &str) {
+    use wasm_bindgen::{JsCast, JsValue};
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let Ok(hook) = js_sys::Reflect::get(&window, &"__demoStatus".into()) else {
+        return;
+    };
+    let Ok(hook) = hook.dyn_into::<js_sys::Function>() else {
+        return;
+    };
+    let _ = hook.call1(&JsValue::NULL, &msg.into());
 }
 
 /// Boot-progress reporting to the page's loading overlay.
@@ -90,27 +133,28 @@ mod boot_status {
     use bevy::prelude::*;
     use bevy::world_serialization::WorldAssetRoot;
 
-    use crate::retro_crt::CrtMaterial;
+    use super::demo_status;
+    use crate::retro_crt::{CrtMaterial, GltfAsset};
 
     /// Registers the milestone reporter.
     pub fn register(app: &mut App) {
         app.add_systems(Update, report_boot_status);
     }
 
-    /// Forwards a milestone to `window.__demoStatus`. If the hook is absent
-    /// (a host serving the module without the overlay), silently no-ops.
-    fn demo_status(msg: &str) {
-        use wasm_bindgen::{JsCast, JsValue};
-        let Some(window) = web_sys::window() else {
-            return;
-        };
-        let Ok(hook) = js_sys::Reflect::get(&window, &"__demoStatus".into()) else {
-            return;
-        };
-        let Ok(hook) = hook.dyn_into::<js_sys::Function>() else {
-            return;
-        };
-        let _ = hook.call1(&JsValue::NULL, &msg.into());
+    /// Once-per-second progress tick for a stage that is WAITING on
+    /// something: `Some("<label> … 12s / heap 340 MB")` when the whole-second
+    /// count advances (and at least a few seconds have passed - a fast boot
+    /// never sees it), `None` otherwise. A climbing counter proves the main
+    /// loop is alive (just slow); a frozen one means the tab stalled. The
+    /// heap figure is for diagnosing out-of-memory aborts - see
+    /// [`wasm_heap_mb`](super::wasm_heap_mb).
+    fn heartbeat(label: &str, elapsed_secs: &mut f32, time: &Time) -> Option<String> {
+        let before = *elapsed_secs as u32;
+        *elapsed_secs += time.delta_secs();
+        let now = *elapsed_secs as u32;
+        (now > before && now >= 3).then(|| {
+            format!("{label} … {now}s / heap {} MB", super::wasm_heap_mb())
+        })
     }
 
     /// Drives the loading overlay's staged status text. Timing note: on wasm
@@ -145,8 +189,11 @@ mod boot_status {
     fn report_boot_status(
         scene_spawned: Query<(), Added<WorldAssetRoot>>,
         crt_material_added: Query<(), Added<MeshMaterial3d<CrtMaterial>>>,
+        gltf_model: Query<&GltfAsset>,
+        asset_server: Res<AssetServer>,
         time: Res<Time>,
         mut stage: Local<u8>,
+        mut stage_elapsed_secs: Local<f32>,
         mut stage3_elapsed_secs: Local<f32>,
     ) {
         /// The CRT screen's own compile-and-first-render stall measured
@@ -164,6 +211,21 @@ mod boot_status {
                 if !scene_spawned.is_empty() {
                     demo_status("compiling CRT shaders …");
                     *stage = 2;
+                    *stage_elapsed_secs = 0.0;
+                } else if let Ok(gltf) = gltf_model.single()
+                    && let bevy::asset::LoadState::Failed(err) =
+                        asset_server.load_state(&gltf.0)
+                {
+                    // A failed .glb fetch/parse otherwise stalls the overlay
+                    // on "loading 3D model" forever with the reason visible
+                    // only in the console - unreachable on mobile Safari
+                    // without a tethered desktop inspector.
+                    demo_status(&format!("failed to load 3D model: {err}"));
+                    *stage = u8::MAX;
+                } else if let Some(msg) =
+                    heartbeat("loading 3D model (2.5 MB)", &mut stage_elapsed_secs, &time)
+                {
+                    demo_status(&msg);
                 }
             }
             2 => {
@@ -171,6 +233,10 @@ mod boot_status {
                     demo_status("waiting for material …");
                     *stage = 3;
                     *stage3_elapsed_secs = 0.0;
+                } else if let Some(msg) =
+                    heartbeat("compiling CRT shaders", &mut stage_elapsed_secs, &time)
+                {
+                    demo_status(&msg);
                 }
             }
             3 => {
@@ -219,10 +285,24 @@ mod boot_status {
 // size. retro_crt.rs is shared with the native binary, so - same reasoning
 // as `suppress_canvas_escape_key` - this stays purely in this wasm-only
 // file rather than adding a wasm32 branch there.
+// Deliberately below the real 2048 WebGL2-priority ceiling: the exact
+// clamp (floor(2048/dpr) CSS px) leaves only a couple physical pixels
+// of headroom (682*3 = 2046), and on browsers without
+// devicePixelContentBox (Safari, iOS in particular) winit measures the
+// physical size itself as css*devicePixelRatio with its own rounding -
+// a fractional layout box (flex centering) or rounding-up there can
+// tip the surface past 2048, whose Surface::configure validation
+// failure leaves the surface unconfigured and the next
+// get_current_texture panics ("Surface is not configured for
+// presentation" - observed on iPhone Safari). 16 physical px of margin
+// costs nothing visible and absorbs any such off-by-a-few measurement.
+// Shared by both clamps below: the CSS ceiling on the live canvas and the
+// pre-`run()` clamp of bevy's initial `WindowResolution`.
+#[cfg(target_arch = "wasm32")]
+const MAX_PHYSICAL_PX: f64 = 2032.0;
+
 #[cfg(target_arch = "wasm32")]
 fn clamp_canvas_to_safe_texture_size() {
-    const MAX_PHYSICAL_PX: f64 = 2048.0;
-
     let Some(window) = web_sys::window() else {
         return;
     };
@@ -236,6 +316,62 @@ fn clamp_canvas_to_safe_texture_size() {
     };
     let _ = style.set_property("max-width", &format!("{max_css_px}px"));
     let _ = style.set_property("max-height", &format!("{max_css_px}px"));
+}
+
+// Even with `clamp_canvas_to_safe_texture_size`'s CSS ceiling in place, the
+// FIRST frame's surface still blows past the texture limit on high-DPR
+// phones: the CSS clamp only takes effect once winit's ResizeObserver
+// reports a (clamped) canvas size, but bevy configures the initial surface
+// from its own `WindowResolution` record before any such report arrives
+// (winit's web backend never measures the canvas at creation - its cached
+// size starts at 0x0 until the observer fires). `bevy_winit` hands
+// retro_crt.rs's `WindowResolution::new(1024, 768)` to winit as a *logical*
+// size (bevy_winit-0.19.0/src/winit_windows.rs:114-119 - no scale-factor
+// override set, and the stored scale factor is still 1.0 at creation), the
+// browser multiplies by the real devicePixelRatio, and the first
+// `Surface::configure` requests 1024x768 x DPR - on an iPhone (DPR 3)
+// that's 3072x2304, over the WebGL2-priority 2048 ceiling. The configure
+// fails (bevy 0.19 catches it as a render error), the surface stays
+// unconfigured, and the very next `get_current_texture` panics - all
+// before `fit_canvas_to_parent` or the CSS clamp above ever get to correct
+// the size. (DPR-2 desktop displays squeaked through by luck: 1024 x 2 =
+// 2048, exactly at the limit.)
+//
+// So ALSO clamp bevy's own initial resolution by the real devicePixelRatio
+// before `run()`, keeping every first-frame surface dimension within
+// `MAX_PHYSICAL_PX`. The clamped value only lives for a frame or two -
+// `fit_canvas_to_parent` plus the CSS ceiling take over as soon as the
+// ResizeObserver reports - so the distorted aspect ratio is never visible.
+// Same reasoning as the other browser-side fixes in this file for why this
+// lives here and not in the shared retro_crt.rs: `WindowPlugin` has already
+// spawned the `PrimaryWindow` entity by the time `build_app` returns, so
+// its `Window` component can be rewritten from here before `run()`.
+#[cfg(target_arch = "wasm32")]
+fn clamp_initial_window_resolution(app: &mut bevy::app::App) {
+    use bevy::prelude::With;
+    use bevy::window::{PrimaryWindow, Window};
+
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let dpr = window.device_pixel_ratio();
+    if !(dpr > 0.0) {
+        return;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let max_logical_px = (MAX_PHYSICAL_PX / dpr).floor() as u32;
+
+    let world = app.world_mut();
+    let mut primary = world.query_filtered::<&mut Window, With<PrimaryWindow>>();
+    let Ok(mut bevy_window) = primary.single_mut(world) else {
+        return;
+    };
+    // The resolution's scale factor is still 1.0 here (winit hasn't created
+    // the window yet), so "physical" == the logical CSS size bevy_winit
+    // will request from winit.
+    let width = bevy_window.resolution.physical_width().min(max_logical_px);
+    let height = bevy_window.resolution.physical_height().min(max_logical_px);
+    bevy_window.resolution.set_physical_resolution(width, height);
 }
 
 // retro_crt.rs's `handle_input` unconditionally sends `AppExit` on Escape
