@@ -259,13 +259,19 @@ impl TerminalTexture {
 /// downcasting; chosen for speed over a boxed/dynamic alternative. The cost
 /// is that callers encode their own hit-id enum into `u64` by hand
 /// (mechanical, but cheap and `Copy`).
-#[derive(Default)]
+///
+/// A `Component`: this data is pure and keyed by `u64` - nothing about it
+/// is texture-specific. Making it spawnable as its own component lets a
+/// display-agnostic consumer (a future bevy_ratatui adapter, or any BYO
+/// input pipeline) own a registry without a `Tui`. The `Tui`-embedded
+/// instance and `draw_with_hits` are unaffected - this is purely additive.
+#[derive(Component, Default)]
 pub struct HitRegions {
     regions: Vec<(u64, ratatui::layout::Rect)>,
 }
 
 impl HitRegions {
-    fn clear(&mut self) {
+    pub fn clear(&mut self) {
         self.regions.clear();
     }
 
@@ -372,9 +378,9 @@ impl Tui {
     /// matches the current grid size.
     ///
     /// No auto-fit helper ships:
-    /// compute `cols`/`rows` yourself, typically from a `TerminalEventType::
+    /// compute `cols`/`rows` yourself, typically from an `InputEvent::
     /// Resize` event's pixel size and `Tui::size_px()`'s per-cell metrics
-    /// (see `examples/helloworld.rs` for the recipe).
+    /// (see `examples/resize.rs` for the recipe).
     pub fn request_resize(&mut self, cols: u16, rows: u16) {
         let (current_cols, current_rows) = self.grid_size();
         if (cols, rows) != (current_cols, current_rows) {

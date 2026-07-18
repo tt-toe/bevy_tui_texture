@@ -147,9 +147,9 @@
 //! ) {
 //!     let Ok(mut term) = terminals.single_mut() else { return };
 //!     for event in events.read() {
-//!         if let TerminalEventType::Resize { new_size } = &event.event {
-//!             let cols = (new_size.0 / fonts.0.min_width_px()).max(1) as u16;
-//!             let rows = (new_size.1 / fonts.0.height_px()).max(1) as u16;
+//!         if let InputEvent::Resize { pixels } = &event.input {
+//!             let cols = (pixels.x / fonts.0.min_width_px()).max(1) as u16;
+//!             let rows = (pixels.y / fonts.0.height_px()).max(1) as u16;
 //!             term.request_resize(cols, rows);
 //!         }
 //!     }
@@ -255,10 +255,16 @@ pub mod prelude {
     // Backend and builders
     pub use crate::{BevyTerminalBackend, Font, Fonts, TerminalBuilder, TerminalFontAsset};
 
-    // Input handling
+    // Input handling. `KeyCode` is deliberately NOT re-exported here:
+    // `bevy::prelude::*` (glob-imported by every example alongside this
+    // prelude) already exports its own `KeyCode` (the physical-key enum),
+    // and two glob imports of one name are ambiguous at every use site.
+    // Import this crate's `KeyCode` explicitly instead:
+    // `use bevy_tui_texture::input::KeyCode;` - an explicit `use` always
+    // wins over a glob, so it cleanly shadows bevy's.
     pub use crate::input::{
-        CursorPosition, KeyModifiers, TerminalEvent, TerminalEventType, TerminalFocus,
-        TerminalInput, TerminalInputConfig,
+        CursorPosition, InputEvent, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent,
+        MouseEventKind, TerminalEvent, TerminalFocus, TerminalInput, TerminalInputConfig,
     };
 
     // Re-export ratatui for convenience

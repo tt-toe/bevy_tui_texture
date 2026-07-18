@@ -28,6 +28,7 @@ cargo run --example widget_catalog_2d   # 2D UI, mouse hit-testing, CJK, glyphs
 cargo run --example widget_catalog_3d   # 3D mesh terminal with interaction
 cargo run --example world_terminal      # world-unit screen (TuiRequest::world_quad)
 cargo run --example multiple_terminals  # several terminals + Tab focus cycling
+cargo run --example form_demo           # form built on TerminalEvent + HitRegions alone
 cargo run --example shader_mesh         # ExtendedMaterial CRT shader effects
 cargo run --example retro_crt           # full CRT demo: glTF + shader + overlay UI
 cargo run --example resize              # Tui::request_resize following the window
@@ -67,6 +68,11 @@ feature (the lib's own bevy is default-features=false and logs nothing).
   x_offset, which most monospace fonts satisfy but isn't guaranteed.
   Silently inert when `bold_italic_fonts` is enabled (that feature makes
   per-cell font selection meaningful; this path assumes one font per row)
+- `crossterm-compat` (opt-in, native-only) — `InputEvent::to_crossterm`/
+  `from_crossterm` (src/input/crossterm_compat.rs), lossy conversions
+  to/from `crossterm::event::Event` for interop with ratatui-ecosystem
+  widget crates (e.g. tui-textarea) or a bevy_ratatui adapter. Not
+  available on wasm32 — crossterm doesn't build there
 
 `TuiKind` variants gate individually: `Ui` needs `2d`, `WorldQuad` needs
 `3d`, `Headless` is always available. One-surface builds work:
@@ -156,10 +162,14 @@ rows. Glyph-atlas eviction is LRU (`evictor` crate).
 - **src/bevy_plugin.rs** — `TerminalPlugin`, `TerminalSystemSet`
   (Input → UserUpdate → Render in `Update`), the systems above
 - **src/input/** — message-driven (`TerminalEvent` via `MessageReader`,
-  bevy 0.18+ messages, not legacy events); focus management with Tab
-  cycling; unified mouse handling that auto-detects 2D UI vs 3D mesh via
-  raycasting (src/input/ray.rs) when both features are on; touch fallback
-  (see Gotchas)
+  bevy 0.18+ messages, not legacy events); the payload (`InputEvent`)
+  mirrors `crossterm::event::Event` so ratatui-ecosystem input vocabulary
+  maps onto it directly (self-defined, not a crossterm dependency — wasm
+  stays intact; see the `crossterm-compat` feature above for real
+  conversions on native); focus management with Tab cycling; unified
+  mouse handling that auto-detects 2D UI vs 3D mesh via raycasting
+  (src/input/ray.rs) when both features are on; touch fallback (see
+  Gotchas)
 - **src/fonts.rs** — TrueType via rustybuzz; CJK; metrics
   `min_width_px()` / `height_px()` for texture sizing
 - **src/utils/** — `text_atlas.rs` (glyph cache texture),
@@ -190,19 +200,41 @@ User systems MUST be placed in `TerminalSystemSet` (`Input` →
 .add_systems(Update, render_terminal.in_set(TerminalSystemSet::Render))
 ```
 
-Input events:
+Input events: the payload (`InputEvent`) mirrors `crossterm::event::Event`
+(`Key`/`Mouse`/`Paste`/`FocusGained`/`FocusLost`/`Resize`), not a
+crate-specific enum — see src/input/mod.rs's module doc comment for why.
+`KeyCode` is this crate's crossterm-shaped mirror
+(`bevy_tui_texture::input::KeyCode`), not `bevy::prelude::KeyCode` (the
+physical key) — the prelude deliberately omits it to avoid a glob-import
+clash, so import it explicitly:
 
 ```rust
+use bevy_tui_texture::input::KeyCode;
+
 fn handle_events(mut events: MessageReader<TerminalEvent>) {
     for event in events.read() {
-        match event.event {
-            TerminalEventType::KeyPress { key, modifiers } => { ... }
-            TerminalEventType::MousePress { button, position } => { ... }
+        match &event.input {
+            InputEvent::Key(k) if k.kind != KeyEventKind::Release => match k.code {
+                KeyCode::Char(c) => { ... }
+                KeyCode::Enter => { ... }
+                _ => {}
+            },
+            InputEvent::Mouse(m) => match m.kind {
+                MouseEventKind::Down(button) => { ... } // m.column, m.row
+                MouseEventKind::Drag(_) | MouseEventKind::Moved => { ... }
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => { ... }
+                _ => {}
+            },
             _ => {}
         }
     }
 }
 ```
+
+`examples/form_demo.rs` builds a complete interactive form on nothing but
+this contract plus `HitRegions` — the reference for how little app code
+that costs (no form/widget framework ships in this crate; see
+`src/input/mod.rs`'s module doc comment for the rationale).
 
 Fonts: TrueType only. `Font::new(&'static [u8])` for `include_bytes!`,
 `Font::from_vec(Vec<u8>)` for runtime-loaded data (Arc-backed, never

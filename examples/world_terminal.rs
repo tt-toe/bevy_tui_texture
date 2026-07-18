@@ -127,10 +127,11 @@ fn rotate_cube(time: Res<Time>, mut cubes: Query<&mut Transform, With<Spinning>>
 /// game camera's ray (multi-camera setups work too).
 fn handle_terminal_events(mut events: MessageReader<TerminalEvent>, mut clicks: ResMut<Clicks>) {
     for event in events.read() {
-        if let TerminalEventType::MousePress { position, .. } = &event.event {
-            clicks.count += 1;
-            clicks.last = Some(*position);
-        }
+        if let InputEvent::Mouse(m) = &event.input
+            && matches!(m.kind, MouseEventKind::Down(_)) {
+                clicks.count += 1;
+                clicks.last = Some((m.column, m.row));
+            }
     }
 }
 

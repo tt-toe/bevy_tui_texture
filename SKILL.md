@@ -102,7 +102,7 @@ Runtime resize — `tui.request_resize(cols, rows)` (no GPU work at call
 site; `Image` is recreated at the same handle, `TerminalDimensions` and
 world-quad mesh aspect update automatically; same-size requests are
 no-ops). No auto-fit helper exists by design: convert
-`TerminalEventType::Resize` pixels via `fonts.min_width_px()` /
+`InputEvent::Resize { pixels }` via `fonts.min_width_px()` /
 `fonts.height_px()` — full recipe in `examples/resize.rs`.
 
 Transparency (HUD-style see-through screen):
@@ -139,25 +139,37 @@ Fonts:
 
 Read `MessageReader<TerminalEvent>` (bevy messages, NOT legacy events);
 `event.target` is always the `Tui` entity, even for attached surfaces.
-Variants: `KeyPress { key, modifiers }`, `CharInput { character }`,
-`MousePress { button, position }`, `MouseRelease { button, position }`,
-`MouseMove { position }`, `FocusGained`, `FocusLost`,
-`Resize { new_size: (px, px) }`.
+The payload (`event.input: InputEvent`) mirrors `crossterm::event::Event`,
+not a crate-specific enum, so ratatui-ecosystem input vocabulary
+(tui-textarea, bevy_ratatui, etc.) maps onto it directly. Variants:
+`Key(KeyEvent { code, modifiers, kind })`,
+`Mouse(MouseEvent { kind, column, row, modifiers })`, `Paste(String)`,
+`FocusGained`, `FocusLost`, `Resize { pixels }`. `KeyCode` here is this
+crate's crossterm-shaped mirror (`bevy_tui_texture::input::KeyCode`), NOT
+`bevy::prelude::KeyCode` (the physical key) — the prelude deliberately
+omits it (glob-import collision), so import it explicitly:
+`use bevy_tui_texture::input::KeyCode;`.
 
-- **`position` is `(col, row)`** — grid cells, x-then-y. (Some in-source
-  doc comments still say "(row, col)"; the emitting code and `hit_at`
-  agree on `(col, row)`. Trust this, not those comments.)
-- **Keyboard needs focus**: only the focused terminal receives
-  `KeyPress`/`CharInput`. Clicking a terminal focuses it
+- **`(column, row)` on `MouseEvent`** — grid cells, x-then-y.
+- **`MouseEventKind`**: `Down(button)`/`Up(button)` (was
+  `MousePress`/`MouseRelease`), `Moved` (no button held) or `Drag(button)`
+  (button held while moving — was a single `MouseMove` for both),
+  `ScrollUp`/`ScrollDown`/`ScrollLeft`/`ScrollRight`.
+- **`KeyEventKind`**: `Press`/`Repeat`/`Release` — filter
+  `k.kind != KeyEventKind::Release` for typical "act on keydown" handling.
+  `KeyCode::Char(c)` already carries the shifted/layout-resolved
+  character (winit resolves it) — there is no separate `CharInput`.
+- **Keyboard needs focus**: only the focused terminal receives `Key`
+  events. Clicking a terminal focuses it
   (`TerminalInputConfig::focus_button`, default left); Tab cycles focus
   when `auto_focus` is on. Mouse events need no focus.
 - **Touch works with no extra code**: `CursorPosition` (the crate's
   tracked resource) falls back to the first active touch's position (and
   the just-released touch's last position on the release frame), and a
-  tap emits left-button `MousePress`/`MouseRelease`. In your own systems,
-  read `Res<CursorPosition>` instead of `Window::cursor_position()` —
-  the latter is `None` on touch devices (see `update_camera_rotation` in
-  `examples/retro_crt.rs`).
+  tap emits `MouseEventKind::Down`/`Up(MouseButton::Left)`. In your own
+  systems, read `Res<CursorPosition>` instead of
+  `Window::cursor_position()` — the latter is `None` on touch devices
+  (see `update_camera_rotation` in `examples/retro_crt.rs`).
 - **Plugin constructors**: `TerminalPlugin::default()` (all input),
   `::new(TerminalInputConfig { keyboard_enabled, mouse_enabled,
   auto_focus, focus_button })`, `::without_keyboard()`,
@@ -169,15 +181,21 @@ Variants: `KeyPress { key, modifiers }`, `CharInput { character }`,
 - **When a 2D UI terminal and a 3D mesh terminal overlap in screen
   space, the UI terminal wins** — bevy_ui renders as an overlay on top of
   the 3D view, so the pick order matches what the user sees.
+- **`crossterm-compat` feature** (native-only): `InputEvent::to_crossterm`/
+  `from_crossterm` for lossy round-trips with real
+  `crossterm::event::Event` — e.g. feeding a crossterm-shaped widget crate
+  or bridging from a bevy_ratatui adapter. Not available on wasm32.
 
 Per-widget hit testing: `tui.draw_with_hits(|frame, hits| {
 hits.add(id, rect); ... })` then
 `tui.hit_regions().hit_at::<MyId>((col, row))` (topmost/last wins; a
 failed id decode returns `None`, it does not fall through). For a
-press-and-drag widget (e.g. a slider), latch a `bool` on `MousePress` over
-the region, apply `MouseMove` positions unconditionally while latched, and
-clear on `MouseRelease` — see `Hit::LightSlider` in
-`examples/retro_crt.rs`.
+press-and-drag widget (e.g. a slider), latch a `bool` on
+`MouseEventKind::Down` over the region, apply `Moved`/`Drag(_)` positions
+unconditionally while latched, and clear on `MouseEventKind::Up` — see
+`Hit::LightSlider` in `examples/retro_crt.rs`. `examples/form_demo.rs` is
+a complete interactive form built on nothing but `TerminalEvent` +
+`HitRegions` — this crate ships no form/widget framework by design.
 
 ## WASM / WebGL2 (hard-won — read before shipping a browser build)
 

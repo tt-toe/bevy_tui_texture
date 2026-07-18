@@ -250,7 +250,7 @@ fn handle_terminal_events(
     screens_b: Query<&Tui, With<ScreenB>>,
 ) {
     for event in events.read() {
-        if !matches!(event.event, TerminalEventType::MousePress { .. }) {
+        if !matches!(event.input, InputEvent::Mouse(m) if matches!(m.kind, MouseEventKind::Down(_))) {
             continue;
         }
         if screens_a.get(event.target).is_ok() {

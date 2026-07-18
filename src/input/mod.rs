@@ -1,7 +1,32 @@
 //! Event-driven terminal input via Bevy's ECS.
 //!
 //! Bevy input systems → `TerminalEvent` messages → User systems → Terminal updates
+//!
+//! The envelope (`TerminalEvent`, entity-targeted) is Bevy-native; the
+//! payload (`InputEvent`) mirrors `crossterm::event::Event` so the wider
+//! ratatui ecosystem's input vocabulary (tui-textarea, bevy_ratatui, etc.)
+//! maps onto it directly. `InputEvent`/`KeyEvent`/`KeyCode`/`MouseEvent`
+//! are self-defined mirrors, not a crossterm dependency, so wasm builds
+//! stay intact; see the `crossterm-compat` feature (native-only) for real
+//! conversions to and from `crossterm::event::Event`.
+//!
+//! This module is deliberately just transport: no form/widget framework
+//! lives here, or ever will. `crate::setup::HitRegions` (a `u64`-keyed
+//! click-region registry, generic over any `TryFrom<u64>` id type) is as
+//! far as it goes - see `examples/form_demo.rs` for a complete interactive
+//! form built on nothing but that plus this module's `TerminalEvent`.
 
+use bevy::input::ButtonState;
+use bevy::input::keyboard::{Key, KeyboardInput};
+// Bevy's own `KeyCode` (physical key location) is aliased rather than used
+// bare: this module also defines its own `pub enum KeyCode` (the
+// crossterm-shaped logical/character mirror below), and an item defined in
+// a module always wins name resolution over a glob-imported one - so every
+// use of bevy's physical KeyCode in this file must go through this alias,
+// never the bare name.
+use bevy::input::keyboard::KeyCode as BevyKeyCode;
+#[cfg(feature = "mouse_input")]
+use bevy::input::mouse::MouseWheel;
 use bevy::prelude::*;
 #[cfg(feature = "mouse_input")]
 use tracing::debug;
@@ -12,6 +37,10 @@ use tracing::debug;
 #[cfg(all(feature = "mouse_input", feature = "3d"))]
 pub mod ray;
 
+// Lossy conversions to/from crossterm::event::Event (native-only).
+#[cfg(all(feature = "crossterm-compat", not(target_arch = "wasm32")))]
+pub mod crossterm_compat;
+
 // ============================================================================
 // Events
 // ============================================================================
@@ -21,76 +50,117 @@ pub mod ray;
 /// These messages are emitted by input capture systems and read by user systems
 /// to handle terminal input. Messages are entity-targeted, enabling selective
 /// routing to specific terminal instances.
-#[derive(Message, Clone, Debug)]
+///
+/// Compiles unconditionally (no feature gate): this is the crate's
+/// bring-your-own-input injection point, so it must exist even when
+/// `keyboard_input`/`mouse_input` are both disabled - a caller can write
+/// `TerminalEvent`s from any source (an adapter for another input
+/// backend, a test harness, a network channel) via `MessageWriter`.
+#[derive(Message, Clone, Debug, PartialEq, Eq)]
 pub struct TerminalEvent {
-    /// The terminal entity that should receive this message
+    /// The Tui entity that should receive this message.
     pub target: Entity,
-    /// The event payload
-    pub event: TerminalEventType,
+    pub input: InputEvent,
 }
 
-/// Types of terminal events.
-#[derive(Clone, Debug)]
-pub enum TerminalEventType {
-    /// Keyboard key was pressed.
-    ///
-    /// Emitted for any key press, including modifier keys.
-    /// Check `modifiers` field for Ctrl, Alt, Shift, Meta state.
-    KeyPress {
-        key: KeyCode,
-        modifiers: KeyModifiers,
-    },
-
-    /// Character input for text entry.
-    ///
-    /// Emitted for printable characters (a-z, 0-9, punctuation, etc).
-    /// This is separate from `KeyPress` to simplify text input handling.
-    CharInput { character: char },
-
-    /// Mouse button was pressed.
-    ///
-    /// The `position` is in terminal coordinates (row, col),
-    /// not screen pixels.
-    MousePress {
-        button: MouseButton,
-        /// Terminal coordinates (row, col)
-        position: (u16, u16),
-    },
-
-    /// Mouse button was released.
-    MouseRelease {
-        button: MouseButton,
-        /// Terminal coordinates (row, col)
-        position: (u16, u16),
-    },
-
-    /// Mouse cursor moved over terminal.
-    ///
-    /// Only emitted when cursor is over the terminal.
-    MouseMove {
-        /// Terminal coordinates (row, col)
-        position: (u16, u16),
-    },
-
-    /// Terminal gained input focus.
-    ///
-    /// Emitted when focus changes to this terminal.
+/// Mirror of `crossterm::event::Event`. Self-defined because crossterm does
+/// not build on wasm32-unknown-unknown; see the `crossterm-compat` feature
+/// for lossy conversions to/from the real crossterm type on native.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InputEvent {
+    Key(KeyEvent),
+    Mouse(MouseEvent),
+    /// Never produced by the built-in capture systems (winit has no paste
+    /// event). Exists for crossterm-shape parity so BYO writers (e.g. a
+    /// bevy_ratatui adapter, tests, network input) can deliver it.
+    Paste(String),
     FocusGained,
-
-    /// Terminal lost input focus.
-    ///
-    /// Emitted when focus changes away from this terminal.
     FocusLost,
+    /// Emitted on window resize for every terminal (same trigger as
+    /// today). Deliberately NOT crossterm's `Resize(cols, rows)`: texture
+    /// terminals never auto-resize, so a cell-count field here would
+    /// report the old, unchanged grid and mislead crossterm-habituated
+    /// readers. The pixel size is what `Tui::request_resize` recipes
+    /// actually need (see `examples/resize.rs`); grid changes are always
+    /// caller-initiated, so the caller already knows them.
+    Resize { pixels: UVec2 },
+}
 
-    /// Window/terminal was resized.
-    ///
-    /// Emitted for window resize events. The user is responsible for
-    /// recreating the terminal backend with new dimensions if needed.
-    Resize { new_size: (u32, u32) },
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyEvent {
+    pub code: KeyCode,
+    pub modifiers: KeyModifiers,
+    pub kind: KeyEventKind,
+}
+
+/// Mirror of `crossterm::event::KeyCode` (the subset a GPU-windowed app can
+/// produce), plus an escape hatch for everything else. Not `KeyCode` from
+/// `bevy::prelude` - see the module-level import comment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyCode {
+    Char(char),
+    Enter,
+    Tab,
+    /// Shift+Tab, following crossterm's convention (`modifiers.shift`
+    /// stays true as well). Known, accepted quirk: derived from the
+    /// *live* shift state at each key transition, so releasing Shift
+    /// before releasing Tab yields a `Press` of `BackTab` but a
+    /// `Release` of `Tab`. Do not try to fix this with per-key state
+    /// tracking - crossterm has the same ambiguity, and the standard
+    /// consumer pattern (ignore `Release` events) never observes it.
+    BackTab,
+    Backspace,
+    Delete,
+    Insert,
+    Esc,
+    Left,
+    Right,
+    Up,
+    Down,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    F(u8),
+    /// Anything not representable above - carries the physical key so no
+    /// information is lost. NOT part of the crossterm mirror; converts to
+    /// `None` in `crossterm-compat`.
+    Unidentified(BevyKeyCode),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyEventKind {
+    Press,
+    Repeat,
+    Release,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MouseEvent {
+    pub kind: MouseEventKind,
+    /// Terminal grid coordinates (cell units), like crossterm.
+    pub column: u16,
+    pub row: u16,
+    pub modifiers: KeyModifiers,
+}
+
+/// Mirror of `crossterm::event::MouseEventKind`, reusing bevy's
+/// `MouseButton` directly (the `crossterm-compat` feature maps
+/// Left/Right/Middle and drops the rest).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MouseEventKind {
+    Down(MouseButton),
+    Up(MouseButton),
+    Drag(MouseButton),
+    Moved,
+    ScrollUp,
+    ScrollDown,
+    ScrollLeft,
+    ScrollRight,
 }
 
 /// Modifier keys state.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct KeyModifiers {
     /// Control key pressed
     pub ctrl: bool,
@@ -183,68 +253,59 @@ impl Default for TerminalInput {
 // Helper Functions
 // ============================================================================
 
-/// Convert KeyCode to character with shift. Returns `None` for non-printable keys.
-pub fn keycode_to_char(key: KeyCode, shift: bool) -> Option<char> {
-    use KeyCode::*;
-
-    match key {
-        // Letters
-        KeyA => Some(if shift { 'A' } else { 'a' }),
-        KeyB => Some(if shift { 'B' } else { 'b' }),
-        KeyC => Some(if shift { 'C' } else { 'c' }),
-        KeyD => Some(if shift { 'D' } else { 'd' }),
-        KeyE => Some(if shift { 'E' } else { 'e' }),
-        KeyF => Some(if shift { 'F' } else { 'f' }),
-        KeyG => Some(if shift { 'G' } else { 'g' }),
-        KeyH => Some(if shift { 'H' } else { 'h' }),
-        KeyI => Some(if shift { 'I' } else { 'i' }),
-        KeyJ => Some(if shift { 'J' } else { 'j' }),
-        KeyK => Some(if shift { 'K' } else { 'k' }),
-        KeyL => Some(if shift { 'L' } else { 'l' }),
-        KeyM => Some(if shift { 'M' } else { 'm' }),
-        KeyN => Some(if shift { 'N' } else { 'n' }),
-        KeyO => Some(if shift { 'O' } else { 'o' }),
-        KeyP => Some(if shift { 'P' } else { 'p' }),
-        KeyQ => Some(if shift { 'Q' } else { 'q' }),
-        KeyR => Some(if shift { 'R' } else { 'r' }),
-        KeyS => Some(if shift { 'S' } else { 's' }),
-        KeyT => Some(if shift { 'T' } else { 't' }),
-        KeyU => Some(if shift { 'U' } else { 'u' }),
-        KeyV => Some(if shift { 'V' } else { 'v' }),
-        KeyW => Some(if shift { 'W' } else { 'w' }),
-        KeyX => Some(if shift { 'X' } else { 'x' }),
-        KeyY => Some(if shift { 'Y' } else { 'y' }),
-        KeyZ => Some(if shift { 'Z' } else { 'z' }),
-
-        // Numbers and shifted symbols
-        Digit1 => Some(if shift { '!' } else { '1' }),
-        Digit2 => Some(if shift { '@' } else { '2' }),
-        Digit3 => Some(if shift { '#' } else { '3' }),
-        Digit4 => Some(if shift { '$' } else { '4' }),
-        Digit5 => Some(if shift { '%' } else { '5' }),
-        Digit6 => Some(if shift { '^' } else { '6' }),
-        Digit7 => Some(if shift { '&' } else { '7' }),
-        Digit8 => Some(if shift { '*' } else { '8' }),
-        Digit9 => Some(if shift { '(' } else { '9' }),
-        Digit0 => Some(if shift { ')' } else { '0' }),
-
-        // Punctuation
-        Space => Some(' '),
-        Minus => Some(if shift { '_' } else { '-' }),
-        Equal => Some(if shift { '+' } else { '=' }),
-        BracketLeft => Some(if shift { '{' } else { '[' }),
-        BracketRight => Some(if shift { '}' } else { ']' }),
-        Backslash => Some(if shift { '|' } else { '\\' }),
-        Semicolon => Some(if shift { ':' } else { ';' }),
-        Quote => Some(if shift { '"' } else { '\'' }),
-        Comma => Some(if shift { '<' } else { ',' }),
-        Period => Some(if shift { '>' } else { '.' }),
-        Slash => Some(if shift { '?' } else { '/' }),
-        Backquote => Some(if shift { '~' } else { '`' }),
-
-        // Non-printable keys
-        _ => None,
+/// Reads the four modifier keys from bevy's `ButtonInput`. The single
+/// modifier implementation in the crate - both `keyboard_input_system` and
+/// every `mouse_input_system` variant call this rather than each computing
+/// their own.
+fn read_modifiers(keyboard: &ButtonInput<BevyKeyCode>) -> KeyModifiers {
+    KeyModifiers {
+        ctrl: keyboard.pressed(BevyKeyCode::ControlLeft) || keyboard.pressed(BevyKeyCode::ControlRight),
+        alt: keyboard.pressed(BevyKeyCode::AltLeft) || keyboard.pressed(BevyKeyCode::AltRight),
+        shift: keyboard.pressed(BevyKeyCode::ShiftLeft) || keyboard.pressed(BevyKeyCode::ShiftRight),
+        meta: keyboard.pressed(BevyKeyCode::SuperLeft) || keyboard.pressed(BevyKeyCode::SuperRight),
     }
+}
+
+/// Maps bevy's logical key (already layout/Shift-resolved by winit) to the
+/// crossterm-shaped `KeyCode`. Pure and unit-testable without an `App`.
+/// `shift` decides `Tab` vs `BackTab` (see `KeyCode::BackTab`'s doc comment
+/// for the accepted press/release quirk this implies). Returns `None` only
+/// when `Key::Character` carries no characters - a winit edge case, not
+/// expected in practice - in which case the caller should skip the whole
+/// `KeyboardInput` message.
+fn keycode_from_logical(key: &Key, shift: bool, physical: BevyKeyCode) -> Option<KeyCode> {
+    Some(match key {
+        Key::Character(s) => KeyCode::Char(s.chars().next()?),
+        Key::Space => KeyCode::Char(' '),
+        Key::Tab if shift => KeyCode::BackTab,
+        Key::Tab => KeyCode::Tab,
+        Key::Enter => KeyCode::Enter,
+        Key::Backspace => KeyCode::Backspace,
+        Key::Delete => KeyCode::Delete,
+        Key::Insert => KeyCode::Insert,
+        Key::Escape => KeyCode::Esc,
+        Key::ArrowLeft => KeyCode::Left,
+        Key::ArrowRight => KeyCode::Right,
+        Key::ArrowUp => KeyCode::Up,
+        Key::ArrowDown => KeyCode::Down,
+        Key::Home => KeyCode::Home,
+        Key::End => KeyCode::End,
+        Key::PageUp => KeyCode::PageUp,
+        Key::PageDown => KeyCode::PageDown,
+        Key::F1 => KeyCode::F(1),
+        Key::F2 => KeyCode::F(2),
+        Key::F3 => KeyCode::F(3),
+        Key::F4 => KeyCode::F(4),
+        Key::F5 => KeyCode::F(5),
+        Key::F6 => KeyCode::F(6),
+        Key::F7 => KeyCode::F(7),
+        Key::F8 => KeyCode::F(8),
+        Key::F9 => KeyCode::F(9),
+        Key::F10 => KeyCode::F(10),
+        Key::F11 => KeyCode::F(11),
+        Key::F12 => KeyCode::F(12),
+        _ => KeyCode::Unidentified(physical),
+    })
 }
 
 // ============================================================================
@@ -280,8 +341,9 @@ fn remap_to_tui(entity: Entity, surfaces: &Query<&crate::setup::TuiSurface>) -> 
 /// in the same logical-pixel, top-left-origin window space as
 /// `Window::cursor_position()` (bevy_winit converts with `to_logical`).
 /// The frame a touch ends, `first_pressed_position` is already `None`, but
-/// `mouse_input_system` still needs a position to emit `MouseRelease` at -
-/// hence the second fallback to the just-released touch's last position.
+/// `mouse_input_system` still needs a position to emit `MouseEventKind::Up`
+/// at - hence the second fallback to the just-released touch's last
+/// position.
 pub fn update_cursor_position_system(
     mut cursor_pos: ResMut<CursorPosition>,
     windows: Query<&Window>,
@@ -301,7 +363,8 @@ pub fn update_cursor_position_system(
 /// Captures keyboard input and emits `TerminalEvent`s for the focused terminal.
 /// Only processes input if a terminal has focus and has keyboard input enabled.
 pub fn keyboard_input_system(
-    keyboard: Res<ButtonInput<KeyCode>>,
+    mut key_events: MessageReader<KeyboardInput>,
+    keyboard: Res<ButtonInput<BevyKeyCode>>,
     focus: Res<TerminalFocus>,
     terminals: Query<&TerminalInput>,
     surfaces: Query<&crate::setup::TuiSurface>,
@@ -324,33 +387,23 @@ pub fn keyboard_input_system(
     // `focus.focused` stores the surface entity (where TerminalInput lives);
     // remap to the Tui entity only for the emitted event's target.
     let target = remap_to_tui(focused_entity, &surfaces);
+    let modifiers = read_modifiers(&keyboard);
 
-    // Check for modifier keys
-    let modifiers = KeyModifiers {
-        ctrl: keyboard.pressed(KeyCode::ControlLeft) || keyboard.pressed(KeyCode::ControlRight),
-        alt: keyboard.pressed(KeyCode::AltLeft) || keyboard.pressed(KeyCode::AltRight),
-        shift: keyboard.pressed(KeyCode::ShiftLeft) || keyboard.pressed(KeyCode::ShiftRight),
-        meta: keyboard.pressed(KeyCode::SuperLeft) || keyboard.pressed(KeyCode::SuperRight),
-    };
+    for key_event in key_events.read() {
+        let kind = match key_event.state {
+            ButtonState::Released => KeyEventKind::Release,
+            ButtonState::Pressed if key_event.repeat => KeyEventKind::Repeat,
+            ButtonState::Pressed => KeyEventKind::Press,
+        };
+        let Some(code) = keycode_from_logical(&key_event.logical_key, modifiers.shift, key_event.key_code)
+        else {
+            continue;
+        };
 
-    // Process all just-pressed keys
-    for key in keyboard.get_just_pressed() {
-        // Emit KeyPress event
         events.write(TerminalEvent {
             target,
-            event: TerminalEventType::KeyPress {
-                key: *key,
-                modifiers,
-            },
+            input: InputEvent::Key(KeyEvent { code, modifiers, kind }),
         });
-
-        // Emit CharInput for printable characters
-        if let Some(character) = keycode_to_char(*key, modifiers.shift) {
-            events.write(TerminalEvent {
-                target,
-                event: TerminalEventType::CharInput { character },
-            });
-        }
     }
 }
 
@@ -439,6 +492,48 @@ impl PartialOrd for SortKey {
             (SortKey::ZIndex(_), SortKey::Distance { .. }) => Some(std::cmp::Ordering::Less),
             (SortKey::Distance { .. }, SortKey::ZIndex(_)) => Some(std::cmp::Ordering::Greater),
         }
+    }
+}
+
+/// Bundles the unified system's three change-detection probe queries
+/// (IMPROVEMENT.md D1) into a single `SystemParam`. Bevy's generated
+/// `SystemParam` tuple impl tops out at 16 elements; the unified variant's
+/// own parameter list already sits at that ceiling once `keyboard` and
+/// `wheel` are added for scroll/modifier support, so these three
+/// low-frequency queries are folded into one slot instead of three.
+///
+/// `pub`, not `pub(crate)`: it appears in `mouse_input_system`'s (public)
+/// parameter list, so it must be at least as visible as that function -
+/// callers never construct it themselves (bevy injects it), so this is
+/// purely to satisfy the visibility checker.
+#[cfg(all(feature = "mouse_input", feature = "2d", feature = "3d"))]
+#[derive(bevy::ecs::system::SystemParam)]
+pub struct MouseChangeProbes<'w, 's> {
+    camera: Query<
+        'w,
+        's,
+        (),
+        (
+            With<Camera>,
+            Or<(Changed<GlobalTransform>, Changed<Projection>, Changed<Camera>)>,
+        ),
+    >,
+    terminal_3d: Query<'w, 's, (), (With<TerminalInput>, Changed<GlobalTransform>)>,
+    terminal_ui: Query<
+        'w,
+        's,
+        (),
+        (
+            With<TerminalInput>,
+            Or<(Changed<bevy::ui::ComputedNode>, Changed<bevy::ui::UiGlobalTransform>)>,
+        ),
+    >,
+}
+
+#[cfg(all(feature = "mouse_input", feature = "2d", feature = "3d"))]
+impl MouseChangeProbes<'_, '_> {
+    fn any_changed(&self) -> bool {
+        !self.camera.is_empty() || !self.terminal_3d.is_empty() || !self.terminal_ui.is_empty()
     }
 }
 
@@ -756,19 +851,74 @@ fn ray_cast_hit_test_inner(
     Some((HitTestResult { col, row }, hit.distance))
 }
 
+/// Selects `Moved` vs `Drag(button)` from which mouse buttons (and touches,
+/// pre-folded into `left` by the caller) are currently held. Left wins if
+/// multiple buttons are held at once - arbitrary but stable.
 #[cfg(feature = "mouse_input")]
+fn move_kind(left: bool, right: bool, middle: bool) -> MouseEventKind {
+    if left {
+        MouseEventKind::Drag(MouseButton::Left)
+    } else if right {
+        MouseEventKind::Drag(MouseButton::Right)
+    } else if middle {
+        MouseEventKind::Drag(MouseButton::Middle)
+    } else {
+        MouseEventKind::Moved
+    }
+}
+
+/// Selects a `MouseEventKind::Scroll*` from a `MouseWheel` message's raw
+/// `(x, y)` delta - sign only, no accumulation. `y` takes priority over
+/// `x` (matches how a plain vertical-wheel mouse reports). `None` when
+/// both deltas are exactly zero (shouldn't normally happen for a real
+/// `MouseWheel` message, but callers must not assume every message
+/// produces an event).
+#[cfg(feature = "mouse_input")]
+fn scroll_kind(x: f32, y: f32) -> Option<MouseEventKind> {
+    if y > 0.0 {
+        Some(MouseEventKind::ScrollUp)
+    } else if y < 0.0 {
+        Some(MouseEventKind::ScrollDown)
+    } else if x > 0.0 {
+        Some(MouseEventKind::ScrollRight)
+    } else if x < 0.0 {
+        Some(MouseEventKind::ScrollLeft)
+    } else {
+        None
+    }
+}
+
+#[cfg(feature = "mouse_input")]
+#[allow(clippy::too_many_arguments)]
 fn emit_mouse_move(
     surface_entity: Entity,
     col: u16,
     row: u16,
+    buttons: &ButtonInput<MouseButton>,
+    touches: &Touches,
+    modifiers: KeyModifiers,
     surfaces: &Query<&crate::setup::TuiSurface>,
     events: &mut MessageWriter<TerminalEvent>,
 ) {
+    // An active touch counts as a held left button - consistent with the
+    // tap-emulates-left-click convention in `emit_button_events` below, and
+    // reuses the same "is a touch currently held" check
+    // `update_cursor_position_system` already relies on (bevy's `Touches`
+    // has no `any_pressed()`).
+    let left = buttons.pressed(MouseButton::Left) || touches.first_pressed_position().is_some();
+    let kind = move_kind(
+        left,
+        buttons.pressed(MouseButton::Right),
+        buttons.pressed(MouseButton::Middle),
+    );
     events.write(TerminalEvent {
         target: remap_to_tui(surface_entity, surfaces),
-        event: TerminalEventType::MouseMove {
-            position: (col, row),
-        },
+        input: InputEvent::Mouse(MouseEvent {
+            kind,
+            column: col,
+            row,
+            modifiers,
+        }),
     });
 }
 
@@ -788,7 +938,7 @@ fn emit_focus_events(
         if let Some(old_entity) = *old_focus {
             events.write(TerminalEvent {
                 target: remap_to_tui(old_entity, surfaces),
-                event: TerminalEventType::FocusLost,
+                input: InputEvent::FocusLost,
             });
         }
 
@@ -796,7 +946,7 @@ fn emit_focus_events(
 
         events.write(TerminalEvent {
             target: remap_to_tui(new_focus, surfaces),
-            event: TerminalEventType::FocusGained,
+            input: InputEvent::FocusGained,
         });
     }
 }
@@ -809,6 +959,7 @@ fn emit_button_events(
     row: u16,
     buttons: &ButtonInput<MouseButton>,
     touches: &Touches,
+    modifiers: KeyModifiers,
     focus: &mut TerminalFocus,
     config: &TerminalInputConfig,
     surfaces: &Query<&crate::setup::TuiSurface>,
@@ -832,22 +983,53 @@ fn emit_button_events(
 
             events.write(TerminalEvent {
                 target,
-                event: TerminalEventType::MousePress {
-                    button,
-                    position: (col, row),
-                },
+                input: InputEvent::Mouse(MouseEvent {
+                    kind: MouseEventKind::Down(button),
+                    column: col,
+                    row,
+                    modifiers,
+                }),
             });
         }
 
         if buttons.just_released(button) || (touch && touches.any_just_released()) {
             events.write(TerminalEvent {
                 target,
-                event: TerminalEventType::MouseRelease {
-                    button,
-                    position: (col, row),
-                },
+                input: InputEvent::Mouse(MouseEvent {
+                    kind: MouseEventKind::Up(button),
+                    column: col,
+                    row,
+                    modifiers,
+                }),
             });
         }
+    }
+}
+
+/// Emits one `Scroll*` event per `MouseWheel` message at the given hit
+/// cell. Shared by all three `mouse_input_system` variants.
+#[cfg(feature = "mouse_input")]
+fn emit_scroll_events(
+    target: Entity,
+    col: u16,
+    row: u16,
+    wheel_messages: &[MouseWheel],
+    modifiers: KeyModifiers,
+    events: &mut MessageWriter<TerminalEvent>,
+) {
+    for wheel in wheel_messages {
+        let Some(kind) = scroll_kind(wheel.x, wheel.y) else {
+            continue;
+        };
+        events.write(TerminalEvent {
+            target,
+            input: InputEvent::Mouse(MouseEvent {
+                kind,
+                column: col,
+                row,
+                modifiers,
+            }),
+        });
     }
 }
 
@@ -874,7 +1056,9 @@ fn emit_button_events(
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn mouse_input_system(
     buttons: Res<ButtonInput<MouseButton>>,
+    keyboard: Res<ButtonInput<BevyKeyCode>>,
     touches: Res<Touches>,
+    mut wheel: MessageReader<MouseWheel>,
     cursor: Res<CursorPosition>,
     config: Res<TerminalInputConfig>,
     mut focus: ResMut<TerminalFocus>,
@@ -902,26 +1086,13 @@ pub fn mouse_input_system(
     mut events: MessageWriter<TerminalEvent>,
     // Change-detection gate (IMPROVEMENT.md D1): anything that can move a
     // cursor→cell mapping without the cursor pixel position itself
-    // changing. `Query::is_empty()` is a cheap archetype check, not a full
-    // iteration.
-    camera_change_probe: Query<
-        (),
-        (
-            With<Camera>,
-            Or<(Changed<GlobalTransform>, Changed<Projection>, Changed<Camera>)>,
-        ),
-    >,
-    terminal_3d_changed: Query<(), (With<TerminalInput>, Changed<GlobalTransform>)>,
-    terminal_ui_changed: Query<
-        (),
-        (
-            With<TerminalInput>,
-            Or<(Changed<bevy::ui::ComputedNode>, Changed<bevy::ui::UiGlobalTransform>)>,
-        ),
-    >,
+    // changing. Bundled into one `SystemParam` - see `MouseChangeProbes`.
+    change_probes: MouseChangeProbes,
     mut last_cursor_pos: Local<Option<Vec2>>,
     mut last_hovered: Local<Option<(Entity, u16, u16)>>,
 ) {
+    let wheel_messages: Vec<MouseWheel> = wheel.read().copied().collect();
+
     let cursor_pos = match cursor.position {
         Some(pos) => pos,
         None => {
@@ -936,14 +1107,13 @@ pub fn mouse_input_system(
         || buttons.get_just_released().len() > 0
         || touches.any_just_pressed()
         || touches.any_just_released();
-    let scene_changed = !camera_change_probe.is_empty()
-        || !terminal_3d_changed.is_empty()
-        || !terminal_ui_changed.is_empty();
+    let scene_changed = change_probes.any_changed();
 
-    if !cursor_moved && !button_transition && !scene_changed {
+    if !cursor_moved && !button_transition && !scene_changed && wheel_messages.is_empty() {
         return;
     }
     *last_cursor_pos = Some(cursor_pos);
+    let modifiers = read_modifiers(&keyboard);
 
     // Build one ray per active camera whose viewport contains the cursor,
     // topmost-rendered camera first (highest `Camera::order`). Multi-camera
@@ -1094,6 +1264,9 @@ pub fn mouse_input_system(
                 *entity,
                 hit_result.col,
                 hit_result.row,
+                &buttons,
+                &touches,
+                modifiers,
                 &surfaces,
                 &mut events,
             );
@@ -1105,9 +1278,18 @@ pub fn mouse_input_system(
             hit_result.row,
             &buttons,
             &touches,
+            modifiers,
             &mut focus,
             &config,
             &surfaces,
+            &mut events,
+        );
+        emit_scroll_events(
+            remap_to_tui(*entity, &surfaces),
+            hit_result.col,
+            hit_result.row,
+            &wheel_messages,
+            modifiers,
             &mut events,
         );
     }
@@ -1119,7 +1301,9 @@ pub fn mouse_input_system(
 #[allow(clippy::type_complexity)]
 pub fn mouse_input_system(
     buttons: Res<ButtonInput<MouseButton>>,
+    keyboard: Res<ButtonInput<BevyKeyCode>>,
     touches: Res<Touches>,
+    mut wheel: MessageReader<MouseWheel>,
     cursor: Res<CursorPosition>,
     config: Res<TerminalInputConfig>,
     mut focus: ResMut<TerminalFocus>,
@@ -1147,6 +1331,8 @@ pub fn mouse_input_system(
     mut last_cursor_pos: Local<Option<Vec2>>,
     mut last_hovered: Local<Option<(Entity, u16, u16)>>,
 ) {
+    let wheel_messages: Vec<MouseWheel> = wheel.read().copied().collect();
+
     let cursor_pos = match cursor.position {
         Some(pos) => pos,
         None => {
@@ -1161,10 +1347,11 @@ pub fn mouse_input_system(
         || buttons.get_just_released().len() > 0
         || touches.any_just_pressed()
         || touches.any_just_released();
-    if !cursor_moved && !button_transition && terminal_ui_changed.is_empty() {
+    if !cursor_moved && !button_transition && terminal_ui_changed.is_empty() && wheel_messages.is_empty() {
         return;
     }
     *last_cursor_pos = Some(cursor_pos);
+    let modifiers = read_modifiers(&keyboard);
 
     let mut hit_candidates: Vec<(Entity, HitTestResult, SortKey)> = Vec::new();
 
@@ -1195,6 +1382,9 @@ pub fn mouse_input_system(
                 *entity,
                 hit_result.col,
                 hit_result.row,
+                &buttons,
+                &touches,
+                modifiers,
                 &surfaces,
                 &mut events,
             );
@@ -1206,9 +1396,18 @@ pub fn mouse_input_system(
             hit_result.row,
             &buttons,
             &touches,
+            modifiers,
             &mut focus,
             &config,
             &surfaces,
+            &mut events,
+        );
+        emit_scroll_events(
+            remap_to_tui(*entity, &surfaces),
+            hit_result.col,
+            hit_result.row,
+            &wheel_messages,
+            modifiers,
             &mut events,
         );
     }
@@ -1220,7 +1419,9 @@ pub fn mouse_input_system(
 #[allow(clippy::type_complexity)]
 pub fn mouse_input_system(
     buttons: Res<ButtonInput<MouseButton>>,
+    keyboard: Res<ButtonInput<BevyKeyCode>>,
     touches: Res<Touches>,
+    mut wheel: MessageReader<MouseWheel>,
     cursor: Res<CursorPosition>,
     config: Res<TerminalInputConfig>,
     mut focus: ResMut<TerminalFocus>,
@@ -1252,6 +1453,8 @@ pub fn mouse_input_system(
     mut last_cursor_pos: Local<Option<Vec2>>,
     mut last_hovered: Local<Option<(Entity, u16, u16)>>,
 ) {
+    let wheel_messages: Vec<MouseWheel> = wheel.read().copied().collect();
+
     let cursor_pos = match cursor.position {
         Some(pos) => pos,
         None => {
@@ -1267,10 +1470,11 @@ pub fn mouse_input_system(
         || touches.any_just_pressed()
         || touches.any_just_released();
     let scene_changed = !camera_change_probe.is_empty() || !terminal_3d_changed.is_empty();
-    if !cursor_moved && !button_transition && !scene_changed {
+    if !cursor_moved && !button_transition && !scene_changed && wheel_messages.is_empty() {
         return;
     }
     *last_cursor_pos = Some(cursor_pos);
+    let modifiers = read_modifiers(&keyboard);
 
     // See the unified system's doc comment for the multi-camera rationale -
     // identical here, just without any 2D UI terminals to also consider.
@@ -1349,6 +1553,9 @@ pub fn mouse_input_system(
                 *entity,
                 hit_result.col,
                 hit_result.row,
+                &buttons,
+                &touches,
+                modifiers,
                 &surfaces,
                 &mut events,
             );
@@ -1360,9 +1567,18 @@ pub fn mouse_input_system(
             hit_result.row,
             &buttons,
             &touches,
+            modifiers,
             &mut focus,
             &config,
             &surfaces,
+            &mut events,
+        );
+        emit_scroll_events(
+            remap_to_tui(*entity, &surfaces),
+            hit_result.col,
+            hit_result.row,
+            &wheel_messages,
+            modifiers,
             &mut events,
         );
     }
@@ -1378,13 +1594,13 @@ pub fn window_resize_system(
     mut events: MessageWriter<TerminalEvent>,
 ) {
     for resize_event in resize_events.read() {
-        let new_size = (resize_event.width as u32, resize_event.height as u32);
+        let pixels = UVec2::new(resize_event.width as u32, resize_event.height as u32);
 
         // Emit resize event for all terminals
         for entity in terminals.iter() {
             events.write(TerminalEvent {
                 target: remap_to_tui(entity, &surfaces),
-                event: TerminalEventType::Resize { new_size },
+                input: InputEvent::Resize { pixels },
             });
         }
     }
@@ -1395,14 +1611,14 @@ pub fn window_resize_system(
 /// Handles Tab key to cycle focus between terminals with `TerminalInput` component.
 /// Emits FocusGained/FocusLost events when focus changes.
 pub fn terminal_focus_system(
-    keyboard: Res<ButtonInput<KeyCode>>,
+    keyboard: Res<ButtonInput<BevyKeyCode>>,
     mut focus: ResMut<TerminalFocus>,
     terminals: Query<(Entity, &TerminalInput)>,
     surfaces: Query<&crate::setup::TuiSurface>,
     mut events: MessageWriter<TerminalEvent>,
 ) {
     // Check if Tab was just pressed
-    if !keyboard.just_pressed(KeyCode::Tab) {
+    if !keyboard.just_pressed(BevyKeyCode::Tab) {
         return;
     }
 
@@ -1441,7 +1657,7 @@ pub fn terminal_focus_system(
         if let Some(old_focus) = focus.focused {
             events.write(TerminalEvent {
                 target: remap_to_tui(old_focus, &surfaces),
-                event: TerminalEventType::FocusLost,
+                input: InputEvent::FocusLost,
             });
         }
 
@@ -1451,7 +1667,7 @@ pub fn terminal_focus_system(
         // Emit FocusGained
         events.write(TerminalEvent {
             target: remap_to_tui(next_entity, &surfaces),
-            event: TerminalEventType::FocusGained,
+            input: InputEvent::FocusGained,
         });
     }
 }
@@ -1465,39 +1681,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_keycode_to_char_letters() {
-        assert_eq!(keycode_to_char(KeyCode::KeyA, false), Some('a'));
-        assert_eq!(keycode_to_char(KeyCode::KeyA, true), Some('A'));
-        assert_eq!(keycode_to_char(KeyCode::KeyZ, false), Some('z'));
-        assert_eq!(keycode_to_char(KeyCode::KeyZ, true), Some('Z'));
+    fn test_keycode_from_logical_character() {
+        assert_eq!(
+            keycode_from_logical(&Key::Character("a".into()), false, BevyKeyCode::KeyA),
+            Some(KeyCode::Char('a'))
+        );
+        assert_eq!(
+            keycode_from_logical(&Key::Character("Ω".into()), false, BevyKeyCode::KeyO),
+            Some(KeyCode::Char('Ω'))
+        );
     }
 
     #[test]
-    fn test_keycode_to_char_numbers() {
-        assert_eq!(keycode_to_char(KeyCode::Digit1, false), Some('1'));
-        assert_eq!(keycode_to_char(KeyCode::Digit1, true), Some('!'));
-        assert_eq!(keycode_to_char(KeyCode::Digit5, false), Some('5'));
-        assert_eq!(keycode_to_char(KeyCode::Digit5, true), Some('%'));
-        assert_eq!(keycode_to_char(KeyCode::Digit0, false), Some('0'));
-        assert_eq!(keycode_to_char(KeyCode::Digit0, true), Some(')'));
+    fn test_keycode_from_logical_empty_character_is_none() {
+        assert_eq!(
+            keycode_from_logical(&Key::Character("".into()), false, BevyKeyCode::KeyA),
+            None
+        );
     }
 
     #[test]
-    fn test_keycode_to_char_punctuation() {
-        assert_eq!(keycode_to_char(KeyCode::Space, false), Some(' '));
-        assert_eq!(keycode_to_char(KeyCode::Comma, false), Some(','));
-        assert_eq!(keycode_to_char(KeyCode::Comma, true), Some('<'));
-        assert_eq!(keycode_to_char(KeyCode::Period, false), Some('.'));
-        assert_eq!(keycode_to_char(KeyCode::Period, true), Some('>'));
+    fn test_keycode_from_logical_tab_and_backtab() {
+        assert_eq!(
+            keycode_from_logical(&Key::Tab, false, BevyKeyCode::Tab),
+            Some(KeyCode::Tab)
+        );
+        assert_eq!(
+            keycode_from_logical(&Key::Tab, true, BevyKeyCode::Tab),
+            Some(KeyCode::BackTab)
+        );
     }
 
     #[test]
-    fn test_keycode_to_char_non_printable() {
-        assert_eq!(keycode_to_char(KeyCode::F1, false), None);
-        assert_eq!(keycode_to_char(KeyCode::Escape, false), None);
-        assert_eq!(keycode_to_char(KeyCode::ArrowUp, false), None);
-        assert_eq!(keycode_to_char(KeyCode::Enter, false), None);
-        assert_eq!(keycode_to_char(KeyCode::Backspace, false), None);
+    fn test_keycode_from_logical_function_key() {
+        assert_eq!(
+            keycode_from_logical(&Key::F5, false, BevyKeyCode::F5),
+            Some(KeyCode::F(5))
+        );
+    }
+
+    #[test]
+    fn test_keycode_from_logical_unknown_falls_back_to_physical() {
+        assert_eq!(
+            keycode_from_logical(&Key::Alt, false, BevyKeyCode::AltLeft),
+            Some(KeyCode::Unidentified(BevyKeyCode::AltLeft))
+        );
     }
 
     #[test]
@@ -1523,6 +1751,83 @@ mod tests {
         assert!(config.mouse_enabled);
         assert!(config.auto_focus);
         assert_eq!(config.focus_button, MouseButton::Left);
+    }
+
+    #[test]
+    fn test_read_modifiers() {
+        let mut input = ButtonInput::<BevyKeyCode>::default();
+        input.press(BevyKeyCode::ControlLeft);
+        let modifiers = read_modifiers(&input);
+        assert!(modifiers.ctrl);
+        assert!(!modifiers.alt);
+        assert!(!modifiers.shift);
+        assert!(!modifiers.meta);
+
+        let empty = ButtonInput::<BevyKeyCode>::default();
+        let modifiers = read_modifiers(&empty);
+        assert!(!modifiers.ctrl);
+        assert!(!modifiers.alt);
+        assert!(!modifiers.shift);
+        assert!(!modifiers.meta);
+    }
+
+    #[cfg(feature = "mouse_input")]
+    mod move_kind_tests {
+        use super::super::move_kind;
+        use bevy::input::mouse::MouseButton;
+        use crate::input::MouseEventKind;
+
+        #[test]
+        fn no_buttons_is_moved() {
+            assert_eq!(move_kind(false, false, false), MouseEventKind::Moved);
+        }
+
+        #[test]
+        fn left_button_drags() {
+            assert_eq!(
+                move_kind(true, false, false),
+                MouseEventKind::Drag(MouseButton::Left)
+            );
+        }
+
+        #[test]
+        fn left_wins_over_right_when_both_held() {
+            assert_eq!(
+                move_kind(true, true, false),
+                MouseEventKind::Drag(MouseButton::Left)
+            );
+        }
+    }
+
+    #[cfg(feature = "mouse_input")]
+    mod scroll_kind_tests {
+        use super::super::scroll_kind;
+        use crate::input::MouseEventKind;
+
+        #[test]
+        fn positive_y_scrolls_up() {
+            assert_eq!(scroll_kind(0.0, 1.0), Some(MouseEventKind::ScrollUp));
+        }
+
+        #[test]
+        fn negative_y_scrolls_down() {
+            assert_eq!(scroll_kind(0.0, -1.0), Some(MouseEventKind::ScrollDown));
+        }
+
+        #[test]
+        fn y_takes_priority_over_x() {
+            assert_eq!(scroll_kind(1.0, 1.0), Some(MouseEventKind::ScrollUp));
+        }
+
+        #[test]
+        fn positive_x_scrolls_right_when_y_is_zero() {
+            assert_eq!(scroll_kind(1.0, 0.0), Some(MouseEventKind::ScrollRight));
+        }
+
+        #[test]
+        fn all_zero_is_none() {
+            assert_eq!(scroll_kind(0.0, 0.0), None);
+        }
     }
 
     // ========================================================================

@@ -438,9 +438,9 @@ struct AppState {
     button_click_count: u32,
     light_illuminance: f32,
     /// Set while a press on `Hit::LightSlider` is held; subsequent
-    /// `MouseMove` events (even ones that stray off the slider's row, as
-    /// long as the button stays down) keep updating `light_illuminance`
-    /// until `MouseRelease`.
+    /// `MouseEventKind::Moved`/`Drag(_)` events (even ones that stray off
+    /// the slider's row, as long as the button stays down) keep updating
+    /// `light_illuminance` until `MouseEventKind::Up`.
     light_slider_dragging: bool,
     shadows_enabled: bool,
     camera_mode: CameraMode,
@@ -902,46 +902,47 @@ fn handle_terminal_events(
 
     for event in events.read() {
         if event.target == main_entity {
-            if let TerminalEventType::MousePress { position, .. } = &event.event {
-                info!(
-                    "Object_2 mouse click at col={}, row={}",
-                    position.0, position.1
-                );
+            if let InputEvent::Mouse(m) = &event.input
+                && matches!(m.kind, MouseEventKind::Down(_)) {
+                    info!(
+                        "Object_2 mouse click at col={}, row={}",
+                        m.column, m.row
+                    );
 
-                // Hit-tested via HitRegions, not parallel Rect bookkeeping.
-                // Button/TableRow hits can only
-                // occur when the STATUS/TABLE tab is active anyway, since
-                // HitRegions is rebuilt fresh every draw and only the
-                // active tab's render function runs.
-                match main_tui.hit_regions().hit_at::<Hit>(*position) {
-                    Some(Hit::Tab(tab)) => {
-                        app_state.selected_tab = tab as usize;
-                        info!("🎯 Tab switched: {}", tab);
+                    // Hit-tested via HitRegions, not parallel Rect
+                    // bookkeeping. Button/TableRow hits can only occur when
+                    // the STATUS/TABLE tab is active anyway, since
+                    // HitRegions is rebuilt fresh every draw and only the
+                    // active tab's render function runs.
+                    match main_tui.hit_regions().hit_at::<Hit>((m.column, m.row)) {
+                        Some(Hit::Tab(tab)) => {
+                            app_state.selected_tab = tab as usize;
+                            info!("🎯 Tab switched: {}", tab);
+                        }
+                        Some(Hit::Button) => {
+                            app_state.button_clicked = true;
+                            app_state.button_click_count += 1;
+                            info!("🎯 Button clicked! Count: {}", app_state.button_click_count);
+                        }
+                        Some(Hit::TableRow(row)) => {
+                            app_state.table_state.select(Some(row as usize));
+                            info!("🎯 Table row selected: {}", row);
+                        }
+                        _ => {}
                     }
-                    Some(Hit::Button) => {
-                        app_state.button_clicked = true;
-                        app_state.button_click_count += 1;
-                        info!("🎯 Button clicked! Count: {}", app_state.button_click_count);
-                    }
-                    Some(Hit::TableRow(row)) => {
-                        app_state.table_state.select(Some(row as usize));
-                        info!("🎯 Table row selected: {}", row);
-                    }
-                    _ => {}
                 }
-            }
         } else if let Some((_, overlay_tui)) = overlay.filter(|(entity, _)| *entity == event.target)
         {
             // Overlay terminal events - hit-tested via HitRegions, not
             // parallel Rect bookkeeping.
-            match &event.event {
-                TerminalEventType::MousePress { position, .. } => {
+            match &event.input {
+                InputEvent::Mouse(m) if matches!(m.kind, MouseEventKind::Down(_)) => {
                     info!(
                         "Overlay terminal mouse click at col={}, row={}",
-                        position.0, position.1
+                        m.column, m.row
                     );
 
-                    match overlay_tui.hit_regions().hit_at::<Hit>(*position) {
+                    match overlay_tui.hit_regions().hit_at::<Hit>((m.column, m.row)) {
                         Some(Hit::CrtCheckbox) => {
                             app_state.effects_enabled = !app_state.effects_enabled;
                             info!(
@@ -988,7 +989,7 @@ fn handle_terminal_events(
                         }
                         Some(Hit::LightSlider) => {
                             app_state.light_slider_dragging = true;
-                            app_state.light_illuminance = light_illuminance_from_col(position.0);
+                            app_state.light_illuminance = light_illuminance_from_col(m.column);
                             info!("🎯 Light: {:.0}", app_state.light_illuminance);
                         }
                         _ => {}
@@ -999,11 +1000,16 @@ fn handle_terminal_events(
                 // column is applied unconditionally, without re-hit-testing
                 // against row 3, so the drag keeps tracking even if the
                 // cursor strays off the slider's row, matching ordinary GUI
-                // slider behaviour.
-                TerminalEventType::MouseMove { position } if app_state.light_slider_dragging => {
-                    app_state.light_illuminance = light_illuminance_from_col(position.0);
+                // slider behaviour. Matches both `Moved` (mouse) and
+                // `Drag(_)` (mouse held or touch) - the drag can continue
+                // being reported as either depending on button state.
+                InputEvent::Mouse(m)
+                    if app_state.light_slider_dragging
+                        && matches!(m.kind, MouseEventKind::Moved | MouseEventKind::Drag(_)) =>
+                {
+                    app_state.light_illuminance = light_illuminance_from_col(m.column);
                 }
-                TerminalEventType::MouseRelease { .. } => {
+                InputEvent::Mouse(m) if matches!(m.kind, MouseEventKind::Up(_)) => {
                     app_state.light_slider_dragging = false;
                 }
                 _ => {}

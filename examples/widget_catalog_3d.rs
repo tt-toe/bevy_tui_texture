@@ -23,6 +23,9 @@ use ratatui::widgets::*;
 use unicode_width::UnicodeWidthStr;
 
 use bevy_tui_texture::Font as TerminalFont;
+// Explicit import: shadows bevy::prelude::KeyCode (globs never override an
+// explicit `use`), so `KeyCode::Tab` etc. below mean the terminal key mirror.
+use bevy_tui_texture::input::KeyCode;
 use bevy_tui_texture::prelude::*;
 
 // Terminal dimensions
@@ -149,13 +152,13 @@ fn handle_terminal_events(
     };
 
     for event in events.read().filter(|e| e.target == terminal_entity) {
-        match &event.event {
-            TerminalEventType::MouseMove { position } => {
-                ui_state.mouse_position = Some(*position);
+        match &event.input {
+            InputEvent::Mouse(m) if matches!(m.kind, MouseEventKind::Moved | MouseEventKind::Drag(_)) => {
+                ui_state.mouse_position = Some((m.column, m.row));
             }
 
-            TerminalEventType::MousePress { position, .. } => {
-                let (col, row) = *position;
+            InputEvent::Mouse(m) if matches!(m.kind, MouseEventKind::Down(_)) => {
+                let (col, row) = (m.column, m.row);
                 let pos = ratatui::layout::Position { x: col, y: row };
 
                 info!(
@@ -257,28 +260,28 @@ fn handle_terminal_events(
                         }
             }
 
-            TerminalEventType::KeyPress { key, .. } => {
+            InputEvent::Key(k) if k.kind != KeyEventKind::Release => {
                 use KeyCode::*;
-                match key {
+                match k.code {
                     Tab => {
                         ui_state.selected_tab = (ui_state.selected_tab + 1) % 5;
                     }
-                    ArrowUp => {
+                    Up => {
                         if ui_state.selected_tab == 1 {
                             let i = ui_state.list_state.selected().unwrap_or(0);
                             ui_state.list_state.select(Some(i.saturating_sub(1)));
                         }
                     }
-                    ArrowDown => {
+                    Down => {
                         if ui_state.selected_tab == 1 {
                             let i = ui_state.list_state.selected().unwrap_or(0);
                             ui_state.list_state.select(Some((i + 1).min(9)));
                         }
                     }
-                    ArrowLeft => {
+                    Left => {
                         ui_state.gauge_value = ui_state.gauge_value.saturating_sub(5);
                     }
-                    ArrowRight => {
+                    Right => {
                         ui_state.gauge_value = (ui_state.gauge_value + 5).min(100);
                     }
                     _ => {}

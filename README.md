@@ -146,6 +146,7 @@ features = ["3d", "keyboard_input", "mouse_input"]   # e.g. a 3D-only app
 - **`bold_italic_fonts`** — real bold/italic font slots; without it, bold/italic are faked from the regular font
 - **`emoji`** — emoji and extended Unicode support (WIP)
 - **`ascii_fast_shaping`** — skip text shaping for all-ASCII rows (assumes zero glyph offsets, true for most monospace fonts; inert when `bold_italic_fonts` is enabled)
+- **`crossterm-compat`** (native-only) — lossy conversions between `input::InputEvent` and `crossterm::event::Event`, for interop with ratatui-ecosystem widget crates or a bevy_ratatui adapter; not available on wasm32 (crossterm doesn't build there)
 
 `TuiKind` variants gate individually: `Ui` needs `2d`, `WorldQuad` needs `3d`, `Headless` is always available.
 

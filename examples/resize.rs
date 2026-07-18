@@ -2,8 +2,8 @@
 //!
 //! Demonstrates the runtime-resize recipe (no auto-fit helper ships - see
 //! the doc comment on `Tui::request_resize`):
-//! 1. listen for `TerminalEventType::Resize { new_size }` (pixels, already
-//!    broadcast to every terminal by the plugin's `window_resize_system`),
+//! 1. listen for `InputEvent::Resize { pixels }` (already broadcast to
+//!    every terminal by the plugin's `window_resize_system`),
 //! 2. convert to `cols`/`rows` using the same font metrics the terminal was
 //!    created with,
 //! 3. call `Tui::request_resize(cols, rows)` - no GPU work at the call site,
@@ -97,9 +97,9 @@ fn handle_resize(
         return;
     };
     for event in events.read() {
-        if let TerminalEventType::Resize { new_size } = &event.event {
-            let cols = (new_size.0 / fonts.0.min_width_px()).max(1) as u16;
-            let rows = (new_size.1 / fonts.0.height_px()).max(1) as u16;
+        if let InputEvent::Resize { pixels } = &event.input {
+            let cols = (pixels.x / fonts.0.min_width_px()).max(1) as u16;
+            let rows = (pixels.y / fonts.0.height_px()).max(1) as u16;
             term.request_resize(cols, rows);
         }
     }
@@ -107,10 +107,11 @@ fn handle_resize(
 
 fn handle_clicks(mut events: MessageReader<TerminalEvent>, mut clicks: ResMut<Clicks>) {
     for event in events.read() {
-        if let TerminalEventType::MousePress { position, .. } = &event.event {
-            clicks.count += 1;
-            clicks.last = Some(*position);
-        }
+        if let InputEvent::Mouse(m) = &event.input
+            && matches!(m.kind, MouseEventKind::Down(_)) {
+                clicks.count += 1;
+                clicks.last = Some((m.column, m.row));
+            }
     }
 }
 

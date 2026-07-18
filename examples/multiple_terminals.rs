@@ -54,6 +54,9 @@ use std::sync::Arc;
 use tracing::info;
 
 use bevy_tui_texture::Font as TerminalFont;
+// Explicit import: shadows bevy::prelude::KeyCode (globs never override an
+// explicit `use`), so `KeyCode::Enter` etc. below mean the terminal key mirror.
+use bevy_tui_texture::input::KeyCode;
 use bevy_tui_texture::prelude::*;
 
 fn main() {
@@ -249,9 +252,9 @@ fn handle_events(
     for event in events.read() {
         // Handle interactive terminal events
         if Some(event.target) == interactive_entity {
-            match &event.event {
-                TerminalEventType::MousePress { position, .. } => {
-                    let (col, row) = *position;
+            match &event.input {
+                InputEvent::Mouse(m) if matches!(m.kind, MouseEventKind::Down(_)) => {
+                    let (col, row) = (m.column, m.row);
                     info!("[Interactive] Click at col={}, row={}", col, row);
 
                     app_state.log_messages.push(format!(
@@ -271,14 +274,14 @@ fn handle_events(
                     }
                     app_state.counter += 1;
                 }
-                TerminalEventType::KeyPress { key, .. } => match key {
-                    KeyCode::ArrowUp => {
+                InputEvent::Key(k) if k.kind != KeyEventKind::Release => match k.code {
+                    KeyCode::Up => {
                         app_state.selected_item = app_state.selected_item.saturating_sub(1);
                         app_state
                             .log_messages
                             .push("Selection moved up".to_string());
                     }
-                    KeyCode::ArrowDown => {
+                    KeyCode::Down => {
                         app_state.selected_item = (app_state.selected_item + 1).min(4);
                         app_state
                             .log_messages
@@ -291,7 +294,7 @@ fn handle_events(
                             .push(format!("Selected item {}", item));
                         app_state.counter += 1;
                     }
-                    KeyCode::KeyC => {
+                    KeyCode::Char('c') => {
                         app_state.counter += 1;
                         let count = app_state.counter;
                         app_state.log_messages.push(format!("Counter: {}", count));
@@ -304,8 +307,9 @@ fn handle_events(
 
         // Handle log terminal events
         if Some(event.target) == log_entity
-            && let TerminalEventType::MousePress { position, .. } = &event.event {
-                let (col, row) = *position;
+            && let InputEvent::Mouse(m) = &event.input
+            && matches!(m.kind, MouseEventKind::Down(_)) {
+                let (col, row) = (m.column, m.row);
                 info!("[Log] Click at col={}, row={}", col, row);
 
                 app_state.log_messages.push(format!(
@@ -316,8 +320,9 @@ fn handle_events(
 
         // Handle status terminal events (clicking gauge to adjust)
         if Some(event.target) == status_entity
-            && let TerminalEventType::MousePress { position, .. } = &event.event {
-                let (col, _row) = *position;
+            && let InputEvent::Mouse(m) = &event.input
+            && matches!(m.kind, MouseEventKind::Down(_)) {
+                let col = m.column;
                 info!("[Status] Click at col={}", col);
 
                 app_state.log_messages.push(format!(
@@ -330,8 +335,9 @@ fn handle_events(
 
         // Handle overlap back terminal events
         if Some(event.target) == overlap_back_entity
-            && let TerminalEventType::MousePress { position, .. } = &event.event {
-                let (col, row) = *position;
+            && let InputEvent::Mouse(m) = &event.input
+            && matches!(m.kind, MouseEventKind::Down(_)) {
+                let (col, row) = (m.column, m.row);
                 info!("[Overlap BACK] col={}, row={} | ZIndex=0", col, row);
 
                 app_state
@@ -341,8 +347,9 @@ fn handle_events(
 
         // Handle overlap front terminal events
         if Some(event.target) == overlap_front_entity
-            && let TerminalEventType::MousePress { position, .. } = &event.event {
-                let (col, row) = *position;
+            && let InputEvent::Mouse(m) = &event.input
+            && matches!(m.kind, MouseEventKind::Down(_)) {
+                let (col, row) = (m.column, m.row);
                 info!("[Overlap FRONT] col={}, row={} | ZIndex=10", col, row);
 
                 app_state
