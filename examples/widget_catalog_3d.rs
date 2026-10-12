@@ -12,7 +12,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rand::Rng as _;
 use tracing::info;
 
 use bevy::prelude::*;
@@ -103,11 +102,9 @@ fn setup_terminal(mut commands: Commands) {
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.5, -0.5, 0.0)),
     ));
 
-    // Declarative 3D terminal. `world_quad`'s mesh already faces +Z at rest
-    // (see `rotate_plane`'s comment for why this changes the seesaw
-    // rotation formula vs. the old Y-normal `SimpleTerminal3D` plane).
-    // height chosen to match the original pixel-sized plane
-    // (ROWS * char_height_px) so the on-screen scale is unchanged.
+    // Declarative 3D terminal. `world_quad`'s mesh faces +Z at rest (see
+    // `rotate_plane`). The height is the terminal's pixel height
+    // (ROWS * char_height_px), i.e. one world unit per pixel.
     let char_height_px = fonts.height_px();
     let terminal_entity = commands
         .spawn((
@@ -307,7 +304,7 @@ fn update_terminal_content(
     // Update sparkline data with random values
     ui_state.sparkline_timer.tick(time.delta());
     if ui_state.sparkline_timer.just_finished() {
-        let new_value = rand::thread_rng().gen_range(1..=15);
+        let new_value = rand::random_range(1..=15);
         ui_state.sparkline_data.push(new_value);
         if ui_state.sparkline_data.len() > 32 {
             ui_state.sparkline_data.remove(0);
@@ -755,10 +752,8 @@ fn draw_glyphs_tab(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
 
 /// System that rotates the plane in seesaw motion for always-visible interaction.
 ///
-/// `TuiKind::WorldQuad`'s mesh already faces +Z at rest (unlike the
-/// old `SimpleTerminal3D`, whose `Plane3d::default()` faces +Y and needed an
-/// extra `Quat::from_rotation_x(FRAC_PI_2)` to face the camera) - so the
-/// seesaw here is a plain roll around Z, no base reorientation needed.
+/// `TuiKind::WorldQuad`'s mesh faces +Z at rest, so the seesaw here is a
+/// plain roll around Z, no base reorientation needed.
 fn rotate_plane(time: Res<Time>, mut query: Query<&mut Transform, With<RotatingPlane>>) {
     for mut transform in &mut query {
         // Seesaw rotation: oscillate ±45° around Z axis

@@ -15,6 +15,7 @@ use rustybuzz::Face;
 use rustybuzz::ttf_parser::colr::CompositeMode;
 
 pub(crate) mod plan_cache;
+pub(crate) mod shape_cache;
 pub(crate) mod text_atlas;
 
 pub(crate) struct Outline {

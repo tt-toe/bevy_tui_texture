@@ -73,7 +73,7 @@ struct CrtExtension {
 
 impl MaterialExtension for CrtExtension {
     fn fragment_shader() -> ShaderRef {
-        "shaders/crt_extended.wgsl".into()
+        "shaders/crt_extended.wesl".into()
     }
 }
 

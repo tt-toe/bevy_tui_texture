@@ -30,8 +30,6 @@ use bevy::input::mouse::MouseWheel;
 use bevy::prelude::*;
 #[cfg(feature = "mouse_input")]
 use tracing::debug;
-//use bevy::log::debug;
-//use log::debug;
 
 // Ray casting for 3D mouse input
 #[cfg(all(feature = "mouse_input", feature = "3d"))]
@@ -486,18 +484,11 @@ impl PartialOrd for SortKey {
             // top of it, so a UI panel overlapping a 3D terminal in screen
             // space (e.g. a HUD panel sitting above where a world model
             // happens to project to) produces hit_candidates for both.
-            // Previously this returned `None`, and the caller's
-            // `sort_by(|a, b| ... .unwrap_or(Equal))` treated that as
-            // "equal" - `Vec::sort_by` is stable, so the winner silently
-            // fell back to whichever entity the `terminals` query happened
-            // to iterate first (archetype/spawn-order dependent, NOT
-            // screen-depth dependent). That made 2D UI clicks
-            // unpredictably "shadowed" by an unrelated 3D hit - observed as
-            // "the 3D model's screen responds to clicks but the 2D overlay
-            // panel doesn't" on some platforms/window sizes but not others,
-            // purely from incidental query ordering. bevy_ui is rendered as
-            // a screen-space overlay on top of every 3D camera regardless
-            // of `Camera::order`, so a UI hit always wins when both fire.
+            // Leaving the two unordered would let the winner depend on
+            // query iteration order (archetype/spawn-order dependent, NOT
+            // screen-depth dependent). bevy_ui is rendered as a
+            // screen-space overlay on top of every 3D camera regardless of
+            // `Camera::order`, so a UI hit always wins when both fire.
             (SortKey::ZIndex(_), SortKey::Distance { .. }) => Some(std::cmp::Ordering::Less),
             (SortKey::Distance { .. }, SortKey::ZIndex(_)) => Some(std::cmp::Ordering::Greater),
         }
@@ -505,7 +496,7 @@ impl PartialOrd for SortKey {
 }
 
 /// Bundles the unified system's three change-detection probe queries
-/// (IMPROVEMENT.md D1) into a single `SystemParam`. Bevy's generated
+/// into a single `SystemParam`. Bevy's generated
 /// `SystemParam` tuple impl tops out at 16 elements; the unified variant's
 /// own parameter list already sits at that ceiling once `keyboard` and
 /// `wheel` are added for scroll/modifier support, so these three
@@ -649,7 +640,7 @@ fn bounding_box_hit_test(
 
     // Coordinate system handling for Bevy UI:
     // - Cursor (input) is in UI coordinates: top-left origin, +Y down, pixels.
-    // - `UiGlobalTransform` (bevy 0.19's UI-specific transform - plain
+    // - `UiGlobalTransform` (bevy's UI-specific transform - plain
     //   `GlobalTransform` is NOT among `Node`'s required components and is
     //   simply absent on pure-UI entities) resolves to the same top-left
     //   origin, +Y down, pixel space as the cursor, but gives the node's
@@ -658,7 +649,7 @@ fn bounding_box_hit_test(
     //   silently reads 0 for any axis anchored from the opposite edge).
     let (node_min_x, node_min_y) = if let Some(t) = ui_transform {
         // `UiGlobalTransform::translation` is in the same physical-pixel
-        // space as `ComputedNode.size` (bevy 0.19's taffy layout runs
+        // space as `ComputedNode.size` (bevy's taffy layout runs
         // entirely in physical pixels) - must be scaled to logical pixels
         // by the same `inverse_scale_factor` as `width_px`/`height_px`
         // above, or the computed bounds are wrong by exactly the window's
@@ -756,7 +747,7 @@ fn bounding_box_hit_test(
     Some(HitTestResult { col, row })
 }
 
-/// Coarse pre-check (IMPROVEMENT.md D1): does `world_ray` even reach the
+/// Coarse pre-check: does `world_ray` even reach the
 /// mesh entity's bounding box? Rejects most terminals with a few float ops
 /// before any mesh vertex data (positions/indices/UVs) is touched by the
 /// precise test in `ray_cast_hit_test_inner`.
@@ -780,8 +771,8 @@ fn ray_intersects_aabb(
     mesh_transform: &bevy::transform::components::GlobalTransform,
     aabb: Option<&bevy::camera::primitives::Aabb>,
 ) -> bool {
-    use bevy::math::bounding::{Aabb3d, RayCast3d};
     use bevy::math::{Dir3A, Vec3A};
+    use bevy::shape::{Aabb3d, RayCast3d};
 
     let Some(aabb) = aabb else {
         return true;
@@ -811,7 +802,6 @@ fn ray_cast_hit_test_inner(
     meshes: &bevy::asset::Assets<bevy::mesh::Mesh>,
     dimensions: Option<&crate::bevy_plugin::TerminalDimensions>,
 ) -> Option<(HitTestResult, f32)> {
-    use bevy::math::Ray3d;
     use bevy::mesh::VertexAttributeValues;
     use bevy::picking::mesh_picking::ray_cast::{Backfaces, ray_mesh_intersection};
     use bevy::prelude::*;
@@ -1114,7 +1104,7 @@ pub fn mouse_input_system(
     )>,
     surfaces: Query<&crate::setup::TuiSurface>,
     mut events: MessageWriter<TerminalEvent>,
-    // Change-detection gate (IMPROVEMENT.md D1): anything that can move a
+    // Change-detection gate: anything that can move a
     // cursor→cell mapping without the cursor pixel position itself
     // changing. Bundled into one `SystemParam` - see `MouseChangeProbes`.
     change_probes: MouseChangeProbes,
@@ -1203,7 +1193,7 @@ pub fn mouse_input_system(
                     continue; // no GlobalTransform - can't ray-cast
                 };
 
-                // Stage 1 (coarse->fine, IMPROVEMENT.md D1): visibility -
+                // Stage 1 (coarse->fine): visibility -
                 // bevy's own visibility system already computed this for
                 // the frame, so an invisible terminal is skipped before
                 // any per-camera work. Fail open (no component = not
@@ -1284,7 +1274,7 @@ pub fn mouse_input_system(
     }
 
     if let Some((entity, hit_result, _sort_key)) = hit_candidates.first() {
-        // Dedupe MouseMove (IMPROVEMENT.md D1): only emit when the
+        // Dedupe MouseMove: only emit when the
         // hovered (entity, col, row) actually changed since the last
         // recompute, so hovering inside one cell stops re-emitting on
         // every gate-triggered recompute.
@@ -1348,7 +1338,7 @@ pub fn mouse_input_system(
     )>,
     surfaces: Query<&crate::setup::TuiSurface>,
     mut events: MessageWriter<TerminalEvent>,
-    // Change-detection gate (IMPROVEMENT.md D1) - no camera/3D probe
+    // Change-detection gate - no camera/3D probe
     // needed here: `bounding_box_hit_test` is pure screen-space, it never
     // reads a camera.
     terminal_ui_changed: Query<
@@ -1476,7 +1466,7 @@ pub fn mouse_input_system(
     )>,
     surfaces: Query<&crate::setup::TuiSurface>,
     mut events: MessageWriter<TerminalEvent>,
-    // Change-detection gate (IMPROVEMENT.md D1) - see the unified system's
+    // Change-detection gate - see the unified system's
     // doc comment for the full rationale; no UI-layout probe needed here
     // since there is no 2D UI terminal kind in this build.
     camera_change_probe: Query<
@@ -1551,7 +1541,7 @@ pub fn mouse_input_system(
             continue; // no GlobalTransform - can't ray-cast
         };
 
-        // Stage 1 (coarse->fine, IMPROVEMENT.md D1): visibility. Fail
+        // Stage 1 (coarse->fine): visibility. Fail
         // open (no component = not pruned).
         if view_visibility.is_some_and(|v| !v.get()) {
             continue;
@@ -1872,7 +1862,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Coordinate mapping (P2-4): pixel_to_cell (2D UI) / uv_to_cell (3D mesh).
+    // Coordinate mapping: pixel_to_cell (2D UI) / uv_to_cell (3D mesh).
     // Pure math, no bevy types - exercised directly.
     // ========================================================================
 
@@ -1936,7 +1926,7 @@ mod tests {
 
         #[test]
         fn uv_one_clamps_to_the_last_cell_not_one_past_it() {
-            // The bug this guards against: a naive `(uv * cols).clamp(0.0,
+            // What this guards against: a naive `(uv * cols).clamp(0.0,
             // cols)` allows exactly `cols` at `uv == 1.0`, one past the last
             // valid grid index (0..cols-1).
             assert_eq!(uv_to_cell(1.0, 1.0, 80, 24), (79, 23));

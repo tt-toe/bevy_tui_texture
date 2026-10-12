@@ -1,8 +1,8 @@
 [package]
 name = "bevy_tui_texture"
-version = "0.3.5"
+version = "0.4.0"
 edition = "2024"
-rust-version = "1.96"
+rust-version = "1.97.1"
 authors = ["TTT"]
 autoexamples = false
 license = "MIT"
@@ -24,8 +24,7 @@ mouse_input = []
 bold_italic_fonts = []
 emoji = ["dep:unicode-properties"]
 # Bypasses rustybuzz shaping for rows where every cell is a single ASCII
-# printable byte with a glyph present in the row's font - see
-# IMPROVEMENT.md A3. Off by default: skipping real shaping means a glyph's
+# printable byte with a glyph present in the row's font. Off by default: skipping real shaping means a glyph's
 # rustybuzz-computed x_offset (kerning/bearing) is assumed to be zero,
 # which holds for most monospace fonts' basic Latin glyphs but isn't
 # guaranteed for all of them. Requires `bold_italic_fonts` to stay
@@ -71,40 +70,37 @@ debug = false
 # General
 [dependencies]
 # Core only: no webgl2/x11 (downstream picks its own windowing/backend),
-# no zstd_rust/tonemapping_luts (examples-only, moved to dev-dependencies),
+# no zstd_rust/tonemapping_luts (examples-only, in dev-dependencies),
 # no bevy_pbr/bevy_picking/mesh_picking/bevy_ui_render/bevy_sprite* (gated
 # behind this crate's own "2d"/"3d" features below instead of forced on
 # every downstream consumer).
-bevy = { version = "0.19", default-features = false, features = [
+bevy = { version = "0.20", default-features = false, features = [
     "bevy_render",
     "bevy_core_pipeline",
 ]}
 ratatui = { version = "0.30.2", default-features = false }
-# Must match the wgpu version bevy 0.19 is pinned to (currently 29) - bump
+# Must match the wgpu version bevy 0.20 is pinned to (currently 30) - bump
 # together. `pub use wgpu;` in lib.rs re-exports this exact version so
 # downstream custom render passes (see `Tui::image_handle` +
 # render-world `GpuImage` lookup) can reference matching types without
 # separately pinning their own wgpu dependency.
-wgpu = { version = "29.0", default-features = false, features = ["wgsl", "webgl"] }
-rustybuzz = "0.20"
-raqote = { version = "0.8", default-features = false }
-tiny-skia = "0.11"
-bytemuck = { version = "1.23", features = ["derive"] }
-bitvec = { version = "1.0", default-features = false, features = ["std"] }
-indexmap = { version = "2.11", default-features = false, features = ["std"] }
-evictor = { version = "0.5", default-features = false }
-unicode-width = "0.2"
-web-time = "1.1"
-tracing = "0.1"
-thiserror = "2.0"
-unicode-properties = { version = "0.1", optional = true }
+wgpu = { version = "30.0", default-features = false, features = ["wgsl", "webgl"] }
+rustybuzz = "0.20.1"
+raqote = { version = "0.8.5", default-features = false }
+tiny-skia = "0.12"
+bytemuck = { version = "1.25", features = ["derive"] }
+bitvec = { version = "1.1", default-features = false, features = ["std"] }
+evictor = { version = "0.7", default-features = false }
+unicode-width = "0.2.2"
+tracing = "0.1.44"
+thiserror = "2.0.21"
+unicode-properties = { version = "0.1.4", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-wasm-bindgen = "0.2"
-web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlCanvasElement", "KeyboardEvent", "console"] }
-js-sys = "0.3"
-console_error_panic_hook = "0.1"
-getrandom = { version = "0.2", features = ["js"] }
+wasm-bindgen = "0.2.129"
+web-sys = { version = "0.3.106", features = ["Window", "Document", "Element", "HtmlCanvasElement", "KeyboardEvent", "console"] }
+js-sys = "0.3.106"
+console_error_panic_hook = "0.1.7"
 
 # `crossterm-compat` feature only - crossterm does not build on wasm32.
 # Version pinned to match ratatui 0.30.2's own crossterm backend
@@ -118,9 +114,6 @@ getrandom = { version = "0.2", features = ["js"] }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 crossterm = { version = "0.29", optional = true, default-features = false, features = ["events", "bracketed-paste"] }
 
-[dev-dependencies]
-rand = "0.8"
-
 # Extra bevy features for examples only (the lib's bevy is default-features=false):
 # - bevy_log: without it examples run silently — shader/asset errors invisible
 # - bevy_gltf/bevy_scene + png/jpeg: the retro_crt glTF model
@@ -129,11 +122,11 @@ rand = "0.8"
 #   needed by the lib itself
 # - webgl2/x11: windowing/GPU backend choice belongs to the app, not the lib
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-bevy = { version = "0.19", default-features = false, features = [
+bevy = { version = "0.20", default-features = false, features = [
     "bevy_log",
     "bevy_gltf",
     "bevy_scene",
-    "bevy_world_serialization", # WorldAssetRoot (0.19 scene spawning)
+    "bevy_world_serialization", # WorldAssetRoot scene spawning
     "reflect_auto_register",    # spawning WorldAssets panics on unregistered types without this
     "png",
     "jpeg",
@@ -142,7 +135,10 @@ bevy = { version = "0.19", default-features = false, features = [
     "webgl2",
     "x11",
 ] }
-font-kit = "0.14"
+font-kit = "0.14.3"
+# Native-only: rand's OS entropy source (getrandom) needs extra build
+# configuration on wasm32-unknown-unknown, and only native examples use it.
+rand = "0.10"
 
 # wasm_demo's own bevy feature set, trimmed for binary size: no zstd_rust/
 # tonemapping_luts (the ~680KB embedded LUT textures + ktx2/zstd decoder;
@@ -151,8 +147,8 @@ font-kit = "0.14"
 #
 # bevy_winit is LOAD-BEARING here even though wasm has no "window": it is
 # the event-loop runner. On native the "x11" feature pulls it in
-# transitively (x11 = ["bevy_internal/x11"] = bevy_winit/x11), but dropping
-# x11 for wasm also dropped bevy_winit itself. Without WinitPlugin,
+# transitively (x11 = ["bevy_internal/x11"] = bevy_winit/x11); a feature
+# list without x11 must name bevy_winit itself. Without WinitPlugin,
 # App::run() falls back to the run_once runner, whose
 # `while plugins_state() == Adding {}` wait-loop busy-spins the browser's
 # main thread forever: RenderPlugin::ready() can only flip once the
@@ -161,7 +157,7 @@ font-kit = "0.14"
 # with zero console output ("Script terminated by timeout" stack topping
 # out in bevy_app::App::plugins_state).
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
-bevy = { version = "0.19", default-features = false, features = [
+bevy = { version = "0.20", default-features = false, features = [
     "bevy_log",
     "bevy_winit",
     "bevy_gltf",
@@ -172,7 +168,7 @@ bevy = { version = "0.19", default-features = false, features = [
     "jpeg",
     "webgl2",
 ] }
-wasm-bindgen-test = "0.3"
+wasm-bindgen-test = "0.3.79"
 
 [lints.clippy]
 type_complexity = "allow"

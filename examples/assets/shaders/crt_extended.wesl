@@ -2,17 +2,21 @@
 // Custom fragment shader for CRT post-processing effects
 // Extends StandardMaterial safely using MaterialExtension pattern
 
-#import bevy_pbr::{
+import bevy_pbr::render::{
     pbr_fragment::pbr_input_from_standard_material,
-    pbr_functions::{alpha_discard, apply_pbr_lighting},
-    forward_io::VertexOutput,
-}
+    pbr_functions::alpha_discard,
+};
 
-#ifdef PREPASS_PIPELINE
-#import bevy_pbr::prepass_io::FragmentOutput
-#else
-#import bevy_pbr::forward_io::FragmentOutput
-#endif
+@if(PREPASS_PIPELINE)
+import bevy_pbr::{
+    prepass::io::{VertexOutput, FragmentOutput},
+    deferred::functions::deferred_output,
+};
+@else
+import bevy_pbr::render::{
+    forward_io::{VertexOutput, FragmentOutput},
+    pbr_functions::apply_pbr_lighting,
+};
 
 // CRT uniforms struct (matches Rust CrtUniforms exactly)
 struct CrtUniforms {
@@ -25,7 +29,7 @@ struct CrtUniforms {
 // CRITICAL: Binding 100 in MATERIAL_BIND_GROUP (Group 3)
 // This matches the Rust #[uniform(100)] attribute
 // StandardMaterial uses bindings 0-30, so 100 is safely above that range
-@group(#{MATERIAL_BIND_GROUP}) @binding(100)
+@group(constants::MATERIAL_BIND_GROUP) @binding(100)
 var<uniform> crt: CrtUniforms;
 
 // Animated scan lines effect
@@ -55,33 +59,34 @@ fn fragment(
 
     // Apply alpha discard (standard PBR operation)
     pbr_input.material.base_color = alpha_discard(
-        pbr_input.material,
+        pbr_input.material.flags,
+        pbr_input.material.alpha_cutoff,
         pbr_input.material.base_color
     );
 
     // Apply PBR lighting and generate base output
-    #ifdef PREPASS_PIPELINE
-        let out = deferred_output(in, pbr_input);
-    #else
-        var out: FragmentOutput;
+    var out: FragmentOutput;
+    @if(PREPASS_PIPELINE) {
+        out = deferred_output(in, pbr_input);
+    } @else {
 
         // Apply PBR lighting (includes our terminal texture from StandardMaterial)
         out.color = apply_pbr_lighting(pbr_input);
 
-        // Phases 2-4: Apply CRT effects
+        // Apply CRT effects
         if crt.effect_intensity > 0.01 {
             // Extract RGB to modify (WGSL doesn't allow assignment to swizzles)
             var rgb = out.color.rgb;
 
-            // Phase 2: Scan lines
+            // Scan lines
             let scan_factor = scanline(in.uv);
             rgb *= scan_factor;
 
-            // Phase 3: Vignette
+            // Vignette
             let vignette_factor = vignette(in.uv);
             rgb *= mix(1.0, vignette_factor, crt.effect_intensity);
 
-            // Phase 4: Phosphor glow + color shift
+            // Phosphor glow + color shift
             // Phosphor glow (subtle gamma adjustment)
             rgb = pow(rgb, vec3<f32>(0.9));
 
@@ -93,7 +98,7 @@ fn fragment(
             // Reconstruct color with modified RGB and original alpha
             out.color = vec4<f32>(rgb, out.color.a);
         }
-    #endif
+    }
 
     return out;
 }

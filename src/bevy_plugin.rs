@@ -179,9 +179,9 @@ impl Plugin for TerminalPlugin {
         // take zero render-resource parameters. The actual GPU render
         // happens in the render world - see `extract_tui_draws` /
         // `render_tui_textures` below. Ordered after the whole Render set
-        // rather than inside it: inside, it was ambiguous with the user's
-        // draw systems, and a draw that happened to run after the flush
-        // reached the GPU a frame late.
+        // rather than inside it: inside, it would be ambiguous with the
+        // user's draw systems, and a draw running after the flush would
+        // reach the GPU a frame late.
         app.add_systems(Update, gpu_flush_system.after(TerminalSystemSet::Render));
         #[cfg(feature = "3d")]
         app.add_systems(Update, resize_world_quad_meshes.after(gpu_flush_system));
@@ -208,18 +208,22 @@ impl Plugin for TerminalPlugin {
         // headless test setups - silently skip registration there, matching
         // every other bevy render-world plugin's own convention.
         //
-        // Registered on the `RenderGraph` schedule (bevy 0.19 has no
-        // node-based render graph - `RenderGraph` is a schedule, run once
-        // per frame from inside `render_system`, with chained sets
-        // `Begin -> Render -> Submit -> Finish`; bevy_core_pipeline's own
-        // camera passes run in `Render`, batched-submitted in `Submit`),
-        // rather than the plain `Render` schedule's `RenderSystems::Render`
-        // set: putting `render_tui_textures` in `RenderGraphSystems::Begin`
-        // structurally guarantees it records before this same frame's
-        // camera passes (`RenderGraphSystems::Render`), so a material
-        // samples this frame's terminal content, not the previous frame's -
-        // not by system-order-plus-submit-timing luck, but because `Begin`
-        // is chained strictly before `Render`.
+        // Registered on the `RenderGraph` schedule (a schedule run once per
+        // frame from inside `render_system`, with sets `Begin -> Render ->
+        // Submit -> Finish`; bevy_core_pipeline's camera passes run in
+        // `Render` and are batch-submitted in `Submit`).
+        //
+        // Those sets are only *weakly* chained: an ordering holds between
+        // two systems only if their tracked ECS access conflicts. None of the orderings this plugin depends on are
+        // visible that way (command buffers travel through `Deferred`
+        // state, and the GPU itself is the shared resource), so each one
+        // is spelled out explicitly below instead of being inherited from
+        // set membership:
+        // - `render_tui_textures` strictly before the whole `Render` set,
+        //   so a material samples this frame's terminal content, not the
+        //   previous frame's;
+        // - the submit after the terminal passes were recorded;
+        // - the blocking readback after that submit.
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
             render_app
                 .init_resource::<PendingTuiDraws>()
@@ -233,7 +237,9 @@ impl Plugin for TerminalPlugin {
                 .add_systems(
                     RenderGraph,
                     (
-                        render_tui_textures.in_set(RenderGraphSystems::Begin),
+                        render_tui_textures
+                            .in_set(RenderGraphSystems::Begin)
+                            .before(RenderGraphSystems::Render),
                         // Safety net for app configurations without
                         // `CorePipelinePlugin` (bevy_core_pipeline's own
                         // `submit_pending_command_buffers`, which normally
@@ -246,12 +252,17 @@ impl Plugin for TerminalPlugin {
                         // double submit, since both take
                         // `ResMut<PendingCommandBuffers>` and so can't
                         // interleave.
-                        flush_tui_commands.in_set(RenderGraphSystems::Submit),
-                        // `Finish` runs after `Submit` - by the time this
-                        // runs, this frame's (or a retried earlier frame's)
-                        // terminal render is already submitted, so the
-                        // blocking GPU->CPU copy reads real content.
-                        process_tui_readbacks.in_set(RenderGraphSystems::Finish),
+                        flush_tui_commands
+                            .in_set(RenderGraphSystems::Submit)
+                            .after(render_tui_textures)
+                            .after(RenderGraphSystems::Render),
+                        // By the time this runs, this frame's (or a retried
+                        // earlier frame's) terminal render is already
+                        // submitted, so the blocking GPU->CPU copy reads
+                        // real content.
+                        process_tui_readbacks
+                            .in_set(RenderGraphSystems::Finish)
+                            .after(flush_tui_commands),
                     ),
                 );
         }
@@ -264,7 +275,13 @@ impl Plugin for TerminalPlugin {
 ///
 /// Stores the actual terminal grid dimensions (columns and rows) and font metrics
 /// for accurate mouse coordinate conversion.
+///
+/// Only ever written on a resize, but watched every frame
+/// (`Changed<TerminalDimensions>`), so it carries a column summary tick: a
+/// frame in which no terminal resized skips the whole column in one check
+/// instead of testing each terminal's change tick.
 #[derive(Component, Debug, Clone, Copy)]
+#[component(summary_tick)]
 pub struct TerminalDimensions {
     pub cols: u16,
     pub rows: u16,
@@ -291,8 +308,12 @@ pub fn gpu_flush_system(
     mut images: ResMut<Assets<Image>>,
 ) {
     for (mut tui, dimensions) in &mut terminals {
-        if let (Some((cols, rows)), Some(mut dimensions)) =
-            (tui.apply_pending_resize(&mut images), dimensions)
+        // Checked through shared access first: a terminal with nothing to
+        // do must not be mutably dereferenced (nor `Assets<Image>`), which
+        // would flag it as changed every single frame.
+        if tui.has_pending_resize()
+            && let (Some((cols, rows)), Some(mut dimensions)) =
+                (tui.apply_pending_resize(&mut images), dimensions)
         {
             let size = tui.size_px();
             dimensions.cols = cols;
@@ -300,7 +321,9 @@ pub fn gpu_flush_system(
             dimensions.char_width_px = size.x / (cols.max(1) as u32);
             dimensions.char_height_px = size.y / (rows.max(1) as u32);
         }
-        tui.flush();
+        if tui.needs_flush() {
+            tui.flush();
+        }
     }
 }
 
@@ -341,7 +364,7 @@ fn resize_world_quad_meshes(
 }
 
 // ============================================================================
-// Render-world GPU render (replaces the old GPU->GPU copy entirely)
+// Render-world GPU render
 // ============================================================================
 
 /// Render-world resource: draw payloads extracted this frame (or a prior
@@ -358,10 +381,10 @@ struct PendingTuiDraws(HashMap<AssetId<Image>, TerminalDrawPayload>);
 struct TerminalGpuStore(HashMap<AssetId<Image>, TerminalGpuState>);
 
 /// Render-world resource: per-font glyph-atlas texture + compositor
-/// pipelines (IMPROVEMENT.md C3), keyed by [`crate::fonts::Fonts::identity`]
+/// pipelines, keyed by [`crate::fonts::Fonts::identity`]
 /// rather than by destination image - terminals that share a `Fonts` share
 /// one entry here. Created lazily in `render_tui_textures`, evicted once no
-/// live `Tui` reports that font key anymore (see [`LiveFontKeys`]).
+/// live `Tui` reports that font key (see [`LiveFontKeys`]).
 #[derive(Resource, Default)]
 struct SharedFontGpuStore(HashMap<usize, SharedFontGpuState>);
 
@@ -373,11 +396,11 @@ struct SharedFontGpuStore(HashMap<usize, SharedFontGpuState>);
 /// `Tui::take_shared_font_uploads`), so entries are appended to rather than
 /// overwritten. Drained (per font, once uploaded) by `render_tui_textures`.
 #[derive(Resource, Default)]
-struct PendingFontUploads(HashMap<usize, Vec<(crate::utils::text_atlas::CacheRect, Vec<u32>)>>);
+struct PendingFontUploads(HashMap<usize, Vec<(crate::utils::text_atlas::CacheRect, Vec<u8>)>>);
 
 /// Render-world resource: every font key currently reported by a live `Tui`
 /// entity, recomputed from scratch each extract. Used by `render_tui_textures`
-/// to evict [`SharedFontGpuStore`] entries for fonts no longer in use by any
+/// to evict [`SharedFontGpuStore`] entries for fonts not in use by any
 /// terminal - unlike [`TerminalGpuStore`]'s per-destination eviction (which
 /// piggybacks on `RenderAssets<GpuImage>` naturally dropping a despawned
 /// terminal's image), a shared font's last user despawning leaves no asset
@@ -387,7 +410,7 @@ struct LiveFontKeys(std::collections::HashSet<usize>);
 
 /// Extract system: drains each `Tui`'s pending draw payload (set by
 /// [`gpu_flush_system`] via [`Tui::flush`](crate::setup::Tui::flush)) into
-/// the render-world [`PendingTuiDraws`] map, and (IMPROVEMENT.md C3) each
+/// the render-world [`PendingTuiDraws`] map, and each
 /// `Tui`'s font key + any pending shared-atlas glyph uploads into
 /// [`LiveFontKeys`]/[`PendingFontUploads`]. Runs in the render world but
 /// mutates the main world through [`MainWorld`] (rather than the read-only
@@ -400,7 +423,7 @@ fn extract_tui_draws(
     mut live_fonts: ResMut<LiveFontKeys>,
     mut query_state: Local<Option<QueryState<&'static mut Tui>>>,
 ) {
-    // Cache the `QueryState` across frames (IMPROVEMENT.md D2) instead of
+    // Cache the `QueryState` across frames instead of
     // constructing a fresh one (archetype matching from scratch) every
     // frame - `QueryState::iter_mut` updates its archetype caches
     // internally on every call, so no explicit `update_archetypes` is
@@ -414,14 +437,14 @@ fn extract_tui_draws(
             font_uploads.0.entry(font_key).or_default().extend(uploads);
         }
 
-        // Single payload in flight per destination (Phase 2 partial
+        // Single payload in flight per destination (partial
         // redraw): if an entry is still sitting in `pending` from a frame
         // `render_tui_textures` skipped (destination `GpuImage` not
         // prepared yet), do NOT drain this `Tui` this frame. A partial
         // payload only covers the rows dirty as of ITS take - overwriting
         // an unrendered entry would silently drop whatever rows it
         // covered, and rendering both in one submit would double-write
-        // the shared per-terminal vertex buffers within that submit
+        // the per-terminal instance buffer within that submit
         // (`queue.write_buffer` applies before the submit as a whole, so
         // both draw calls would see only the LAST write). Leaving the
         // payload in `Tui::pending_draw` instead means the next dirty
@@ -432,7 +455,11 @@ fn extract_tui_draws(
             continue;
         }
 
-        if let Some((dest, draw)) = tui.take_pending_draw() {
+        // Shared access first, so a static terminal isn't flagged as
+        // changed by every frame's extract.
+        if tui.has_pending_draw()
+            && let Some((dest, draw)) = tui.take_pending_draw()
+        {
             pending.0.insert(dest, draw);
         }
     }
@@ -450,16 +477,14 @@ fn extract_tui_draws(
 /// images still present in `RenderAssets<GpuImage>` - once a `Tui`
 /// despawns, its last strong `Handle<Image>` drops, bevy's own asset
 /// extraction removes the `GpuImage`, and the next call here drops this
-/// store's now-orphaned GPU state (atlas texture, pipelines) right along
+/// store's orphaned GPU state (uniform, instance buffer) right along
 /// with it. No entity-level bookkeeping needed.
 ///
 /// Records every terminal's draw into the shared [`RenderContext`] encoder
 /// (auto-flushed into `PendingCommandBuffers` at the end of this system,
 /// batch-submitted once alongside the rest of the frame's rendering in
 /// `RenderGraphSystems::Submit` - see [`flush_tui_commands`]) instead of
-/// creating and submitting its own `CommandEncoder` (IMPROVEMENT.md B3 - no
-/// longer a separate submit at all, now that submission itself is
-/// batched). Skipped entirely on a frame with nothing pending, so a fully
+/// creating and submitting its own `CommandEncoder`. Skipped entirely on a frame with nothing pending, so a fully
 /// static scene still touches no encoder and submits nothing extra.
 #[allow(clippy::too_many_arguments)]
 fn render_tui_textures(
@@ -489,7 +514,7 @@ fn render_tui_textures(
     // whose GPU state is created below, on their first draw) until then.
     for (key, uploads) in &mut font_uploads.0 {
         if let Some(shared) = font_store.0.get(key) {
-            shared.upload_glyphs(render_queue.0.as_ref(), uploads);
+            shared.upload_glyphs(&render_queue, uploads);
             uploads.clear();
         }
     }
@@ -512,12 +537,12 @@ fn render_tui_textures(
         let shared = font_store.0.entry(draw.font_key()).or_insert_with(|| {
             SharedFontGpuState::new(
                 render_device.wgpu_device(),
-                render_queue.0.as_ref(),
+                &render_queue,
                 gpu_image.texture_descriptor.format,
             )
         });
         if let Some(uploads) = font_uploads.0.remove(&draw.font_key()) {
-            shared.upload_glyphs(render_queue.0.as_ref(), &uploads);
+            shared.upload_glyphs(&render_queue, &uploads);
         }
 
         let gpu_state = store
@@ -526,7 +551,7 @@ fn render_tui_textures(
             .or_insert_with(|| TerminalGpuState::new(render_device.wgpu_device(), shared));
         gpu_state.render(
             render_device.wgpu_device(),
-            render_queue.0.as_ref(),
+            &render_queue,
             shared,
             encoder,
             &gpu_image.texture_view,
@@ -723,7 +748,7 @@ fn read_back_gpu_image_blocking(
             depth_or_array_layers: 1,
         },
     );
-    render_queue.0.submit(Some(encoder.finish()));
+    render_queue.submit(Some(encoder.finish()));
 
     let buffer_slice = staging_buffer.slice(..);
     let (sender, receiver) = std::sync::mpsc::channel();
@@ -742,7 +767,9 @@ fn read_back_gpu_image_blocking(
         .expect("map_async callback never ran")
         .expect("failed to map readback buffer");
 
-    let mapped = buffer_slice.get_mapped_range();
+    let mapped = buffer_slice
+        .get_mapped_range()
+        .expect("readback buffer was just mapped");
     let out = strip_row_padding(&mapped, unpadded_bytes_per_row, bytes_per_row, height);
     drop(mapped);
     staging_buffer.unmap();
@@ -750,8 +777,8 @@ fn read_back_gpu_image_blocking(
 }
 
 // ============================================================================
-// Test: staging-row padding math (P2-4). Pure CPU - no wgpu device needed
-// (the readback opt-in still uses this math, kept even after Phase A/B).
+// Test: staging-row padding math used by the blocking readback. Pure CPU -
+// no wgpu device needed.
 // ============================================================================
 
 #[cfg(test)]

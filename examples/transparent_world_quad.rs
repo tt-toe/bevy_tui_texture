@@ -1,4 +1,4 @@
-//! Transparent `TuiKind::WorldQuad` — a HUD-style see-through screen (P2-2).
+//! Transparent `TuiKind::WorldQuad` — a HUD-style see-through screen.
 //!
 //! Combines `TerminalConfig::alpha_mode: AlphaMode::Blend` with
 //! `transparent_reset_bg: true`: cells with no explicit background

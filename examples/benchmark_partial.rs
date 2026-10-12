@@ -1,27 +1,24 @@
-// Benchmark Partial Example - Isolates the two flush-skipping optimizations
-// (A1: unchanged-frame early-out, A2: row-incremental reshape) that
+// Benchmark Partial Example - Isolates the two flush-skipping paths
+// (unchanged-frame early-out, row-incremental reshape) that
 // examples/benchmark.rs cannot show, because that benchmark redraws every
 // cell every frame.
 //
-// See IMPROVEMENT.md, item M1.
-//
 // Usage:
-//   BENCH_MODE=static  cargo run --release --example benchmark_partial   # isolates A1
-//   BENCH_MODE=partial cargo run --release --example benchmark_partial  # isolates A2
+//   BENCH_MODE=static  cargo run --release --example benchmark_partial   # unchanged-frame early-out
+//   BENCH_MODE=partial cargo run --release --example benchmark_partial  # row-incremental reshape
 //   (default: static)
 //
 // Mode "static": the terminal content is a fixed, purely deterministic
 // function of (row, col) - no frame count, no time - so every draw after
 // the first produces a byte-identical ratatui buffer diff (empty). The
 // user-side cost of recomputing that content every frame is deliberately
-// left in place and constant across before/after runs, so any FPS/frame
-// time delta measured here comes only from BevyTerminalBackend::flush()'s
-// early-out (or lack of it).
+// left in place, so the FPS/frame time measured here is that cost plus
+// BevyTerminalBackend::flush()'s early-out.
 //
 // Mode "partial": identical static content, except exactly one row shows
 // a live frame counter and therefore changes every frame. This isolates
-// the row-incremental reshape (A2): only that one row's shaping/vertices
-// should need regenerating once A2 lands.
+// the row-incremental reshape: only that one row is reshaped and
+// re-uploaded.
 
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::prelude::*;

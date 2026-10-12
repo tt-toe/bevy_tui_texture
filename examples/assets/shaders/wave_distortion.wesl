@@ -4,12 +4,11 @@
 // - Ripple effects from center
 // - Animated movement
 
-#import bevy_pbr::{
+import bevy_pbr::render::{
     mesh_functions,
     forward_io::{Vertex, VertexOutput},
     view_transformations::position_world_to_clip,
-    mesh_view_bindings::view,
-}
+};
 
 @group(2) @binding(0) var terminal_texture: texture_2d<f32>;
 @group(2) @binding(1) var terminal_sampler: sampler;
@@ -59,12 +58,11 @@ fn vertex(vertex: Vertex) -> VertexOutput {
 
     out.uv = vertex.uv;
 
-    #ifdef VERTEX_TANGENTS
+    @if(VERTEX_TANGENTS)
     out.world_tangent = mesh_functions::mesh_tangent_local_to_world(
         world_from_local,
         vertex.tangent
     );
-    #endif
 
     return out;
 }

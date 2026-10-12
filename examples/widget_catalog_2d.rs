@@ -44,7 +44,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tracing::info;
-use rand::Rng as _;
 
 use bevy::prelude::*;
 use bevy::window::WindowResolution;
@@ -322,7 +321,7 @@ fn render_terminal(
     // Update sparkline data with random values
     state.sparkline_timer.tick(time.delta());
     if state.sparkline_timer.just_finished() {
-        let new_value = rand::thread_rng().gen_range(1..=15);
+        let new_value = rand::random_range(1..=15);
         state.sparkline_data.push(new_value);
         if state.sparkline_data.len() > 32 {
             state.sparkline_data.remove(0);

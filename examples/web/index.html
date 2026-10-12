@@ -155,7 +155,7 @@
     };
 
     // Late-failure diagnostics: without these the overlay freezes on the
-    // last milestone with no hint of WHY (observed on iPhone Safari, whose
+    // last milestone with no hint of WHY (e.g. on iPhone Safari, whose
     // GPU/WebGL memory caps sit well below iPad's). Rust panics are
     // forwarded to __demoStatus by the wasm side's own panic hook; these
     // listeners catch what that hook can't:
@@ -195,7 +195,7 @@
     // possible worlds at a glance:
     // - spinner keeps turning, status text never advances → the main thread
     //   is alive but an async step never completes (e.g. wgpu renderer
-    //   init stuck - the known Bevy 0.19 wasm startup hang looks like this),
+    //   init stuck),
     // - spinner frozen too → the main thread itself is stalled (synchronous
     //   shader compile, busy-wait, or the tab is about to be killed).
     const bootT0 = Date.now();

@@ -8,7 +8,7 @@ Guidance for Claude Code (claude.ai/code) when working in this repository.
 Bevy app — on 2D UI nodes, 3D meshes, or existing glTF screens — with no
 CPU readback anywhere in the hot path.
 
-**Version pins**: bevy 0.19 + ratatui 0.30.2 + wgpu 29 (wgpu must exactly
+**Version pins**: bevy 0.20 + ratatui 0.30.2 + wgpu 30 (wgpu must exactly
 match bevy's pin — bump together; both are re-exported so downstream code
 can name matching types).
 
@@ -64,7 +64,7 @@ feature (the lib's own bevy is default-features=false and logs nothing).
   otherwise bold/italic are faked from the regular font
 - `emoji` (opt-in, WIP) — emoji-aware glyph handling (pulls in `unicode-properties`)
 - `ascii_fast_shaping` (opt-in) — bypasses rustybuzz for rows that are all
-  single ASCII printable bytes (see IMPROVEMENT.md A3). Assumes zero
+  single ASCII printable bytes. Assumes zero
   x_offset, which most monospace fonts satisfy but isn't guaranteed.
   Silently inert when `bold_italic_fonts` is enabled (that feature makes
   per-cell font selection meaningful; this path assumes one font per row)
@@ -107,39 +107,61 @@ All three share the same per-frame path below.
    buffer, marks the `Tui` dirty **only if the diff changed a cell**.
    Byte-identical redraws are free all the way down: ratatui always calls
    `Backend::flush()`, but `BevyTerminalBackend::flush()` early-returns
-   before any shaping/vertex work when nothing changed. Calling `draw`
+   before any shaping/geometry work when nothing changed. Calling `draw`
    every frame is the intended pattern.
 2. If dirty, the plugin's `gpu_flush_system` (main world, pure CPU,
    ordered after `TerminalSystemSet::Render` so every draw in that set is
-   flushed the same frame) extracts a `TerminalDrawPayload` (pending glyph rasterizations +
-   vertex/index data); it also applies any pending `Tui::request_resize`
+   flushed the same frame) extracts a `TerminalDrawPayload` (the cell
+   instances to draw); it also applies any pending `Tui::request_resize`
    first (recreates the destination `Image` in place at the same handle,
    syncs `TerminalDimensions`; `resize_world_quad_meshes` then fixes a
    world quad's aspect on `Changed<TerminalDimensions>`).
 3. Render world: `extract_tui_draws` + `render_tui_textures`
-   (src/bevy_plugin.rs) render the payload — two passes, background quads
-   then glyphs (`TerminalGpuState::render` in src/backend/mod.rs) —
-   **directly into the destination `Image`'s own `GpuImage::texture_view`**,
+   (src/bevy_plugin.rs) render the payload — one instanced draw, see
+   "Cell instances" below (`TerminalGpuState::render` in
+   src/backend/mod.rs) — **directly into the destination `Image`'s own `GpuImage::texture_view`**,
    the same texture any material's bind group already references. No asset
    mutation, no material touching, for `StandardMaterial`,
    `ExtendedMaterial`, or any custom `Material`. Both 2D (`ImageNode`) and
    3D terminals update through this one path.
 
 **Same-frame latency is structural**: `render_tui_textures` runs in the
-`RenderGraph` schedule's `RenderGraphSystems::Begin` set, chained strictly
-before `RenderGraphSystems::Render` (camera passes) and
+`RenderGraph` schedule's `RenderGraphSystems::Begin` set, strictly before
+`RenderGraphSystems::Render` (camera passes) and
 `RenderGraphSystems::Submit` (one batched submit for terminal and camera
 commands alike — `flush_tui_commands`, riding the shared `RenderContext`
 encoder). A material samples this frame's content, not last frame's. The
 only CPU readback is the explicit opt-in `Tui::read_back_blocking`.
 
+Those orderings are declared **explicitly** (`.before(RenderGraphSystems::Render)`,
+`.after(...)` in `TerminalPlugin::build`), not inherited from set
+membership: the `RenderGraphSystems` sets are only weakly chained, i.e.
+ordered only between systems whose tracked ECS access conflicts — and
+command buffers (`Deferred` state) and the GPU itself are invisible to
+that. Without the explicit edges the readback can run before the submit
+and return an empty texture.
+
+### Cell instances (src/backend/mod.rs, shaders/composite.wgsl)
+
+Every glyph is one `CellInstance` (20 bytes: destination rect, atlas slot
+origin, fg + bg RGBA), expanded to a triangle strip in the vertex shader
+from `vertex_index` alone — no CPU vertex positions, no index buffer. The
+`cells` pipeline resolves background and glyph in the fragment shader and
+writes with `BlendState::REPLACE`, so each pixel is shaded once and there
+is no separate background pass. A further glyph in an already-covered cell
+(a combining mark shaped as its own glyph) is an *overlay* instance, drawn
+by a second, alpha-blended pipeline over the tail of the same instance
+buffer (`TerminalDrawPayload::cell_count` splits the two ranges). A
+row-clear rectangle is a cell instance with `fg` alpha 0.
+
 ### Render-world GPU state & eviction
 
-- `TerminalGpuStore` — per-terminal state (screen-size uniform, persistent
-  grow-only vertex/index buffers, `write_buffer`d in place), keyed by
+- `TerminalGpuStore` — per-terminal state (globals uniform, rewritten only
+  on resize; one persistent grow-only instance buffer, `write_buffer`d in
+  place), keyed by
   destination `Image` asset id; created lazily on first render, evicted
   when that `GpuImage` disappears.
-- `SharedFontGpuStore` — glyph atlas + bg/fg compositor pipelines, keyed
+- `SharedFontGpuStore` — glyph atlas + compositor pipelines, keyed
   by `Fonts::identity()`: terminals sharing a `Fonts` share one atlas and
   rasterize each glyph once. Evicted via the `LiveFontKeys` liveness set
   once no live `Tui` reports that font key.
@@ -153,13 +175,35 @@ only CPU readback is the explicit opt-in `Tui::read_back_blocking`.
 ### Partial redraw
 
 `flush()` re-shapes only the rows `dirty_rows` marks changed, reusing a
-per-row vertex cache (`RowGeometry`). `take_draw_payload` emits either a
+per-row instance cache (`RowGeometry`). `take_draw_payload` emits either a
 full payload (every row, `LoadOp::Clear`) — used whenever the destination
 texture can't be trusted (`full_redraw_needed`: just created / resized /
 cleared / fonts swapped / pending-payload overwrite) — or a partial one
-(only dirty rows, each preceded by a synthesized row-clear quad,
+(only dirty rows, each preceded by a row-clear instance,
 `LoadOp::Load`). CPU concatenation and GPU upload both scale with dirty
-rows. Glyph-atlas eviction is LRU (`evictor` crate).
+rows.
+
+### Text caches (per `Fonts`, in `SharedFontCpuState`)
+
+Reshaping a row is: split into font runs → shape each run → look each
+glyph up in the atlas. Each step is cached, because terminal content
+repeats (a recolored row has the same text; scrolled content is the same
+text on another row):
+
+- `FontChoiceCache` (src/utils/shape_cache.rs) memoizes
+  `Fonts::font_for_cell` per `(char, bold, italic)` — the fallback probe is
+  a cmap lookup per font per cell otherwise.
+- `ShapeCache` (same file) is an LRU of shaped runs keyed by
+  `(font, run text)`; a hit skips rustybuzz entirely. Only never-seen text
+  pays for shaping.
+- `Atlas` (src/utils/text_atlas.rs) maps glyph → fixed slot. A hit is one
+  hash probe plus stamping the slot with the current flush's epoch
+  (`Atlas::begin_flush`); eviction, only once the atlas is full, is a
+  clock sweep that takes slots untouched by recent flushes and never one
+  the current flush used unless nothing else is left.
+
+`cargo test --release --lib cpu_hot_path -- --ignored --nocapture` times
+this whole path without a GPU (src/setup.rs `perf_bench`).
 
 ### Other modules
 
@@ -169,7 +213,7 @@ rows. Glyph-atlas eviction is LRU (`evictor` crate).
 - **src/bevy_plugin.rs** — `TerminalPlugin`, `TerminalSystemSet`
   (Input → UserUpdate → Render in `Update`), the systems above
 - **src/input/** — message-driven (`TerminalEvent` via `MessageReader`,
-  bevy 0.18+ messages, not legacy events); the payload (`InputEvent`)
+  bevy messages, not `EventReader`); the payload (`InputEvent`)
   mirrors `crossterm::event::Event` so ratatui-ecosystem input vocabulary
   maps onto it directly (self-defined, not a crossterm dependency — wasm
   stays intact; see the `crossterm-compat` feature above for real
@@ -186,8 +230,9 @@ rows. Glyph-atlas eviction is LRU (`evictor` crate).
   symbols-only font with no `m` (e.g. Symbols Nerd Font) is measured by its
   `.notdef` advance and can shrink every cell — prefer a patched
   "Nerd Font Mono" primary.
-- **src/utils/** — `text_atlas.rs` (glyph cache texture),
-  `plan_cache.rs` (shaping cache)
+- **src/utils/** — `text_atlas.rs` (glyph atlas slot index),
+  `shape_cache.rs` (shaped-run + font-choice caches), `plan_cache.rs`
+  (rustybuzz shape plans, `evictor` LRU)
 
 ## Key Patterns
 
@@ -299,7 +344,7 @@ Fonts: TrueType only. `Font::new(&'static [u8])` for `include_bytes!`,
      light-dependent terms, so content stays visible at any scene light
      level while metallic/roughness/reflectance still give a glass
      specular highlight (see `claim_object2_screen`).
-   - Spawning glTF scenes in 0.19 (`WorldAssetRoot`; `Gltf::scenes` is
+   - Spawning glTF scenes (`WorldAssetRoot`; `Gltf::scenes` is
      `Vec<Handle<WorldAsset>>`) requires bevy features
      `bevy_world_serialization` + `reflect_auto_register` (panics without
      the latter) + image formats (`png`, `jpeg`).
@@ -308,7 +353,7 @@ Fonts: TrueType only. `Font::new(&'static [u8])` for `include_bytes!`,
    - Declaring `@location(1) color` in WGSL is NOT enough — without an
      explicit vertex layout in `Material::specialize`, bevy feeds NORMAL
      into location 1 and vertex colors silently do nothing.
-   - A custom vertex layout breaks the prepass/shadow pipelines (0.19
+   - A custom vertex layout breaks the prepass/shadow pipelines (bevy
      quits the app on render errors) — insert `NotShadowCaster` +
      `NotShadowReceiver`.
    - For additive blending (`One/One`), modulate ALL light terms by the
@@ -329,15 +374,20 @@ Fonts: TrueType only. `Font::new(&'static [u8])` for `include_bytes!`,
 
 ## GPU Texture Facts
 
-- **Glyph atlas**: 2048×2048 RGBA8 (`CACHE_WIDTH`/`CACHE_HEIGHT` in
-  src/backend/mod.rs) — square and pinned to the WebGL2-guaranteed
+- **Glyph atlas**: 2048×2048 `R8Unorm` (`CACHE_WIDTH`/`CACHE_HEIGHT` in
+  src/backend/mod.rs) — glyphs are coverage masks tinted by the cell's
+  foreground color, so one channel suffices (color bitmap glyphs render
+  as their alpha silhouette). Square and pinned to the WebGL2-guaranteed
   `max_texture_dimension_2d`, identical on native and wasm, so it has no
-  wasm-only failure mode. Shared per `Fonts::identity()`; LRU-evicted.
+  wasm-only failure mode. Shared per `Fonts::identity()`.
 - **Terminal textures**: `cols·char_w × rows·char_h`, `Rgba8Unorm`.
   Staying under the target GPU's `max_texture_dimension_2d` for huge
   grid/font combinations is the caller's responsibility.
-- **Shaders**: `composite_bg.wgsl` (backgrounds) + `composite_fg.wgsl`
-  (glyphs).
+- **Shaders**: `composite.wgsl` (plain WGSL, compiled by wgpu directly —
+  not a bevy asset). Shaders loaded *through bevy* (examples/assets/shaders)
+  are WESL: `.wesl` files, `import a::b;`, `@if(FLAG)`,
+  `constants::MATERIAL_BIND_GROUP`, and bevy_pbr modules under
+  `bevy_pbr::render::*`.
 
 ## WASM Demo Architecture
 
@@ -440,7 +490,7 @@ automatically, no manual Node bookkeeping.
 
 | bevy | ratatui | wgpu | bevy_tui_texture |
 |------|---------|------|------------------|
-| 0.19 | 0.30.2  | 29   | 0.3              |
+| 0.20 | 0.30.2  | 30   | 0.4              |
 
-Rust edition 2024, `rust-version = "1.96"` — tracks bevy 0.19's MSRV, not
+Rust edition 2024, `rust-version = "1.97.1"` — tracks bevy 0.20's MSRV, not
 this crate's own code (see README.md "MSRV policy").

@@ -23,7 +23,7 @@ the repo layout as-is.
 | `wasm_demo.js` | wasm-bindgen JS glue (generated) |
 | `wasm_demo_bg.wasm` | the compiled demo (generated) |
 | `../assets/models/retro_crt.glb` | CRT computer model (fetched at runtime, sibling dir) |
-| `../assets/shaders/*.wgsl` | CRT / reflection shaders (fetched at runtime, sibling dir) |
+| `../assets/shaders/*.wesl` | CRT / reflection shaders (fetched at runtime, sibling dir) |
 
 `index.html` and this README are hand-maintained; only `wasm_demo.js` /
 `wasm_demo_bg.wasm` are build outputs.
@@ -87,7 +87,7 @@ wasm-opt -Oz --strip-debug --strip-producers \
   -o examples/web/wasm_demo_bg.wasm examples/web/wasm_demo_bg.wasm
 ```
 
-No asset-copying step is needed anymore - `examples/assets/` is fetched
+No asset-copying step is needed - `examples/assets/` is fetched
 directly at runtime from its sibling location, the same directory native
 builds read from (see `examples/retro_crt.rs`'s `build_app` doc comment).
 
@@ -159,18 +159,3 @@ is the only feedback the page can give.
   storage buffers); overlapping transparent surfaces sort per-mesh
   instead. All other features (glTF, custom materials, terminal input)
   match native.
-- **Known issue: startup can hang indefinitely on some browser/GPU
-  combinations**, past the WebGL2 check, with no console error (Firefox
-  has been seen to eventually report "Script terminated by timeout"; the
-  tab's content process can become unrecoverable, requiring it to be
-  closed). Confirmed via a from-scratch isolation test that this reproduces
-  with a *pure* Bevy 0.19 app (`DefaultPlugins` + a bare camera, zero
-  `bevy_tui_texture` code) on this Bevy 0.19.0 / wgpu 29.0.4 / winit
-  0.30.12 / wasm-bindgen 0.2.108 combination - it is not a bug in this
-  crate or in `retro_crt.rs`/`wasm_demo.rs`. Forcing
-  `WgpuSettingsPriority::WebGL2` (conservative, known-safe device
-  limits/features instead of trusting the adapter's raw report) and
-  switching `opt-level` between `"z"`/`"s"` were both tried and neither
-  resolved it. If you hit this, try a different browser, GPU, or OS first;
-  if it's universal, check Bevy's issue tracker for wasm32 startup hangs
-  around this version combination.

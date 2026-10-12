@@ -32,7 +32,7 @@ use bevy::reflect::Reflect;
 use bevy::render::render_resource::{AsBindGroup, ShaderType};
 use bevy::shader::ShaderRef;
 use bevy::window::WindowResolution;
-// bevy 0.19: glTF scenes are WorldAssets, spawned via WorldAssetRoot.
+// glTF scenes are WorldAssets, spawned via WorldAssetRoot.
 use bevy::world_serialization::WorldAssetRoot;
 use ratatui::prelude::*;
 use ratatui::style::Color as RatatuiColor;
@@ -172,7 +172,7 @@ pub(crate) struct CrtExtension {
 
 impl MaterialExtension for CrtExtension {
     fn fragment_shader() -> ShaderRef {
-        "shaders/crt_extended.wgsl".into()
+        "shaders/crt_extended.wesl".into()
     }
 }
 
@@ -202,10 +202,10 @@ struct BlurMaterial {
 
 impl Material for BlurMaterial {
     fn vertex_shader() -> ShaderRef {
-        "shaders/unlit_blur.wgsl".into()
+        "shaders/unlit_blur.wesl".into()
     }
     fn fragment_shader() -> ShaderRef {
-        "shaders/unlit_blur.wgsl".into()
+        "shaders/unlit_blur.wesl".into()
     }
 
     fn alpha_mode(&self) -> AlphaMode {
@@ -230,7 +230,7 @@ impl Material for BlurMaterial {
         ])?;
         descriptor.vertex.buffers = vec![vertex_layout];
 
-        // Disable depth writes (bevy 0.19: Option<bool>)
+        // Disable depth writes
         if let Some(depth_stencil) = &mut descriptor.depth_stencil {
             depth_stencil.depth_write_enabled = Some(false);
         }
@@ -368,8 +368,7 @@ const LIGHT_SLIDER_TRACK_X0: u16 =
 /// Inner-area row the slider's `Line` is drawn on (see `status_lines` in
 /// `render_overlay_terminal` - index 3, right after the FX/Shadow/FPS row).
 const LIGHT_SLIDER_ROW: u16 = 3;
-// A floor of 0 is deliberately NOT used here (unlike the earlier linear
-// version): log10(0) is undefined, and a slider that must represent "off"
+// A floor of 0 is deliberately NOT used here: log10(0) is undefined, and a slider that must represent "off"
 // as an infinitely-small fraction of its travel is a bad slider anyway.
 // 1.0 lux is near-total darkness for this scene's purposes (the emissive
 // CRT screen stays fully lit regardless - see `claim_object2_screen` -
@@ -545,7 +544,7 @@ fn setup(
         .entity(camera)
         .insert(Tonemapping::KhronosPbrNeutral);
 
-    // Note: Materials are now created dynamically when needed
+    // Note: Materials are created dynamically when needed
     // (CrtMaterial for Object_2 and ReflectionMaterial for Monitor_Reflection)
 
     // / Ground Mesh Starts
@@ -600,7 +599,7 @@ fn setup(
     commands.spawn((
         DirectionalLight {
             illuminance: 2000.0,
-            shadow_maps_enabled: true, // bevy 0.19 rename
+            shadow_maps_enabled: true,
             ..default()
         },
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.5, -0.5, 0.0)),
@@ -689,7 +688,7 @@ fn spawn_gltf_scene_simple(
         );
 
         // Spawn the default (first) scene, rotated 90° clockwise
-        // bevy 0.19: Gltf::scenes is Vec<Handle<WorldAsset>> → WorldAssetRoot.
+        // Gltf::scenes is Vec<Handle<WorldAsset>> → WorldAssetRoot.
         if let Some(scene) = gltf.scenes.first() {
             commands.spawn((
                 WorldAssetRoot(scene.clone()),
@@ -752,7 +751,7 @@ fn claim_object2_screen(
         let cull_mode = standard_material.cull_mode;
 
         // Note: this model's (_0) glass UVs span the full [0,1]² range and
-        // are already upright, so no correction is needed (verified with
+        // are already upright, so no correction is needed (check with
         // the CRT_CALIBRATE=1 quadrant display). If a different model's
         // orientation is off, rewrite the mesh UVs directly instead of
         // using uv_transform, which would desync display from mouse
@@ -765,12 +764,12 @@ fn claim_object2_screen(
                     // through the EMISSIVE channel, not base_color_texture.
                     // bevy_pbr's apply_pbr_lighting adds emissive_light
                     // AFTER the light-dependent diffuse/specular terms
-                    // (bevy_pbr-0.19.0/src/render/pbr_functions.wgsl:863:
+                    // (bevy_pbr's `pbr_functions`:
                     // `... + emissive_light`, no light-intensity factor
                     // anywhere in that term) - so the screen content stays
                     // fully visible even at `light_illuminance = 0`, same
                     // as the additive Monitor_Reflection overlay
-                    // (unlit_blur.wgsl, a fully custom Material that never
+                    // (unlit_blur.wesl, a fully custom Material that never
                     // samples scene lights at all - see
                     // `claim_monitor_reflection`).
                     //
@@ -1030,7 +1029,7 @@ fn update_crt_uniforms(
     time: Res<Time>,
 ) {
     // Update Object_2 (Monitor Glass) CRT material if it exists.
-    // (bevy 0.19: get_mut returns an AssetMut guard, hence `mut`)
+    // (`get_mut` returns an `AssetMut` guard, hence `mut`)
     for material_handle in &object2_query {
         if let Some(mut material) = crt_materials.get_mut(&material_handle.0) {
             material.extension.uniforms.effect_intensity =
@@ -1049,7 +1048,7 @@ fn update_blur_uniforms(
     time: Res<Time>,
 ) {
     // Update reflection blur material if it exists.
-    // (bevy 0.19: get_mut returns an AssetMut guard, hence `mut`)
+    // (`get_mut` returns an `AssetMut` guard, hence `mut`)
     for material_handle in &reflection_query {
         if let Some(mut material) = blur_materials.get_mut(&material_handle.0) {
             material.uniforms.effect_intensity = if app_state.effects_enabled { 1.0 } else { 0.0 };
@@ -1645,8 +1644,7 @@ fn render_overlay_terminal(
         frame.render_widget(content, area);
 
         // Register checkbox / radio button hit regions right next to
-        // the content that draws them - replaces the parallel Rect
-        // bookkeeping this used to do in AppState.
+        // the content that draws them.
         let inner_area = Block::bordered().inner(area);
 
         // CRT checkbox (row 0, start)
@@ -1772,7 +1770,7 @@ fn update_directional_light(
 ) {
     if let Ok(mut light) = light_query.single_mut() {
         light.illuminance = app_state.light_illuminance;
-        light.shadow_maps_enabled = app_state.shadows_enabled; // bevy 0.19 rename
+        light.shadow_maps_enabled = app_state.shadows_enabled;
                                                                // Debug output (first frame only)
         if app_state.frame_count == 1 {
             info!(

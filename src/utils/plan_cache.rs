@@ -19,6 +19,13 @@ pub(crate) struct PlanCache {
     lru: Lru<Key, ShapePlan>,
 }
 
+// SAFETY: evictor 0.7's `Lru` exclusively owns its arena (the raw pointers it
+// holds only point into that arena) and has no thread-affine state, so
+// moving it to another thread is sound for `Send` keys/values. Only `Send`
+// is asserted - shared access always goes through the `Mutex` in
+// `Fonts::with_shared_cpu_state`.
+unsafe impl Send for PlanCache {}
+
 impl PlanCache {
     pub(crate) fn new(capacity: usize) -> Self {
         Self {
@@ -34,14 +41,16 @@ impl PlanCache {
             script: buffer.script(),
         };
 
-        self.lru.get_or_insert_with(key, |_| {
-            ShapePlan::new(
-                font.font(),
-                buffer.direction(),
-                Some(buffer.script()),
-                buffer.language().as_ref(),
-                &[],
-            )
-        })
+        self.lru
+            .get_or_insert_with(key, |_| {
+                ShapePlan::new(
+                    font.font(),
+                    buffer.direction(),
+                    Some(buffer.script()),
+                    buffer.language().as_ref(),
+                    &[],
+                )
+            })
+            .0
     }
 }

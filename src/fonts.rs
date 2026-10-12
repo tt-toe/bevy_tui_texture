@@ -178,13 +178,13 @@ impl AssetLoader for TerminalFontAssetLoader {
     }
 }
 
-/// Shared CPU-side glyph cache state: the `Atlas` LRU slot allocator, the
+/// Shared CPU-side glyph cache state: the `Atlas` slot allocator, the
 /// rustybuzz `PlanCache`, and queued-but-not-yet-uploaded glyph
 /// rasterizations. Owned by `Fonts` (behind a lazily-initialized `Mutex`,
 /// see [`Fonts::with_shared_cpu_state`]) rather than by each terminal's
 /// `BevyTerminalBackend`, so every terminal sharing the same `Arc<Fonts>`
 /// rasterizes and uploads each glyph exactly once instead of once per
-/// terminal (IMPROVEMENT.md C3). Living inside `Fonts` - reachable from
+/// terminal. Living inside `Fonts` - reachable from
 /// `self.fonts` alone - rather than an external resource is what lets
 /// `BevyTerminalBackend`'s `ratatui::backend::Backend::flush` implementation
 /// reach it: that trait method's signature (`fn flush(&mut self)`) is fixed
@@ -194,7 +194,11 @@ impl AssetLoader for TerminalFontAssetLoader {
 pub(crate) struct SharedFontCpuState {
     pub(crate) cached: crate::utils::text_atlas::Atlas,
     pub(crate) plan_cache: crate::utils::plan_cache::PlanCache,
-    pub(crate) pending_cache_updates: Vec<(crate::utils::text_atlas::CacheRect, Vec<u32>)>,
+    pub(crate) pending_cache_updates: Vec<(crate::utils::text_atlas::CacheRect, Vec<u8>)>,
+    /// Shaped runs by text - see [`crate::utils::shape_cache`].
+    pub(crate) shape_cache: crate::utils::shape_cache::ShapeCache,
+    /// Memoized per-cell font fallback - see [`Fonts::font_for_cell_cached`].
+    pub(crate) font_choices: crate::utils::shape_cache::FontChoiceCache,
 }
 
 impl SharedFontCpuState {
@@ -203,11 +207,16 @@ impl SharedFontCpuState {
         Self {
             cached: crate::utils::text_atlas::Atlas::new(fonts, CACHE_WIDTH, CACHE_HEIGHT),
             // Keyed by (font, script, direction), and one row can span
-            // several fonts and scripts now that each font run is shaped
+            // several fonts and scripts, since each font run is shaped
             // separately - room for a few scripts per font keeps the LRU
             // from rebuilding plans every row.
             plan_cache: crate::utils::plan_cache::PlanCache::new(fonts.count().max(2) * 4),
             pending_cache_updates: Vec::new(),
+            // Enough for several screens of distinct rows: a hit needs the
+            // same run text, so capacity is what lets scrolled-away content
+            // come back for free.
+            shape_cache: crate::utils::shape_cache::ShapeCache::new(1024),
+            font_choices: crate::utils::shape_cache::FontChoiceCache::new(),
         }
     }
 }
@@ -252,7 +261,7 @@ impl Fonts {
     }
 
     /// Stable identity for this `Fonts` instance - used to key the
-    /// render-world's per-font shared GPU atlas store (IMPROVEMENT.md C3).
+    /// render-world's per-font shared GPU atlas store.
     /// Two terminals share GPU (and, via [`Fonts::with_shared_cpu_state`],
     /// CPU) glyph-cache state exactly when they hold the same `Arc<Fonts>`
     /// (this returns the same value for any two `&Fonts` borrowed from
@@ -435,6 +444,41 @@ impl Fonts {
         1 + self.bold.len() + self.italic.len() + self.bold_italic.len() + self.regular.len()
     }
 
+    /// [`Self::font_for_cell`], memoized through `cache` for the usual
+    /// single-`char` symbol. Multi-codepoint clusters always take the full
+    /// probe (the best font depends on every codepoint of the cluster).
+    pub(crate) fn font_for_cell_cached(
+        &self,
+        cell: &Cell,
+        cache: &mut crate::utils::shape_cache::FontChoiceCache,
+    ) -> (&Font, bool, bool) {
+        let mut chars = cell.symbol().chars();
+        let (Some(ch), None) = (chars.next(), chars.next()) else {
+            return self.font_for_cell(cell);
+        };
+        let style = u8::from(cell.modifier.contains(ratatui::style::Modifier::BOLD))
+            | u8::from(cell.modifier.contains(ratatui::style::Modifier::ITALIC)) << 1;
+        let (id, fake_bold, fake_italic) = cache.get_or_insert_with(ch, style, || {
+            let (font, fake_bold, fake_italic) = self.font_for_cell(cell);
+            (font.id(), fake_bold, fake_italic)
+        });
+        (self.font_by_id(id), fake_bold, fake_italic)
+    }
+
+    /// The font with this id. Ids come from this same `Fonts` (via
+    /// `font_for_cell`), so the lookup always succeeds; the last-resort
+    /// font - the answer for a single-font setup - is checked first.
+    fn font_by_id(&self, id: u64) -> &Font {
+        if self.last_resort.id() == id {
+            return &self.last_resort;
+        }
+        [&self.regular, &self.bold, &self.italic, &self.bold_italic]
+            .into_iter()
+            .flatten()
+            .find(|font| font.id() == id)
+            .unwrap_or(&self.last_resort)
+    }
+
     pub(crate) fn font_for_cell(&self, cell: &Cell) -> (&Font, bool, bool) {
         let is_bold = cell.modifier.contains(ratatui::style::Modifier::BOLD);
         let is_italic = cell.modifier.contains(ratatui::style::Modifier::ITALIC);
@@ -547,7 +591,7 @@ impl Fonts {
 }
 
 // ============================================================================
-// Test: font_for_cell's per-style fallback order (P2-4). Pure CPU - loads
+// Test: font_for_cell's per-style fallback order. Pure CPU - loads
 // the shipped M+ font multiple times (each load gets a fresh random `id()`,
 // see `Font::build`'s `RandomState::new()` per call) to stand in for
 // distinct "regular"/"bold"/"italic"/"bold_italic" font slots, and checks

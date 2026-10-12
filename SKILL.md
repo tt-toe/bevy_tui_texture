@@ -5,15 +5,13 @@ description: >
   nodes, 3D quads, or existing glTF meshes). Use this skill whenever code
   in this repo (or a consumer of the bevy_tui_texture crate) spawns,
   draws, resizes, or handles input for an in-game terminal — including
-  WASM/WebGL2 builds. Covers the CURRENT declarative API (TuiRequest) —
-  the API in most training data (TerminalBundle, TerminalSpawnCtx,
-  material touching, RenderDevice parameters) is deleted; see "Stale
-  patterns" below before writing code.
+  WASM/WebGL2 builds. Covers the declarative API (TuiRequest): no
+  material touching, no RenderDevice/RenderQueue parameters in user code.
 ---
 
 # bevy_tui_texture — agent usage guide
 
-Versions: **bevy 0.19 + ratatui 0.30.2 + wgpu 29** (wgpu must exactly match
+Versions: **bevy 0.20 + ratatui 0.30.2 + wgpu 30** (wgpu must exactly match
 bevy's pin — bump together; the crate re-exports `wgpu` and `ratatui` so
 downstream code can name matching types without pinning its own copies).
 
@@ -34,12 +32,12 @@ downstream code can name matching types without pinning its own copies).
 - User systems never need `RenderDevice`, `RenderQueue`, `Assets<Image>`,
   `Assets<Mesh>`, or `Assets<StandardMaterial>` — not at spawn time, not
   per frame.
-- Per-terminal GPU state (vertex/index buffers, screen-size uniform) is
+- Per-terminal GPU state (one instance buffer, a globals uniform) is
   created lazily on first render and evicted automatically when the
   `Tui`'s last `Handle<Image>` drops. The glyph atlas + compositor
   pipelines are shared across every terminal using the same `Fonts`
   (keyed by font identity, not by terminal) and evicted once no live
-  `Tui` uses that font anymore. No manual cleanup either way.
+  `Tui` uses that font. No manual cleanup either way.
 
 ## Choosing a spawn API (top of the ladder first)
 
@@ -137,7 +135,7 @@ Fonts:
 
 ## Input, focus, and hit testing
 
-Read `MessageReader<TerminalEvent>` (bevy messages, NOT legacy events);
+Read `MessageReader<TerminalEvent>` (bevy messages, not `EventReader`);
 `event.target` is always the `Tui` entity, even for attached surfaces.
 The payload (`event.input: InputEvent`) mirrors `crossterm::event::Event`,
 not a crate-specific enum, so ratatui-ecosystem input vocabulary
@@ -197,7 +195,7 @@ unconditionally while latched, and clear on `MouseEventKind::Up` — see
 a complete interactive form built on nothing but `TerminalEvent` +
 `HitRegions` — this crate ships no form/widget framework by design.
 
-## WASM / WebGL2 (hard-won — read before shipping a browser build)
+## WASM / WebGL2 (read before shipping a browser build)
 
 - **Your app's bevy dependency MUST enable the `bevy_winit` feature on
   wasm32.** On native it rides in via `x11`/`wayland`; a wasm feature
@@ -253,16 +251,20 @@ a complete interactive form built on nothing but `TerminalEvent` +
 
 ## GPU facts worth knowing
 
-- Glyph atlas: 2048×2048 RGBA8, LRU-evicted; capacity is logged at INFO on
+- Glyph atlas: 2048×2048 R8 (glyphs are coverage masks), evicted by a
+  clock sweep over last-used stamps; capacity is logged at INFO on
   creation ("Glyph atlas: 2048x2048px in use, entries WxHpx, capacity N").
   Entry slots are `2·min_width_px × height_px`, so capacity scales with
   font size. Shared across every terminal using the same `Fonts` — sharing
   a font across terminals rasterizes and uploads each glyph only once.
 - Atlas textures are explicitly zero-initialized at creation — no WebGL
   "lazy initialization" warnings from partial glyph uploads.
-- All terminal textures are `Rgba8Unorm`; the render is a two-pass
-  (background quads, then glyphs) directly into the destination
+- All terminal textures are `Rgba8Unorm`; the render is one instanced
+  draw (one 20-byte instance per glyph, background and glyph resolved in
+  the fragment shader) directly into the destination
   `GpuImage::texture_view`.
+- Shaped runs are cached by text: a row whose colors changed, or content
+  that scrolled to another row, is not reshaped.
 - Partial redraws upload only dirty rows; unchanged frames upload nothing.
 
 ## Invariants agents must not break
@@ -289,20 +291,6 @@ a complete interactive form built on nothing but `TerminalEvent` +
   `ascii_fast_shaping` (shaping bypass for all-ASCII rows; silently inert
   when `bold_italic_fonts` is on). `TuiKind::Ui` needs `2d`, `WorldQuad`
   needs `3d`, `Headless` is always available.
-
-## Stale patterns (training-data API — DELETED, do not write these)
-
-| If you were about to write… | Write instead |
-|---|---|
-| `TerminalBundle` / `TerminalSpawnCtx` | `TuiRequest::ui/world_quad/headless` |
-| `materials.get_mut(handle)` "touch" every frame | Nothing — updates are automatic |
-| `Res<RenderDevice>` / `Res<RenderQueue>` in setup or draw systems | Plain `Commands` / `Query<&mut Tui>` |
-| `terminal.draw()` + `render_to_texture()` + copy-back | `tui.draw(...)` only; the plugin owns the GPU path |
-| Per-material-type plugin registration for texture updates | Nothing — works for any `Material` impl |
-| `EventReader<TerminalEvent>` | `MessageReader<TerminalEvent>` (bevy 0.18+ messages) |
-| `Font::new(bytes.leak())` for runtime fonts | `Font::from_vec(bytes)` |
-| `window.cursor_position()` for terminal picking | `Res<CursorPosition>` (has the touch fallback) |
-| 1800×1200 atlas constants | 2048×2048 (`CACHE_WIDTH`/`CACHE_HEIGHT`) |
 
 ## Verification (what CI runs — .github/workflows/ci.yml)
 

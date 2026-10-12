@@ -387,6 +387,21 @@ impl Tui {
         }
     }
 
+    /// Whether a [`Self::request_resize`] is waiting for `gpu_flush_system`.
+    pub(crate) fn has_pending_resize(&self) -> bool {
+        self.pending_resize.is_some()
+    }
+
+    /// Whether a draw since the last flush changed any cell.
+    pub(crate) fn needs_flush(&self) -> bool {
+        self.dirty
+    }
+
+    /// Whether a flushed payload is waiting for `extract_tui_draws`.
+    pub(crate) fn has_pending_draw(&self) -> bool {
+        self.pending_draw.is_some()
+    }
+
     /// Apply a pending resize, if any: recreate the destination `Image` at
     /// the new pixel size, update the backend's grid dimensions, and resize
     /// ratatui's own buffers immediately (rather than waiting for the next
@@ -406,23 +421,22 @@ impl Tui {
         let backend = self.texture_state.terminal.backend_mut();
         backend.resize(cols, rows);
 
-        // Drain whatever the backend currently holds (vertex geometry from
-        // the last draw at the OLD grid size) - rendering that geometry
-        // against the freshly resized texture would show garbled,
-        // wrongly-scaled content for one frame, so it's discarded. Glyph
-        // rasterizations queue in the shared per-font state (`Fonts`,
-        // IMPROVEMENT.md C3), not in this payload, so there is nothing
-        // grid-size-dependent left to preserve there. Any previously
-        // unflushed payload (`self.pending_draw`, not yet drained by
-        // `extract_tui_draws`) is simply replaced - its vertex data was
-        // for an even older frame, equally stale.
+        // Drain whatever the backend currently holds (geometry from the
+        // last draw, at the pre-resize grid size) - rendering it against
+        // the freshly resized texture would show garbled, wrongly-scaled
+        // content for one frame, so it's discarded. Glyph rasterizations
+        // queue in the shared per-font state (`Fonts`), not in this
+        // payload, so there is nothing grid-size-dependent to preserve
+        // there. A payload not yet drained by `extract_tui_draws`
+        // (`self.pending_draw`) is simply overwritten - its geometry is
+        // equally stale.
         let mut payload = backend.take_draw_payload();
         payload.discard_stale_geometry();
         self.pending_draw = Some(payload);
 
         // `backend.resize()` (above) already set `full_redraw_needed`, but
         // the `take_draw_payload()` call just above consumed and cleared
-        // it while building the (now-discarded) payload. Re-arm it so the
+        // it while building the discarded payload. Re-arm it so the
         // FIRST REAL DRAW after this resize also comes out full rather
         // than partial - the destination texture was just recreated at the
         // new size, so a `LoadOp::Load` partial has nothing valid to
@@ -520,7 +534,7 @@ impl Tui {
     /// the CPU at all; do not call this every frame. Returns tightly-packed
     /// RGBA8 bytes. Goes through the render world via a request/response
     /// channel (`TuiReadbackChannel` in `bevy_plugin.rs`) - there is no
-    /// main-world texture to read from directly in Phase B.
+    /// main-world texture to read from directly.
     pub fn read_back_blocking(&self, channel: &crate::bevy_plugin::TuiReadbackChannel) -> Vec<u8> {
         channel.request_blocking(self.texture_state.image_handle.id())
     }
@@ -533,17 +547,17 @@ impl Tui {
         if self.dirty {
             let backend = self.texture_state.terminal.backend_mut();
             if self.pending_draw.is_some() {
-                // About to replace a not-yet-extracted previous payload
-                // (the render world skipped a frame - it extracts every
-                // frame once running, but sits out the first few while the
-                // renderer initializes asynchronously). A Phase 2 partial
-                // payload only covers the rows dirty as of ITS take - if
-                // the new payload were also partial, the old payload's
+                // About to overwrite a not-yet-extracted payload (the
+                // render world skipped a frame - it extracts every frame
+                // once running, but sits out the first few while the
+                // renderer initializes asynchronously). A partial payload
+                // only covers the rows dirty as of ITS take - if the new
+                // payload were also partial, the overwritten payload's
                 // rows would simply be dropped, never rendered. Force a
                 // full payload instead, which safely supersedes anything
                 // (glyph rasterizations live in the shared per-font state,
-                // `Fonts`, IMPROVEMENT.md C3, rather than in this payload,
-                // so there is nothing font-side to lose here either way).
+                // `Fonts`, rather than in this payload, so there is
+                // nothing font-side to lose here either way).
                 backend.force_full_redraw();
             }
             let draw = backend.take_draw_payload();
@@ -565,15 +579,15 @@ impl Tui {
     }
 
     /// Returns this terminal's font identity key, alongside any glyph
-    /// rasterizations still pending upload to that font's shared atlas
-    /// (IMPROVEMENT.md C3). The upload list is frequently empty: whichever
+    /// rasterizations still pending upload to that font's shared atlas.
+    /// The upload list is frequently empty: whichever
     /// terminal sharing a given font is visited first in a frame drains it
     /// for all of them (see `Fonts::with_shared_cpu_state`). Called once
     /// per `Tui` per frame by the render-world extract system
     /// (`extract_tui_draws` in `bevy_plugin.rs`).
     pub(crate) fn take_shared_font_uploads(
         &self,
-    ) -> (usize, Vec<(crate::utils::text_atlas::CacheRect, Vec<u32>)>) {
+    ) -> (usize, Vec<(crate::utils::text_atlas::CacheRect, Vec<u8>)>) {
         let backend = self.texture_state.terminal.backend();
         (backend.font_key(), backend.take_shared_glyph_uploads())
     }
@@ -730,7 +744,7 @@ pub(crate) struct WorldQuadHeight(pub(crate) f32);
 ///
 /// The request materializes on the next frame (or once the font asset
 /// resolves, for [`TuiFontSource::Asset`]): `TuiRequest` is removed and the
-/// same components the immediate-mode helpers used to build are inserted.
+/// terminal components (`Tui`, `TerminalDimensions`, ...) are inserted.
 /// Query for `&mut Tui` with your marker as usual - just tolerate it not
 /// existing yet (`let Ok(..) = query.single_mut() else { return }`), which
 /// idiomatic bevy systems do anyway.
@@ -1043,7 +1057,7 @@ pub(crate) struct TuiAttached {
 ///    type other than `StandardMaterial` (which naturally drop out of the
 ///    query below once `MeshMaterial3d<StandardMaterial>` is gone) as well
 ///    as [`AttachMaterial::standard`] (which keeps re-matching the query
-///    forever, but now settles into true no-ops).
+///    forever, but settles into true no-ops).
 #[cfg(feature = "3d")]
 #[derive(Component)]
 pub struct AttachTerminal {
@@ -1124,7 +1138,7 @@ mod tui_flush_tests {
     /// asserts on directly (a real ratatui backend failure is impractical
     /// to trigger from the outside, so this drives the same private method
     /// `draw`/`draw_with_hits` call on error). Pure CPU - `TerminalTexture`
-    /// needs no `RenderDevice`/`RenderQueue` since Phase B.
+    /// needs no `RenderDevice`/`RenderQueue`.
     #[test]
     fn draw_error_logged_only_once() {
         let mut images = Assets::<Image>::default();
@@ -1194,9 +1208,9 @@ mod tui_flush_tests {
         );
     }
 
-    /// Regression test: draw once inside a real headless bevy render
-    /// world, then read the destination `Image` back via
-    /// [`Tui::read_back_blocking`]. Exercises the full Phase B pipeline -
+    /// Draw once inside a real headless bevy render world, then read the
+    /// destination `Image` back via [`Tui::read_back_blocking`]. Exercises
+    /// the full pipeline -
     /// `gpu_flush_system` -> `extract_tui_draws` -> `render_tui_textures` ->
     /// `TerminalGpuState::render` -> `process_tui_readbacks` - end to end.
     ///
@@ -1204,8 +1218,8 @@ mod tui_flush_tests {
     /// render world's channel, so it must be called from a different thread
     /// than the one driving `app.update()` - exactly like a real
     /// application using `PipelinedRenderingPlugin`. Skips (rather than
-    /// fails) if no GPU adapter shows up within the bound, matching the
-    /// deferred plan to not make CI depend on GPU availability.
+    /// fails) if no GPU adapter shows up within the bound, so CI does not
+    /// depend on GPU availability.
     #[test]
     fn flush_renders_drawn_content_synchronously() {
         use crate::bevy_plugin::TerminalPlugin;
@@ -1292,19 +1306,182 @@ mod tui_flush_tests {
         }
         let pixels = pixels.expect("readback never completed - render world stalled");
 
-        let has_red_pixel = pixels.as_chunks::<4>().0.iter().any(|px| px[0] > 200 && px[2] < 60);
+        let has_red_pixel = pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|px| px[0] > 200 && px[2] < 60);
         assert!(
             has_red_pixel,
             "rendered texture does not contain the drawn red background"
         );
     }
 
-    /// Phase 2 partial redraw, GPU-backed regression: draw two rows (red,
+    /// Headless render app for GPU-backed tests, or `None` when this
+    /// environment has no GPU adapter.
+    fn gpu_app() -> Option<App> {
+        use crate::bevy_plugin::TerminalPlugin;
+        use bevy::render::renderer::RenderDevice;
+
+        let mut app = App::new();
+        app.add_plugins((
+            bevy::app::TaskPoolPlugin::default(),
+            bevy::asset::AssetPlugin::default(),
+            bevy::window::WindowPlugin {
+                primary_window: None,
+                exit_condition: bevy::window::ExitCondition::DontExit,
+                ..default()
+            },
+            bevy::mesh::MeshPlugin,
+            bevy::diagnostic::FrameCountPlugin,
+            bevy::time::TimePlugin,
+            bevy::render::RenderPlugin::default(),
+            bevy::image::ImagePlugin::default(),
+            TerminalPlugin::display_only(),
+        ));
+        app.init_resource::<bevy::camera::ClearColor>();
+        app.finish();
+        app.cleanup();
+
+        for _ in 0..200 {
+            app.update();
+            if app.world().get_resource::<RenderDevice>().is_some() {
+                return Some(app);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        eprintln!("skipping: no GPU adapter available in this environment");
+        None
+    }
+
+    /// Runs `app` until the terminal on `entity` has been read back.
+    fn read_back(app: &mut App, entity: Entity) -> Vec<u8> {
+        use crate::bevy_plugin::TuiReadbackChannel;
+
+        let image_id = app.world().get::<Tui>(entity).unwrap().image_handle().id();
+        let channel = app.world().resource::<TuiReadbackChannel>().clone();
+        let readback = std::thread::spawn(move || channel.request_blocking(image_id));
+        for _ in 0..200 {
+            app.update();
+            if readback.is_finished() {
+                return readback.join().expect("readback thread panicked");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("readback never completed - render world stalled");
+    }
+
+    /// GPU-backed check of the single-pass cell compositor end to end:
+    /// coverage masks reach the R8 atlas, each cell samples its own slot,
+    /// and background + glyph resolve to the right pixels - including a
+    /// second glyph in one cell (an overlay instance) keeping the cell's
+    /// background instead of overwriting it.
+    #[test]
+    fn cells_resolve_glyph_and_background_in_one_pass() {
+        let Some(mut app) = gpu_app() else {
+            return;
+        };
+
+        let fonts = test_fonts();
+        let (cell_w, cell_h) = (fonts.min_width_px() as usize, fonts.height_px() as usize);
+        const COLS: usize = 5;
+
+        let entity = {
+            let mut images = app.world_mut().resource_mut::<Assets<Image>>();
+            let texture_state = TerminalTexture::create(
+                COLS as u16,
+                1,
+                fonts,
+                true,
+                false,
+                [0, 0, 0, 255],
+                &mut images,
+            )
+            .expect("failed to create terminal texture");
+            let mut tui = Tui::from_texture_state(texture_state);
+            tui.draw(|frame| {
+                let buf = frame.buffer_mut();
+                // Full block: coverage 1 everywhere -> pure foreground.
+                buf[(0, 0)].set_symbol("█").set_style(
+                    Style::default()
+                        .fg(RatatuiColor::Rgb(0, 255, 0))
+                        .bg(RatatuiColor::Rgb(255, 0, 0)),
+                );
+                // Space: coverage 0 everywhere -> pure background.
+                buf[(1, 0)].set_symbol(" ").set_style(
+                    Style::default()
+                        .fg(RatatuiColor::Rgb(0, 255, 0))
+                        .bg(RatatuiColor::Rgb(0, 0, 255)),
+                );
+                // A letter: both.
+                buf[(2, 0)].set_symbol("M").set_style(
+                    Style::default()
+                        .fg(RatatuiColor::Rgb(255, 255, 255))
+                        .bg(RatatuiColor::Rgb(0, 0, 0)),
+                );
+                // Two glyphs in one cell: a cell instance plus an overlay.
+                buf[(3, 0)].set_symbol("i_").set_style(
+                    Style::default()
+                        .fg(RatatuiColor::Rgb(255, 255, 0))
+                        .bg(RatatuiColor::Rgb(255, 0, 255)),
+                );
+                // Left at the default style: reset colors.
+                buf[(4, 0)].set_symbol(" ");
+            });
+            app.world_mut().spawn(tui).id()
+        };
+
+        let pixels = read_back(&mut app, entity);
+        assert_eq!(pixels.len(), COLS * cell_w * cell_h * 4);
+        let cell = |col: usize| -> Vec<[u8; 4]> {
+            (0..cell_h)
+                .flat_map(|y| (0..cell_w).map(move |x| (x, y)))
+                .map(|(x, y)| {
+                    let i = (y * COLS * cell_w + col * cell_w + x) * 4;
+                    [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
+                })
+                .collect()
+        };
+
+        assert!(
+            cell(0).iter().all(|px| *px == [0, 255, 0, 255]),
+            "a full-block glyph must be pure foreground"
+        );
+        assert!(
+            cell(1).iter().all(|px| *px == [0, 0, 255, 255]),
+            "a space must be pure background"
+        );
+        let letter = cell(2);
+        assert!(letter.contains(&[255, 255, 255, 255]));
+        assert!(letter.contains(&[0, 0, 0, 255]));
+
+        let stacked = cell(3);
+        // Thin strokes may never reach full coverage: "mostly foreground".
+        let is_fg = |px: &[u8; 4]| px[1] > 128;
+        let is_bg = |px: &[u8; 4]| *px == [255, 0, 255, 255];
+        assert!(
+            stacked.iter().any(is_fg) && stacked.iter().any(is_bg),
+            "expected glyph and background pixels, got {stacked:?}"
+        );
+        // The underscore sits on the bottom rows, the `i` above it: both
+        // glyphs must have left foreground pixels.
+        let rows_with_fg: Vec<usize> = (0..cell_h)
+            .filter(|y| stacked[y * cell_w..(y + 1) * cell_w].iter().any(is_fg))
+            .collect();
+        assert!(
+            rows_with_fg.first().unwrap() + cell_h / 3 < *rows_with_fg.last().unwrap(),
+            "both stacked glyphs must be visible, got foreground rows {rows_with_fg:?}"
+        );
+
+        assert!(cell(4).iter().all(|px| *px == [0, 0, 0, 255]));
+    }
+
+    /// Partial redraw, GPU-backed: draw two rows (red,
     /// green), read back the fully-rendered texture, then redraw ONLY the
     /// second row (green -> blue) and read back again. The first row's
     /// pixels must be byte-identical across both readbacks (proving
-    /// `LoadOp::Load` actually preserved them - a `LoadOp::Clear` bug here
-    /// would wipe row 0 on the second render), and the second row must now
+    /// `LoadOp::Load` actually preserved them - a `LoadOp::Clear` here
+    /// would wipe row 0 on the second render), and the second row must
     /// show blue instead of green. Same skip-if-no-GPU policy as
     /// `flush_renders_drawn_content_synchronously`.
     #[test]
@@ -1428,7 +1605,11 @@ mod tui_flush_tests {
             "row 1 must start out green"
         );
         assert!(
-            row1_after.as_chunks::<4>().0.iter().any(|px| px[0..3] == [0, 0, 255]),
+            row1_after
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|px| px[0..3] == [0, 0, 255]),
             "row 1 must show blue after being redrawn"
         );
     }
@@ -1436,7 +1617,7 @@ mod tui_flush_tests {
 
 // ============================================================================
 // Test: TuiRequest with TuiFontSource::Asset materializes once the font
-// asset finishes loading (P1-2 acceptance). No GPU needed - materialization
+// asset finishes loading. No GPU needed - materialization
 // is pure CPU + Assets<Image>; the app here has no RenderPlugin at all.
 // ============================================================================
 
@@ -1514,7 +1695,7 @@ mod tui_request_tests {
 }
 
 // ============================================================================
-// Test: attach_terminal_system settles into zero archetype churn (P2-1).
+// Test: attach_terminal_system settles into zero archetype churn.
 //
 // Component add/remove always re-stamps bevy's per-component change tick,
 // even when the reinserted value is identical - so "no remove+insert
@@ -1605,7 +1786,7 @@ mod attach_churn_tests {
 }
 
 // ============================================================================
-// Test: runtime resize (P1-3). Pure CPU + Assets<Image>, no GPU/App needed -
+// Test: runtime resize. Pure CPU + Assets<Image>, no GPU/App needed -
 // `TerminalTexture::resize`/`Tui::apply_pending_resize` touch neither.
 // ============================================================================
 
@@ -1680,7 +1861,7 @@ mod resize_tests {
 }
 
 // ============================================================================
-// Test: HitRegions (P2-4). Pure CPU, no bevy/GPU needed at all.
+// Test: HitRegions. Pure CPU, no bevy/GPU needed at all.
 // ============================================================================
 
 #[cfg(test)]
@@ -1762,5 +1943,138 @@ mod hit_regions_tests {
         regions.clear();
 
         assert_eq!(regions.hit_at::<WidgetId>((5, 5)), None);
+    }
+}
+
+// ============================================================================
+// CPU hot-path micro-benchmark (no GPU, no App). `#[ignore]`d - run with:
+//   cargo test --release --lib cpu_hot_path -- --ignored --nocapture
+// Times the whole main-world cost of a dirty frame: ratatui's diff +
+// `Backend::draw`/`flush` (shaping, atlas lookups, geometry) inside
+// `Tui::draw`, then `Tui::flush` (payload assembly) and the extract-side
+// drains. Workloads write straight into the frame buffer so widget layout
+// cost stays out of the numbers.
+// ============================================================================
+
+#[cfg(test)]
+mod perf_bench {
+    use super::*;
+    use crate::fonts::{Font, Fonts};
+    use ratatui::style::{Color as RColor, Style};
+    use std::time::{Duration, Instant};
+
+    const COLS: u16 = 120;
+    const ROWS: u16 = 40;
+    const FRAMES: u32 = 600;
+    const TEXT: &[u8] = b"The quick brown fox jumps over the lazy dog. 0123456789 +-*/=<>[]{}() ";
+
+    fn run(name: &str, mut paint: impl FnMut(u32, &mut ratatui::buffer::Buffer)) {
+        let font_data = include_bytes!("../examples/assets/fonts/Mplus1Code-Regular.ttf");
+        let fonts = Arc::new(Fonts::new(Font::new(font_data).expect("font"), 16));
+        let mut images = Assets::<Image>::default();
+        let texture =
+            TerminalTexture::create(COLS, ROWS, fonts, true, false, [0, 0, 0, 255], &mut images)
+                .expect("terminal");
+        let mut tui = Tui::from_texture_state(texture);
+
+        let mut draw = Duration::ZERO;
+        let mut take = Duration::ZERO;
+        // Warm-up frames populate the glyph atlas / plan cache.
+        for frame_no in 0..FRAMES + 20 {
+            let t0 = Instant::now();
+            tui.draw(|frame| paint(frame_no, frame.buffer_mut()));
+            let t1 = Instant::now();
+            tui.flush();
+            let payload = tui.take_pending_draw();
+            let uploads = tui.take_shared_font_uploads();
+            let t2 = Instant::now();
+            std::hint::black_box((&payload, &uploads));
+            if frame_no >= 20 {
+                draw += t1 - t0;
+                take += t2 - t1;
+            }
+        }
+        println!(
+            "[cpu_hot_path] {name:<12} draw+shape {:>7.1} us  payload {:>6.1} us  total {:>7.1} us/frame",
+            draw.as_secs_f64() * 1e6 / FRAMES as f64,
+            take.as_secs_f64() * 1e6 / FRAMES as f64,
+            (draw + take).as_secs_f64() * 1e6 / FRAMES as f64,
+        );
+    }
+
+    fn text_at(frame_no: u32, x: u16, y: u16) -> &'static str {
+        let i = (x as usize + y as usize * 7 + frame_no as usize) % TEXT.len();
+        std::str::from_utf8(&TEXT[i..i + 1]).unwrap()
+    }
+
+    #[test]
+    #[ignore = "benchmark - run explicitly with --ignored --nocapture"]
+    fn cpu_hot_path() {
+        // Every cell's text and colors change every frame (the text scrolls,
+        // so row contents recur).
+        run("full_text", |n, buf| {
+            for y in 0..ROWS {
+                for x in 0..COLS {
+                    let c = (x as u32 * 2 + y as u32 * 5 + n) as u8;
+                    buf[(x, y)].set_symbol(text_at(n, x, y)).set_style(
+                        Style::default()
+                            .fg(RColor::Rgb(c, 255 - c, 128))
+                            .bg(RColor::Rgb(c / 4, 0, 64 - c / 4)),
+                    );
+                }
+            }
+        });
+        // Worst case for any text cache: every row is new, never-seen text
+        // every frame (pseudo-random printable ASCII).
+        run("unique_text", |n, buf| {
+            let mut state = n.wrapping_mul(2654435761).wrapping_add(12345);
+            for y in 0..ROWS {
+                for x in 0..COLS {
+                    state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                    let i = 0x21 + (state >> 24) as usize % 94;
+                    const ASCII: &str = "                                 !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
+                    buf[(x, y)].set_symbol(&ASCII[i..i + 1]);
+                }
+            }
+        });
+        // examples/benchmark.rs's gradient: one block glyph, colors scroll.
+        run("gradient", |n, buf| {
+            for y in 0..ROWS {
+                for x in 0..COLS {
+                    let c = (x as u32 * 2 + y as u32 * 5 + n) as u8;
+                    buf[(x, y)]
+                        .set_symbol("█")
+                        .set_style(Style::default().fg(RColor::Rgb(c, 255 - c, 128)));
+                }
+            }
+        });
+        // Text stays put, only colors change (highlight/selection movement).
+        run("colors_only", |n, buf| {
+            for y in 0..ROWS {
+                for x in 0..COLS {
+                    let c = (x as u32 * 2 + y as u32 * 5 + n) as u8;
+                    buf[(x, y)]
+                        .set_symbol(text_at(0, x, y))
+                        .set_style(Style::default().fg(RColor::Rgb(c, 255 - c, 128)));
+                }
+            }
+        });
+        // Static screen with one live row (a clock / counter / log tail).
+        run("one_row", |n, buf| {
+            for y in 0..ROWS {
+                for x in 0..COLS {
+                    let frame_no = if y == 5 { n } else { 0 };
+                    buf[(x, y)].set_symbol(text_at(frame_no, x, y));
+                }
+            }
+        });
+        // Nothing changes at all.
+        run("static", |_, buf| {
+            for y in 0..ROWS {
+                for x in 0..COLS {
+                    buf[(x, y)].set_symbol(text_at(0, x, y));
+                }
+            }
+        });
     }
 }

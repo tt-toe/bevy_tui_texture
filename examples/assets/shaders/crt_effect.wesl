@@ -5,7 +5,7 @@
 // - Color aberration (chromatic aberration)
 // - Vignette
 
-#import bevy_pbr::forward_io::VertexOutput
+import bevy_pbr::render::forward_io::VertexOutput;
 
 struct CrtMaterial {
     effect_intensity: f32,

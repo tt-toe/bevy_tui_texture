@@ -22,9 +22,9 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-bevy = "0.19"
+bevy = "0.20"
 font-kit = "0.14"
-bevy_tui_texture = "0.3"
+bevy_tui_texture = "0.4"
 ```
 
 ### Hello World
@@ -134,7 +134,7 @@ wasm-opt -Oz --strip-debug --strip-producers \
 
 ```toml
 [dependencies.bevy_tui_texture]
-version = "0.3"
+version = "0.4"
 default-features = false
 features = ["3d", "keyboard_input", "mouse_input"]   # e.g. a 3D-only app
 ```
@@ -153,26 +153,49 @@ features = ["3d", "keyboard_input", "mouse_input"]   # e.g. a 3D-only app
 ## Performance
 
 - Dirty-cell tracking: byte-identical redraws cost nothing, and redraws touching only a few rows upload only those rows
+- One instanced draw per terminal: each glyph is a single 20-byte instance, and background + glyph are resolved in one fragment pass (no separate background pass, no index buffer)
+- Shaped text is cached by content — recolored rows and scrolled content are never reshaped
 - Glyph atlas shared across terminals using the same fonts — each glyph is rasterized and uploaded once
 - Persistent, grow-only GPU buffers; all terminal draws ride the frame's single batched submit alongside the camera passes
 - Terminal content lands in the same frame it is drawn (no one-frame lag)
 
-See `examples/benchmark.rs` and `examples/benchmark_partial.rs`.
+See `examples/benchmark.rs` and `examples/benchmark_partial.rs` (windowed,
+FPS), and `cargo test --release --lib cpu_hot_path -- --ignored --nocapture`
+(the CPU side alone, no GPU needed).
+
+### 0.3 → 0.4
+
+CPU cost of a dirty frame on a 120×40 terminal (the `cpu_hot_path`
+benchmark above; Apple M1, microseconds per frame, including ratatui's
+own buffer diff of about 70):
+
+| workload                          | 0.3.5 | 0.4.0 |
+|-----------------------------------|------:|------:|
+| every cell: scrolling text+colors |  1350 |   290 |
+| every cell: colors only           |  1190 |   265 |
+| every cell: block glyph gradient  |  1985 |   385 |
+| every cell: never-seen text       |  1485 |  1080 |
+| one row changes                   |   100 |    75 |
+| nothing changes                   |    74 |    69 |
+
+`examples/benchmark` (full-frame redraw, uncapped, same machine): about
+250 fps → about 390 fps.
 
 ## Requirements
 
-- Rust 1.96+ (2024 edition), Bevy 0.19, Ratatui 0.30, a GPU with WGPU support
+- Rust 1.97.1+ (2024 edition), Bevy 0.20, Ratatui 0.30, a GPU with WGPU support
 - Platforms: Windows, macOS, Linux, and Web (WebGL2)
 - Fonts must be TrueType (`.ttf`)
 
 **MSRV policy**: the declared `rust-version` tracks whichever dependency
-needs the newest compiler — currently bevy 0.19 itself, not anything this
+needs the newest compiler — currently bevy 0.20 itself, not anything this
 crate's own code requires (edition 2024's floor is 1.85; ratatui 0.30.2
 declares 1.88.0). Bumping bevy/ratatui may raise this floor; there is no
 separate "N versions behind stable" policy on top.
 
 | `bevy` | `ratatui` | `wgpu` | `bevy_tui_texture` |
 |--------|-----------|--------|--------------------|
+| `0.20` | `0.30`    | `30`   | `0.4`              |
 | `0.19` | `0.30`    | `29`   | `0.3`              |
 | `0.18` | `0.30`    | `27`   | `0.2`              |
 | `0.17` | `0.29`    | `26`   | `0.1`              |

@@ -1,7 +1,6 @@
-use std::num::NonZeroUsize;
 use std::ops::Deref;
 
-use evictor::Lru;
+use bevy::platform::collections::HashMap;
 use ratatui::style::Modifier;
 use tracing::info;
 
@@ -43,21 +42,42 @@ impl Deref for Entry {
     }
 }
 
+/// One atlas slot's bookkeeping: which glyph currently lives there, and
+/// the last flush that used it.
+#[derive(Debug, Clone, Copy)]
+struct Slot {
+    key: Key,
+    last_used: u64,
+}
+
+/// CPU-side index of the glyph atlas: which fixed-size slot each glyph
+/// occupies, and which slot to reuse once the atlas is full.
+///
+/// A lookup is the hot path of every flush - it runs once per glyph of
+/// every reshaped row - so a hit costs one hash probe plus one store: the
+/// slot is stamped with the current flush's epoch instead of being relinked
+/// to the front of a recency list. Eviction (the rare path, only once the
+/// atlas is full) is a clock sweep over those stamps.
 #[derive(Debug)]
 pub(crate) struct Atlas {
-    lru: Lru<Key, CacheRect>,
+    index: HashMap<Key, u32>,
+    /// Allocated slots, by slot number.
+    slots: Vec<Slot>,
     width: u32,
 
     entry_width: u32,
     entry_height: u32,
 
-    next_entry: u32,
     max_entries: u32,
 
-    /// Bumped every time a slot is reassigned to a different key (eviction
-    /// in `get`, or a full `clear`) - see IMPROVEMENT.md A2. A cached
-    /// row's UV rects are only trustworthy as long as no reassignment has
-    /// happened since they were recorded; comparing this counter is how
+    /// Advanced by [`Atlas::begin_flush`]; what a used slot is stamped with.
+    epoch: u64,
+    /// Where the next eviction sweep starts.
+    hand: u32,
+
+    /// Bumped every time a slot is reassigned to a different key. A cached
+    /// row's atlas rects are only trustworthy as long as no reassignment
+    /// has happened since they were recorded; comparing this counter is how
     /// `BevyTerminalBackend::flush` (the only reader) detects that.
     generation: u64,
 }
@@ -72,14 +92,14 @@ impl Atlas {
         );
 
         Atlas {
-            lru: Lru::new(
-                NonZeroUsize::new(max_entries as usize).expect("Max entries must be non-zero"),
-            ),
+            index: HashMap::default(),
+            slots: Vec::new(),
             width,
             entry_width,
             entry_height,
-            next_entry: 0,
             max_entries,
+            epoch: 0,
+            hand: 0,
             generation: 0,
         }
     }
@@ -89,8 +109,10 @@ impl Atlas {
         self.generation
     }
 
-    pub(crate) fn try_get(&mut self, key: &Key) -> Option<Entry> {
-        self.lru.get(key).copied().map(Entry::Cached)
+    /// Starts a new flush: every glyph looked up from here on counts as in
+    /// use by this flush, and is the last thing an eviction will pick.
+    pub(crate) fn begin_flush(&mut self) {
+        self.epoch += 1;
     }
 
     pub(crate) fn get(&mut self, key: &Key, width: u32, height: u32) -> Entry {
@@ -104,21 +126,55 @@ impl Atlas {
             "Internal width not a multiple of provided width - entry size is fixed at Atlas::new time"
         );
 
-        self.try_get(key).unwrap_or_else(|| {
-            let rect = if self.next_entry == self.max_entries {
-                // Reassigning an existing slot to a new key - any row
-                // geometry caching that slot's old UV rect is now stale.
-                self.generation += 1;
-                self.lru.pop().expect("Atlas has zero max entries!").1
-            } else {
-                let entry = self.next_entry;
-                self.next_entry += 1;
-                self.slot_to_rect(entry, width)
-            };
+        if let Some(&slot) = self.index.get(key) {
+            self.slots[slot as usize].last_used = self.epoch;
+            return Entry::Cached(self.slot_to_rect(slot, width));
+        }
 
-            self.lru.insert(*key, rect);
-            Entry::Uncached(rect)
-        })
+        let slot = if (self.slots.len() as u32) < self.max_entries {
+            self.slots.push(Slot {
+                key: *key,
+                last_used: self.epoch,
+            });
+            self.slots.len() as u32 - 1
+        } else {
+            // Reassigning an existing slot to a new key - any row geometry
+            // caching that slot's old rect is now stale.
+            self.generation += 1;
+            let slot = self.evict();
+            self.index.remove(&self.slots[slot as usize].key);
+            self.slots[slot as usize] = Slot {
+                key: *key,
+                last_used: self.epoch,
+            };
+            slot
+        };
+        self.index.insert(*key, slot);
+        Entry::Uncached(self.slot_to_rect(slot, width))
+    }
+
+    /// Picks the slot to reuse, sweeping from the clock hand: preferably
+    /// one no flush has touched for a while, otherwise any slot the current
+    /// flush hasn't used. Only when every slot is in use by the current
+    /// flush (more distinct glyphs on screen than the atlas holds) does it
+    /// take one of those - the generation bump in `get` makes the affected
+    /// rows reshape.
+    fn evict(&mut self) -> u32 {
+        let count = self.slots.len() as u32;
+        // "Stale" = untouched by this flush and the one before it, so a
+        // glyph that merely skipped one frame isn't the first to go.
+        for stale_before in [self.epoch.saturating_sub(1), self.epoch] {
+            for step in 0..count {
+                let slot = (self.hand + step) % count;
+                if self.slots[slot as usize].last_used < stale_before {
+                    self.hand = (slot + 1) % count;
+                    return slot;
+                }
+            }
+        }
+        let slot = self.hand % count;
+        self.hand = (slot + 1) % count;
+        slot
     }
 
     fn slot_to_rect(&self, slot: u32, width: u32) -> CacheRect {
@@ -180,5 +236,67 @@ mod tests {
         let post_insertion = atlas.get(&last_key, char_width, char_height);
 
         assert_eq!(*last_inserted, *post_insertion);
+    }
+
+    fn key(glyph: u32) -> Key {
+        Key {
+            style: Modifier::default(),
+            glyph,
+            font: 0,
+        }
+    }
+
+    fn small_atlas() -> (Atlas, u32, u32) {
+        let fonts = Fonts::new(
+            Font::new(include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/examples/assets/fonts/Mplus1Code-Regular.ttf"
+            )))
+            .unwrap(),
+            24,
+        );
+        let (w, h) = (fonts.min_width_px(), fonts.height_px());
+        // Room for exactly 4 entries (2 x 2 slots of `2w` x `h`).
+        (Atlas::new(&fonts, w * 4, h * 2), w, h)
+    }
+
+    #[test]
+    fn a_full_atlas_evicts_a_glyph_no_recent_flush_used() {
+        let (mut atlas, w, h) = small_atlas();
+        assert_eq!(atlas.max_entries, 4);
+
+        atlas.begin_flush();
+        let rects: Vec<_> = (0..4).map(|glyph| *atlas.get(&key(glyph), w, h)).collect();
+        // Two more flushes keep using everything except glyph 2.
+        for _ in 0..2 {
+            atlas.begin_flush();
+            for glyph in [0, 1, 3] {
+                assert!(atlas.get(&key(glyph), w, h).cached());
+            }
+        }
+
+        let generation = atlas.generation();
+        let new = atlas.get(&key(99), w, h);
+        assert!(!new.cached());
+        assert_eq!(*new, rects[2], "the new glyph takes the stale slot");
+        assert_eq!(atlas.generation(), generation + 1);
+        assert!(!atlas.get(&key(2), w, h).cached(), "glyph 2 was evicted");
+    }
+
+    #[test]
+    fn glyphs_used_by_the_current_flush_are_evicted_last() {
+        let (mut atlas, w, h) = small_atlas();
+        atlas.begin_flush();
+        let rects: Vec<_> = (0..4).map(|glyph| *atlas.get(&key(glyph), w, h)).collect();
+
+        atlas.begin_flush();
+        for glyph in [0, 1, 2] {
+            atlas.get(&key(glyph), w, h);
+        }
+        // Only glyph 3 is unused by this flush - it must be the one replaced.
+        assert_eq!(*atlas.get(&key(50), w, h), rects[3]);
+        for glyph in [0, 1, 2] {
+            assert!(atlas.get(&key(glyph), w, h).cached());
+        }
     }
 }

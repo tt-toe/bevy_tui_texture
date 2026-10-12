@@ -1,14 +1,11 @@
-// unlit_blur.wgsl - Combined vertex and fragment shader for BlurMaterial
+// unlit_blur.wesl - Combined vertex and fragment shader for BlurMaterial
 //
 // Additive-blended monitor reflection, modulated by VERTEX COLORS:
 // the Rust side injects an edge-fade gradient into ATTRIBUTE_COLOR and the
 // pipeline maps POSITION/COLOR/UV_0 to locations 0/1/2 (see
 // BlurMaterial::specialize). Every light contribution below is multiplied by
 // the vertex color, so black vertices contribute nothing under Add blending.
-#import bevy_render::view::View
-#import bevy_pbr::mesh_functions::{get_world_from_local, mesh_position_local_to_clip}
-
-@group(0) @binding(0) var<uniform> view: View;
+import bevy_pbr::render::mesh_functions::{get_world_from_local, mesh_position_local_to_clip};
 
 struct VertexInput {
     @builtin(instance_index) instance_index: u32,
@@ -47,13 +44,13 @@ struct BlurUniforms {
 }
 
 // Custom Material bindings - use MATERIAL_BIND_GROUP for custom Material
-@group(#{MATERIAL_BIND_GROUP}) @binding(0)
+@group(constants::MATERIAL_BIND_GROUP) @binding(0)
 var<uniform> uniforms: BlurUniforms;
 
-@group(#{MATERIAL_BIND_GROUP}) @binding(1)
+@group(constants::MATERIAL_BIND_GROUP) @binding(1)
 var base_color_texture: texture_2d<f32>;
 
-@group(#{MATERIAL_BIND_GROUP}) @binding(2)
+@group(constants::MATERIAL_BIND_GROUP) @binding(2)
 var base_color_sampler: sampler;
 
 // Blur sampling function

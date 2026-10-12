@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
-use crate::backend::TextBgVertexMember;
-use crate::backend::TextVertexMember;
+use crate::backend::CellInstance;
 use crate::backend::Viewport;
 use crate::backend::rasterize::rasterize_glyph;
 use crate::colors::Rgb;
@@ -16,21 +15,35 @@ const NULL_CELL: Cell = Cell::new("");
 /// Cached geometry for one row, from the last flush that (re)generated it.
 /// Reused verbatim by a later flush when the row is clean (`dirty_rows[y]
 /// == false`) and the atlas hasn't reassigned any slot since - see
-/// `BevyTerminalBackend::flush` and IMPROVEMENT.md A2. Vertex positions
-/// are absolute screen pixel coordinates (including `screen_y`, which
-/// only depends on the row index, not on anything about the current
-/// frame), so a cached row's vertices can be appended to the frame's
-/// output verbatim with no rebasing.
+/// `BevyTerminalBackend::flush`. Instances carry absolute pixel positions
+/// (the row's `y` included), so a cached row is appended to a frame's
+/// payload verbatim, with no rebasing.
 #[derive(Default, Clone)]
 struct RowGeometry {
-    bg_vertices: Vec<TextBgVertexMember>,
-    text_vertices: Vec<TextVertexMember>,
+    /// One instance per covered cell - see [`CellInstance`].
+    cells: Vec<CellInstance>,
+    /// Extra glyphs landing in a cell `cells` already covers (combining
+    /// marks shaped as separate glyphs). Empty for almost every row.
+    overlays: Vec<CellInstance>,
     /// `Atlas::generation()` as of when this geometry was (re)computed.
     /// A mismatch against the atlas's current generation means some slot
-    /// referenced by `text_vertices`' UVs may have been reassigned to a
-    /// different glyph since - the row must be treated as dirty and
-    /// regenerated rather than reused.
+    /// referenced by these instances may have been reassigned to a
+    /// different glyph since - the row must be regenerated, not reused.
     atlas_generation: u64,
+}
+
+/// One glyph of the row being shaped: a [`ShapedGlyph`] rebased onto the
+/// row (its cluster is a byte offset into the whole row string) and tagged
+/// with the [`FontRun`] it came from.
+///
+/// [`ShapedGlyph`]: crate::utils::shape_cache::ShapedGlyph
+#[derive(Clone, Copy)]
+struct RowGlyph {
+    glyph_id: u32,
+    cluster: u32,
+    x_advance: i32,
+    x_offset: i32,
+    run: u16,
 }
 
 /// A maximal stretch of a row whose cells all resolve to the same font
@@ -48,7 +61,11 @@ struct FontRun<'f> {
 /// as a missing glyph even when a fallback font has it. A cell with an
 /// empty symbol (the hidden half of a wide char) contributes no text, so
 /// it just extends whichever run it follows.
-fn font_runs<'f>(fonts: &'f Fonts, cells: &[Cell]) -> Vec<FontRun<'f>> {
+fn font_runs<'f>(
+    fonts: &'f Fonts,
+    cells: &[Cell],
+    choices: &mut crate::utils::shape_cache::FontChoiceCache,
+) -> Vec<FontRun<'f>> {
     let mut runs: Vec<FontRun<'f>> = Vec::new();
     let mut end = 0;
     for cell in cells {
@@ -60,7 +77,7 @@ fn font_runs<'f>(fonts: &'f Fonts, cells: &[Cell]) -> Vec<FontRun<'f>> {
             }
             continue;
         }
-        let (font, fake_bold, fake_italic) = fonts.font_for_cell(cell);
+        let (font, fake_bold, fake_italic) = fonts.font_for_cell_cached(cell, choices);
         // Fake styling only applies with real per-style font slots.
         let styled = cfg!(feature = "bold_italic_fonts");
         let (fake_bold, fake_italic) = (styled && fake_bold, styled && fake_italic);
@@ -103,8 +120,8 @@ mod font_run_tests {
             .collect()
     }
 
-    /// Regression: `shape_row` used to shape the whole row with the first
-    /// cell's font, so a fallback font was never used past column 0.
+    /// A row is not shaped with its first cell's font alone: a char that
+    /// font lacks gets a run in a fallback font, at any column.
     #[test]
     fn chars_missing_from_the_first_font_get_a_fallback_run() {
         // M+ (tried first) has no Hangul; fusion-pixel (last resort) does.
@@ -115,7 +132,8 @@ mod font_run_tests {
         fonts.add_regular_fonts([mplus]);
 
         let row = cells(&["a", "b", "한", "", "c", "d"]);
-        let runs: Vec<_> = font_runs(&fonts, &row)
+        let mut choices = crate::utils::shape_cache::FontChoiceCache::new();
+        let runs: Vec<_> = font_runs(&fonts, &row, &mut choices)
             .iter()
             .map(|run| (run.font.id(), run.bytes.clone()))
             .collect();
@@ -129,7 +147,8 @@ mod font_run_tests {
     #[test]
     fn a_single_font_row_is_one_run() {
         let fonts = Fonts::new(Font::new(MPLUS).expect("M+ parses"), 16);
-        let runs = font_runs(&fonts, &cells(&["h", "i", " ", "あ", ""]));
+        let mut choices = crate::utils::shape_cache::FontChoiceCache::new();
+        let runs = font_runs(&fonts, &cells(&["h", "i", " ", "あ", ""]), &mut choices);
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].bytes, 0..6);
     }
@@ -212,18 +231,22 @@ pub struct BevyTerminalBackend {
     pub(super) full_redraw_needed: bool,
 
     // ====== Font management (Arc, no lifetime) ======
-    // `cached` (Atlas), `plan_cache`, and `pending_cache_updates` used to
-    // live here, one independent copy per terminal. They now live in
-    // `fonts.shared_cpu_state` instead (reachable via
-    // `Fonts::with_shared_cpu_state`) - shared by every terminal that
-    // holds the same `Arc<Fonts>`, so a glyph is rasterized and queued for
-    // GPU upload once per font, not once per terminal (IMPROVEMENT.md C3).
+    // The atlas, plan cache and pending glyph uploads are not here: they
+    // live in `fonts.shared_cpu_state` (reachable via
+    // `Fonts::with_shared_cpu_state`), shared by every terminal that holds
+    // the same `Arc<Fonts>`, so a glyph is rasterized and queued for GPU
+    // upload once per font, not once per terminal.
     pub(super) fonts: Arc<Fonts>,
     pub(super) buffer: UnicodeBuffer,
     pub(super) row: String,
     pub(super) rowmap: Vec<u16>,
-    /// cmap lookup cache for the ASCII fast path (IMPROVEMENT.md A3,
-    /// feature `ascii_fast_shaping`) - `None` means "checked, this font
+    /// Scratch for `shape_row`: which cells of the row being shaped already
+    /// have a cell instance (so a further glyph there becomes an overlay).
+    covered: Vec<bool>,
+    /// Scratch for `shape_row`: the row's glyphs, in shaping order.
+    glyphs: Vec<RowGlyph>,
+    /// cmap lookup cache for the ASCII fast path (feature
+    /// `ascii_fast_shaping`) - `None` means "checked, this font
     /// has no glyph for this char", cached to avoid re-probing every
     /// frame. Keyed by `(font id, char)` since a terminal's font can
     /// change via `update_fonts` (which clears this) and, in principle,
@@ -233,17 +256,12 @@ pub struct BevyTerminalBackend {
         std::collections::HashMap<(u64, char), Option<rustybuzz::ttf_parser::GlyphId>>,
 
     // ====== Draw data (owned) ======
-    // No index buffer here: quad indices are a pure function of vertex
-    // count (quad i -> [4i, 4i+1, 4i+2, 4i+2, 4i+3, 4i+1]), so this
-    // terminal's `TerminalGpuState` (backend/mod.rs) owns one static,
-    // grow-only index buffer instead of regenerating one here every frame.
-    // Note: there are no `bg_vertices`/`text_vertices` fields here -
-    // `flush()` only maintains `row_geometry` below; the full-frame or
-    // dirty-rows-only vertex `Vec`s are built on demand in
-    // `take_draw_payload` (Phase 2 partial redraw), not accumulated here.
+    // `flush()` only maintains `row_geometry`; the full-frame or
+    // dirty-rows-only instance list is assembled on demand in
+    // `take_draw_payload`.
     /// Per-row geometry cache, indexed by row `y`, letting `flush()` skip
     /// reshaping+re-rasterizing rows `dirty_rows` says are unchanged. See
-    /// `RowGeometry` and IMPROVEMENT.md A2.
+    /// `RowGeometry`.
     row_geometry: Vec<RowGeometry>,
 
     // ====== Color settings ======
@@ -251,13 +269,11 @@ pub struct BevyTerminalBackend {
     pub(super) reset_bg: Rgb,
     /// If true, a cell whose *effective* background is `Color::Reset`
     /// (accounting for `Modifier::REVERSED` - see the color-selection logic
-    /// in `flush()`) is packed with alpha 0 instead of 255, making it show
-    /// through to whatever is behind the terminal's surface (a world-quad
-    /// with `AlphaMode::Blend`, or a transparent-background UI node).
-    /// Localized entirely to vertex-color packing here - no shader/pipeline
-    /// change needed (`composite_bg.wgsl` already unpacks and outputs the
-    /// full RGBA of `bg_color`, and the bg pipeline's `BlendState::REPLACE`
-    /// writes it through as-is).
+    /// in `shape_row`) gets background alpha 0 instead of 255, making it
+    /// show through to whatever is behind the terminal's surface (a
+    /// world-quad with `AlphaMode::Blend`, or a transparent-background UI
+    /// node). Localized entirely to `CellInstance::bg` - the cell pipeline
+    /// writes that RGBA as-is wherever the glyph has no coverage.
     pub(super) transparent_reset_bg: bool,
     /// Color shown before any content has been drawn (or while nothing is
     /// drawn at all - e.g. mid-resize): the render world's `LoadOp::Clear`
@@ -266,7 +282,7 @@ pub struct BevyTerminalBackend {
     pub(super) initial_fill: [u8; 4],
 }
 
-/// Builder for BevyTerminalBackend. Fully synchronous, requires Device/Queue at build().
+/// Builder for BevyTerminalBackend. Fully synchronous, pure CPU.
 pub struct TerminalBuilder {
     fonts: Arc<Fonts>,
     cols: u16,
@@ -342,7 +358,7 @@ impl TerminalBuilder {
     /// pipelines) are created lazily in the render world on this font's
     /// first extract (see `SharedFontGpuState` in `backend/mod.rs` and the
     /// render-world store in `bevy_plugin.rs`) - and the CPU-side atlas
-    /// LRU/plan cache lazily on this `Fonts`' first use (see
+    /// index/plan cache lazily on this `Fonts`' first use (see
     /// `Fonts::with_shared_cpu_state`), not here.
     pub fn build(self) -> BevyTerminalBackend {
         BevyTerminalBackend {
@@ -359,6 +375,8 @@ impl TerminalBuilder {
             buffer: UnicodeBuffer::new(),
             row: String::new(),
             rowmap: vec![],
+            covered: vec![],
+            glyphs: vec![],
             #[cfg(feature = "ascii_fast_shaping")]
             ascii_glyph_cache: std::collections::HashMap::new(),
             row_geometry: vec![],
@@ -370,16 +388,29 @@ impl TerminalBuilder {
     }
 }
 
-/// Convert tiny-skia Pixmap to Vec<u32> in RGBA8 format
-fn pixmap_to_rgba8(pixmap: tiny_skia::Pixmap) -> Vec<u32> {
+/// A tiny-skia pixmap's alpha channel - the coverage mask the R8 glyph
+/// atlas stores (tiny-skia pixels are RGBA byte order).
+fn pixmap_coverage(pixmap: &tiny_skia::Pixmap) -> Vec<u8> {
     pixmap
         .data()
         .as_chunks::<4>()
         .0
         .iter()
-        // tiny-skia uses RGBA byte order; pack into u32 (little-endian RGBA)
-        .map(|&rgba| u32::from_le_bytes(rgba))
+        .map(|rgba| rgba[3])
         .collect()
+}
+
+/// Coverage mask of a rasterized glyph: `rasterize_glyph` yields RGBA8
+/// packed little-endian into `u32`s, so alpha is the top byte.
+fn glyph_coverage(image: &[u32]) -> Vec<u8> {
+    image.iter().map(|rgba| (rgba >> 24) as u8).collect()
+}
+
+/// Pixel coordinate as the `u16` a [`CellInstance`] stores. Terminal
+/// textures are bounded by the GPU's max texture dimension, far below
+/// `u16::MAX`; saturating keeps an absurd grid from wrapping around.
+fn px_u16(px: u32) -> u16 {
+    px.min(u16::MAX as u32) as u16
 }
 
 impl BevyTerminalBackend {
@@ -403,13 +434,13 @@ impl BevyTerminalBackend {
         self.cols = cols;
         self.rows = rows;
 
-        // A row's cached geometry was computed for the OLD grid width -
-        // row `y` may now map entirely different content (even if the
-        // corresponding ratatui cells happen to diff as "unchanged" in
-        // isolation). Clearing (rather than resizing) `dirty_rows` here
-        // means the next `draw()`'s `resize(new_height, true)` treats
-        // every row as newly added, marking all of them dirty (see
-        // IMPROVEMENT.md A2's invalidation list).
+        // A row's cached geometry was computed for the previous grid
+        // width - row `y` may map entirely different content at the new
+        // one (even if the corresponding ratatui cells happen to diff as
+        // "unchanged" in isolation). Clearing (rather than resizing)
+        // `dirty_rows` here means the next `draw()`'s
+        // `resize(new_height, true)` treats every row as newly added,
+        // marking all of them dirty.
         self.dirty_rows.clear();
         self.row_geometry.clear();
 
@@ -459,8 +490,7 @@ impl BevyTerminalBackend {
                 }
             };
 
-            // Convert tiny-skia Pixmap to Vec<u32> (RGBA8 format)
-            let bitmap = pixmap_to_rgba8(pixmap);
+            let bitmap = pixmap_coverage(&pixmap);
 
             // Create atlas key
             let key = Key {
@@ -470,8 +500,8 @@ impl BevyTerminalBackend {
             };
 
             // Get atlas slot (this allocates space in the shared atlas -
-            // shared with every other terminal using this same `Fonts`,
-            // IMPROVEMENT.md C3) and queue the bitmap for GPU upload.
+            // shared with every other terminal using this same `Fonts`)
+            // and queue the bitmap for GPU upload.
             self.fonts.with_shared_cpu_state(|shared| {
                 let rect = shared.cached.get(&key, width, height);
                 shared.pending_cache_updates.push((*rect, bitmap));
@@ -488,38 +518,26 @@ impl BevyTerminalBackend {
     }
 
     /// Build the CPU-computed draw payload for the render world to consume:
-    /// the background/foreground vertex data for whichever rows need
-    /// re-rendering, plus this backend's font identity (`font_key`, see
-    /// [`Fonts::identity`]) so the render world knows which shared
-    /// atlas/pipelines to render against (IMPROVEMENT.md C3). Called only
-    /// when the terminal is dirty (see `Tui::flush` in `setup.rs`).
+    /// the cell instances for whichever rows need re-rendering, plus this
+    /// backend's font identity (`font_key`, see [`Fonts::identity`]) so the
+    /// render world knows which shared atlas/pipelines to render against.
+    /// Called only when the terminal is dirty (see `Tui::flush`).
     ///
-    /// Phase 2 partial redraw: concatenates `row_geometry` (maintained by
-    /// `flush()`) into the payload's vertex `Vec`s, choosing between two
-    /// shapes:
-    /// - **Full** (`load_previous == false`): every row is included, no
-    ///   synthesized clear quads - the render pass uses `LoadOp::Clear`,
-    ///   which wipes the whole destination texture before drawing. Chosen
-    ///   whenever `full_redraw_needed` is set (destination texture content
-    ///   can't be trusted - see that field's doc) or every row happens to
-    ///   be dirty anyway (cheaper than synthesizing a clear quad per row).
+    /// Concatenates `row_geometry` (maintained by `flush()`), choosing
+    /// between two shapes:
+    /// - **Full** (`load_previous == false`): every row, drawn after a
+    ///   `LoadOp::Clear` to `initial_fill`. Chosen whenever
+    ///   `full_redraw_needed` is set (destination content can't be trusted)
+    ///   or every row happens to be dirty anyway.
     /// - **Partial** (`load_previous == true`): only rows in
-    ///   `rows_dirty_since_take` are included, and each such row is
-    ///   preceded by a synthesized full-row-width background quad in the
-    ///   `initial_fill` color. The render pass uses `LoadOp::Load`
-    ///   (preserving every other row's pixels already on the destination
-    ///   texture), and because the bg pipeline blends with
-    ///   `BlendState::REPLACE`, that synthesized quad is pixel-identical
-    ///   to clearing just that row - required because `shape_row` itself
-    ///   skips emitting a bg quad for any cell whose color already equals
-    ///   `initial_fill` (nothing to draw under `LoadOp::Clear`, but under
-    ///   `LoadOp::Load` a previous frame's different pixels there would
-    ///   otherwise linger).
+    ///   `rows_dirty_since_take`, each preceded by a row-clear instance (a
+    ///   full-row rectangle in `initial_fill`, glyph coverage off). The
+    ///   pass uses `LoadOp::Load`, preserving every other row; the clear
+    ///   instance resets whatever part of the row no cell instance covers
+    ///   (cells with nothing to shape emit no instance).
     ///
-    /// Glyph rasterizations are NOT part of this payload - they queue in
-    /// the shared `Fonts::with_shared_cpu_state`, keyed by font rather than
-    /// by terminal, and are drained separately (once per font per frame,
-    /// not once per terminal) via [`Self::take_shared_glyph_uploads`].
+    /// Glyph rasterizations are NOT part of this payload - see
+    /// [`Self::take_shared_glyph_uploads`].
     pub(crate) fn take_draw_payload(&mut self) -> crate::backend::TerminalDrawPayload {
         use ratatui::backend::Backend;
 
@@ -529,59 +547,64 @@ impl BevyTerminalBackend {
         });
         let height = bounds.height as usize;
 
-        // All rows dirty is cheaper handled as full (no synthesized clear
-        // quads to build). A `rows_dirty_since_take` shorter than `height`
-        // (e.g. take called before any draw at this size) never counts as
-        // "all dirty" - `full_redraw_needed` (set on every path that grows
-        // the grid) is what guarantees correctness for that case instead.
+        // All rows dirty is cheaper handled as full (no row-clear
+        // instances). A `rows_dirty_since_take` shorter than `height`
+        // (take called before any draw at this size) never counts as "all
+        // dirty" - `full_redraw_needed` (set on every path that grows the
+        // grid) is what guarantees correctness for that case instead.
         let all_dirty = height > 0
             && self.rows_dirty_since_take.len() >= height
             && self.rows_dirty_since_take[..height].iter().all(|&d| d);
         let full = self.full_redraw_needed || all_dirty;
 
-        let mut bg_vertices = Vec::new();
-        let mut text_vertices = Vec::new();
-        let row_width_px = bounds.width as f32 * self.fonts.min_width_px() as f32;
-        let cell_height_px = self.fonts.height_px() as f32;
+        let cell_width_px = self.fonts.min_width_px();
+        let cell_height_px = self.fonts.height_px();
+        let row_width_px = px_u16(bounds.width as u32 * cell_width_px);
 
-        for y in 0..height {
-            let redraw = full || self.rows_dirty_since_take.get(y).copied().unwrap_or(false);
-            if !redraw {
-                continue;
-            }
+        // `row_geometry` may not reach `y` yet if this is called before the
+        // first draw at the current size - such rows are skipped;
+        // `full_redraw_needed` guarantees that only happens while `full`,
+        // where the `LoadOp::Clear` already covers them.
+        let redraw = |y: usize| full || self.rows_dirty_since_take.get(y).copied().unwrap_or(false);
+        let rows = || {
+            (0..height)
+                .filter(|&y| redraw(y))
+                .filter_map(|y| self.row_geometry.get(y).map(|row| (y, row)))
+        };
+
+        // Sized exactly up front: one allocation, no regrowth while rows
+        // are appended.
+        let clears = if full {
+            0
+        } else {
+            (0..height).filter(|&y| redraw(y)).count()
+        };
+        let cell_count = clears + rows().map(|(_, row)| row.cells.len()).sum::<usize>();
+        let overlay_count = rows().map(|(_, row)| row.overlays.len()).sum::<usize>();
+        let mut instances = Vec::with_capacity(cell_count + overlay_count);
+
+        for y in (0..height).filter(|&y| redraw(y)) {
             if !full {
-                // Row-clear quad: TL, TR, BL, BR corner order, matching
-                // `shape_row`'s own quads - REPLACE-blended, so this is
-                // pixel-identical to clearing just this row.
-                let y0 = y as f32 * cell_height_px;
-                let y1 = y0 + cell_height_px;
-                let color = u32::from_be_bytes(self.initial_fill);
-                bg_vertices.extend_from_slice(&[
-                    TextBgVertexMember {
-                        vertex: [0.0, y0],
-                        bg_color: color,
-                    },
-                    TextBgVertexMember {
-                        vertex: [row_width_px, y0],
-                        bg_color: color,
-                    },
-                    TextBgVertexMember {
-                        vertex: [0.0, y1],
-                        bg_color: color,
-                    },
-                    TextBgVertexMember {
-                        vertex: [row_width_px, y1],
-                        bg_color: color,
-                    },
-                ]);
+                instances.push(CellInstance {
+                    rect: [
+                        0,
+                        px_u16(y as u32 * cell_height_px),
+                        row_width_px,
+                        px_u16(cell_height_px),
+                    ],
+                    uv: [0, 0],
+                    fg: [0; 4],
+                    bg: self.initial_fill,
+                });
             }
-            // `row_geometry` may not reach `y` yet if this is called before
-            // the first draw at the current size - skip; `full_redraw_needed`
-            // guarantees this only happens while `full` is true, so the
-            // `LoadOp::Clear` on an empty payload already covers it.
             if let Some(row) = self.row_geometry.get(y) {
-                bg_vertices.extend_from_slice(&row.bg_vertices);
-                text_vertices.extend_from_slice(&row.text_vertices);
+                instances.extend_from_slice(&row.cells);
+            }
+        }
+        debug_assert_eq!(instances.len(), cell_count);
+        if overlay_count > 0 {
+            for (_, row) in rows() {
+                instances.extend_from_slice(&row.overlays);
             }
         }
 
@@ -591,14 +614,28 @@ impl BevyTerminalBackend {
         self.full_redraw_needed = false;
 
         crate::backend::TerminalDrawPayload {
-            screen_width_px: bounds.width as f32 * self.fonts.min_width_px() as f32,
-            screen_height_px: bounds.height as f32 * self.fonts.height_px() as f32,
+            screen_width_px: (bounds.width as u32 * cell_width_px) as f32,
+            screen_height_px: (bounds.height as u32 * cell_height_px) as f32,
             clear_color: self.initial_fill,
             font_key: self.fonts.identity(),
             load_previous: !full,
-            bg_vertices,
-            text_vertices,
+            instances,
+            cell_count: cell_count as u32,
         }
+    }
+
+    /// Regenerates `row_geometry[y]` in place via `shape_row`, stamping it
+    /// with the atlas generation as of the end of that row's own shaping.
+    fn reshape_row(
+        &mut self,
+        y: usize,
+        width: usize,
+        shared: &mut crate::fonts::SharedFontCpuState,
+    ) {
+        let mut geometry = std::mem::take(&mut self.row_geometry[y]);
+        self.shape_row(y, width, shared, &mut geometry);
+        geometry.atlas_generation = shared.cached.generation();
+        self.row_geometry[y] = geometry;
     }
 
     /// Forces the next [`Self::take_draw_payload`] call to produce a full
@@ -611,8 +648,7 @@ impl BevyTerminalBackend {
         self.full_redraw_needed = true;
     }
 
-    /// This backend's font identity - see [`Fonts::identity`] and
-    /// IMPROVEMENT.md C3.
+    /// This backend's font identity - see [`Fonts::identity`].
     pub(crate) fn font_key(&self) -> usize {
         self.fonts.identity()
     }
@@ -627,7 +663,7 @@ impl BevyTerminalBackend {
     /// an empty result for that same font.
     pub(crate) fn take_shared_glyph_uploads(
         &self,
-    ) -> Vec<(crate::utils::text_atlas::CacheRect, Vec<u32>)> {
+    ) -> Vec<(crate::utils::text_atlas::CacheRect, Vec<u8>)> {
         self.fonts
             .with_shared_cpu_state(|shared| std::mem::take(&mut shared.pending_cache_updates))
     }
@@ -650,13 +686,12 @@ impl BevyTerminalBackend {
     /// Update fonts used by the backend.
     pub fn update_fonts(&mut self, new_fonts: Arc<Fonts>) {
         // Invalidate this backend's own caches and mark all dirty. No
-        // atlas invalidation needed here: the atlas now lives in
-        // `Fonts::with_shared_cpu_state` (IMPROVEMENT.md C3), keyed by the
-        // `Fonts` instance itself - switching to a different `Arc<Fonts>`
-        // means the next flush naturally looks up (or lazily creates) that
-        // OTHER font's own shared state, leaving whatever the old `Fonts`
-        // owned untouched (and simply dropped once its last `Arc` clone
-        // goes away, same as any other Rust value).
+        // atlas invalidation needed here: the atlas lives in
+        // `Fonts::with_shared_cpu_state`, keyed by the `Fonts` instance
+        // itself - switching to a different `Arc<Fonts>` means the next
+        // flush looks up (or lazily creates) that OTHER font's own shared
+        // state, leaving whatever the outgoing `Fonts` owned untouched
+        // (and simply dropped once its last `Arc` clone goes away).
         self.dirty_rows.clear();
         self.row_geometry.clear();
         self.rows_dirty_since_take.clear();
@@ -667,36 +702,23 @@ impl BevyTerminalBackend {
     }
 
     /// Shapes and rasterizes-as-needed a single row (index `y`, of a grid
-    /// `width` cells wide), returning its background and foreground
-    /// vertex geometry. Factored out of `flush()` so the same per-row
-    /// logic can (re)build either a freshly-dirty row or a clean row
-    /// whose cache turned out to be stale (see IMPROVEMENT.md A2) -
-    /// callers append the result to both this frame's output and this
-    /// row's `row_geometry` cache entry. An empty row (no glyphs) returns
-    /// two empty `Vec`s, which is a perfectly valid cache entry - nothing
-    /// distinguishes "cached and empty" from "never cached", since a
-    /// dirty row is always (re)shaped before ever being read as clean.
+    /// `width` cells wide) into `out`, replacing its previous contents (its
+    /// allocations are reused). Shared by `flush()`'s two passes: a
+    /// freshly-dirty row, or a clean row whose cache turned out stale. A
+    /// row with no glyphs leaves `out` empty, which is a perfectly valid
+    /// cache entry.
     fn shape_row(
         &mut self,
         y: usize,
         width: usize,
         shared: &mut crate::fonts::SharedFontCpuState,
-    ) -> (Vec<TextBgVertexMember>, Vec<TextVertexMember>) {
+        out: &mut RowGeometry,
+    ) {
         use crate::backend::c2c;
         use rustybuzz::shape_with_plan;
-        use rustybuzz::ttf_parser::GlyphId;
 
-        let mut bg_vertices = Vec::new();
-        let mut text_vertices = Vec::new();
-
-        // Packed the same way as `bg_color_u32` below - a bg quad whose
-        // color exactly matches this is redundant (IMPROVEMENT.md B3):
-        // the render pass already clears the target to `initial_fill`, so
-        // drawing an identical quad on top changes nothing. This also
-        // correctly keeps (never skips) an alpha-0 `transparent_reset_bg`
-        // quad whenever `initial_fill`'s own alpha isn't 0 - the packed
-        // values simply won't be equal in that case.
-        let initial_fill_u32 = u32::from_be_bytes(self.initial_fill);
+        out.cells.clear();
+        out.overlays.clear();
 
         let row_start = y * width;
         let row_end = (row_start + width).min(self.cells.len());
@@ -715,112 +737,123 @@ impl BevyTerminalBackend {
         }
 
         if self.row.is_empty() {
-            return (bg_vertices, text_vertices);
+            return;
         }
+        self.covered.clear();
+        self.covered.resize(row_cells.len(), false);
 
-        // One rustybuzz run per stretch of cells resolving to the same
-        // font, so each char is shaped by a font that actually has it.
-        let runs = font_runs(&self.fonts, row_cells);
+        // One run per stretch of cells resolving to the same font, so each
+        // char is shaped by a font that actually has it.
+        let runs = font_runs(&self.fonts, row_cells, &mut shared.font_choices);
 
-        // ASCII fast path (IMPROVEMENT.md A3, opt-in via the
-        // `ascii_fast_shaping` feature - compiled out entirely otherwise,
-        // and requires `bold_italic_fonts` to be off, since that feature
-        // makes per-cell font selection meaningful while this path assumes
-        // the whole row shares one font - which is also why it only runs
-        // for a row that `font_runs` resolved to a single run). Builds
-        // synthetic glyph info/position pairs straight from
-        // the font's cmap instead of invoking rustybuzz at all, then feeds
-        // them into the SAME per-glyph loop below as real shaped output -
-        // no duplication of the atlas/vertex-emission logic, so there is
-        // exactly one code path that can get that part wrong. Bails to the
-        // full shaping path (`None`) the moment any cell isn't a single
-        // ASCII printable byte or the font lacks that glyph.
+        let mut glyphs = std::mem::take(&mut self.glyphs);
+        glyphs.clear();
+
+        // ASCII fast path (opt-in via the `ascii_fast_shaping` feature -
+        // compiled out entirely otherwise, and requires `bold_italic_fonts`
+        // to be off, since that feature makes per-cell font selection
+        // meaningful while this path assumes the whole row shares one font
+        // - which is also why it only runs for a row that `font_runs`
+        // resolved to a single run). Synthesizes glyphs straight from the
+        // font's cmap instead of invoking rustybuzz, feeding the SAME
+        // per-glyph loop below as shaped output. Bails to the shaping path
+        // the moment any cell isn't a single ASCII printable byte or the
+        // font lacks that glyph.
         #[cfg(all(feature = "ascii_fast_shaping", not(feature = "bold_italic_fonts")))]
-        let fast_path: Option<(Vec<rustybuzz::GlyphInfo>, Vec<rustybuzz::GlyphPosition>)> = 'fast: {
+        let fast_path = 'fast: {
             use rustybuzz::ttf_parser::Face;
 
-            // Synthesized glyphs carry no run information - single-font
-            // rows only.
             let [run] = runs.as_slice() else {
-                break 'fast None;
+                break 'fast false;
             };
             let font = run.font;
 
-            let mut infos = Vec::with_capacity(row_cells.len());
-            let mut positions = Vec::with_capacity(row_cells.len());
             for (x, cell) in row_cells.iter().enumerate() {
                 let bytes = cell.symbol().as_bytes();
                 // Exactly one ASCII printable byte - this single check also
                 // excludes an empty symbol (NULL_CELL wide-char
                 // continuation) and any multi-byte UTF-8 grapheme cluster.
                 if bytes.len() != 1 || !(0x20..=0x7E).contains(&bytes[0]) {
-                    break 'fast None;
+                    glyphs.clear();
+                    break 'fast false;
                 }
                 let ch = bytes[0] as char;
 
-                let cache_key = (font.id(), ch);
                 let glyph_id = *self
                     .ascii_glyph_cache
-                    .entry(cache_key)
+                    .entry((font.id(), ch))
                     .or_insert_with(|| Face::glyph_index(font.font(), ch));
                 let Some(glyph_id) = glyph_id else {
-                    break 'fast None; // font lacks this glyph - defer to full shaping
+                    glyphs.clear();
+                    break 'fast false; // font lacks this glyph - defer to shaping
                 };
-
-                // Struct-literal update syntax (`..Default::default()`)
-                // isn't usable here: `GlyphInfo` has private fields not
-                // nameable from outside rustybuzz, and Rust's privacy
-                // rules block `..` on a literal that can't name every
-                // field, even though `Default` alone would fill them. Build
-                // the default first, then set only the two public fields.
-                let mut glyph_info = rustybuzz::GlyphInfo::default();
-                glyph_info.glyph_id = glyph_id.0 as u32;
-                glyph_info.cluster = x as u32;
-                infos.push(glyph_info);
-                positions.push(rustybuzz::GlyphPosition::default());
+                glyphs.push(RowGlyph {
+                    glyph_id: glyph_id.0 as u32,
+                    cluster: x as u32,
+                    x_advance: 0,
+                    x_offset: 0,
+                    run: 0,
+                });
             }
-            Some((infos, positions))
+            true
         };
         #[cfg(not(all(feature = "ascii_fast_shaping", not(feature = "bold_italic_fonts"))))]
-        let fast_path: Option<(Vec<rustybuzz::GlyphInfo>, Vec<rustybuzz::GlyphPosition>)> = None;
+        let fast_path = false;
 
-        // `glyph_runs[i]` indexes the run glyph `i` was shaped in - that
-        // run's font owns the glyph id and supplies its metrics.
-        let (infos, positions, glyph_runs) = if let Some((infos, positions)) = fast_path {
-            let glyph_runs = vec![0; infos.len()];
-            (infos, positions, glyph_runs)
-        } else {
-            let mut infos = Vec::new();
-            let mut positions = Vec::new();
-            let mut glyph_runs = Vec::new();
+        if !fast_path {
             for (run_idx, run) in runs.iter().enumerate() {
-                let mut buffer = std::mem::take(&mut self.buffer);
-                buffer.clear();
-                // Clusters stay byte offsets into the whole row - what
+                let text = &self.row[run.bytes.clone()];
+                let buffer = &mut self.buffer;
+                let plan_cache = &mut shared.plan_cache;
+                // Shaped once per distinct run text: an unchanged row whose
+                // colors moved, or content that merely scrolled to another
+                // row, is served from the cache without touching rustybuzz.
+                let shaped = shared.shape_cache.get_or_shape(run.font, text, || {
+                    let mut unicode = std::mem::take(buffer);
+                    unicode.clear();
+                    for (idx, ch) in text.char_indices() {
+                        unicode.add(ch, idx as u32);
+                    }
+                    let glyph_buffer = shape_with_plan(
+                        run.font.font(),
+                        plan_cache.get(run.font, &mut unicode),
+                        unicode,
+                    );
+                    let shaped = glyph_buffer
+                        .glyph_infos()
+                        .iter()
+                        .zip(glyph_buffer.glyph_positions())
+                        .map(|(info, pos)| crate::utils::shape_cache::ShapedGlyph {
+                            glyph_id: info.glyph_id,
+                            cluster: info.cluster,
+                            x_advance: pos.x_advance,
+                            x_offset: pos.x_offset,
+                        })
+                        .collect();
+                    *buffer = glyph_buffer.clear();
+                    shaped
+                });
+                // Clusters become byte offsets into the whole row - what
                 // `rowmap` is indexed by.
-                for (idx, ch) in self.row[run.bytes.clone()].char_indices() {
-                    buffer.add(ch, (run.bytes.start + idx) as u32);
-                }
-                let glyph_buffer = shape_with_plan(
-                    run.font.font(),
-                    shared.plan_cache.get(run.font, &mut buffer),
-                    buffer,
-                );
-                infos.extend_from_slice(glyph_buffer.glyph_infos());
-                positions.extend_from_slice(glyph_buffer.glyph_positions());
-                glyph_runs.resize(infos.len(), run_idx);
-                self.buffer = glyph_buffer.clear();
+                glyphs.extend(shaped.iter().map(|glyph| RowGlyph {
+                    glyph_id: glyph.glyph_id,
+                    cluster: run.bytes.start as u32 + glyph.cluster,
+                    x_advance: glyph.x_advance,
+                    x_offset: glyph.x_offset,
+                    run: run_idx as u16,
+                }));
             }
-            (infos, positions, glyph_runs)
-        };
+        }
+
+        let cell_width_px = self.fonts.min_width_px();
+        let cell_height_px = self.fonts.height_px();
+        let last_resort_id = self.fonts.last_resort_id();
 
         // Process shaped (or synthesized) glyphs
-        for ((info, pos), &run_idx) in infos.iter().zip(&positions).zip(&glyph_runs) {
-            let run = &runs[run_idx];
-            let metrics = run.font.font();
-            let advance_scale = self.fonts.height_px() as f32 / metrics.height() as f32;
+        for glyph in &glyphs {
+            let run = &runs[glyph.run as usize];
 
-            let cluster = info.cluster as usize;
+            let cluster = glyph.cluster as usize;
             if cluster >= self.rowmap.len() {
                 continue;
             }
@@ -831,7 +864,6 @@ impl BevyTerminalBackend {
             }
 
             let cell = &row_cells[cell_idx];
-            let _glyph_id = GlyphId(info.glyph_id as u16);
 
             let (cell_font, cell_fake_bold, cell_fake_italic) =
                 (run.font, run.fake_bold, run.fake_italic);
@@ -840,7 +872,7 @@ impl BevyTerminalBackend {
             use unicode_width::UnicodeWidthChar;
             let ch = cell.symbol().chars().next().unwrap_or(' ');
             let ch_width = ch.width().unwrap_or(1).max(1) as u32;
-            let glyph_width_px = ch_width * self.fonts.min_width_px();
+            let glyph_width_px = ch_width * cell_width_px;
 
             // Check if this character is an emoji
             #[cfg(feature = "emoji")]
@@ -876,19 +908,17 @@ impl BevyTerminalBackend {
                 Key {
                     style,
                     glyph: ch as u32,
-                    font: self.fonts.last_resort_id(),
+                    font: last_resort_id,
                 }
             } else {
                 Key {
                     style,
-                    glyph: info.glyph_id,
+                    glyph: glyph.glyph_id,
                     font: cell_font.id(),
                 }
             };
 
-            let cached = shared
-                .cached
-                .get(&key, glyph_width_px, self.fonts.height_px());
+            let cached = shared.cached.get(&key, glyph_width_px, cell_height_px);
 
             // If not cached, render the glyph
             if !cached.cached() {
@@ -897,10 +927,11 @@ impl BevyTerminalBackend {
                     use crate::backend::programmatic_glyphs::render_programmatic_glyph;
 
                     if let Some(pixmap) =
-                        render_programmatic_glyph(ch, glyph_width_px, self.fonts.height_px())
+                        render_programmatic_glyph(ch, glyph_width_px, cell_height_px)
                     {
-                        let bitmap = pixmap_to_rgba8(pixmap);
-                        shared.pending_cache_updates.push((*cached, bitmap));
+                        shared
+                            .pending_cache_updates
+                            .push((*cached, pixmap_coverage(&pixmap)));
                     } else {
                         tracing::warn!(
                             "Failed to render programmatic glyph '{}' (U+{:04X})",
@@ -909,11 +940,18 @@ impl BevyTerminalBackend {
                         );
                     }
                 } else {
-                    let fit_x =
-                        fit_to_cells(pos.x_advance as f32 * advance_scale, glyph_width_px as f32);
+                    let metrics = cell_font.font();
+                    let advance_scale = cell_height_px as f32 / metrics.height() as f32;
+                    let fit_x = fit_to_cells(
+                        glyph.x_advance as f32 * advance_scale,
+                        glyph_width_px as f32,
+                    );
 
                     // Calculate glyph bearing offset to apply during rasterization
-                    let bearing_offset_x = pos.x_offset as f32 * advance_scale * fit_x;
+                    let bearing_offset_x = glyph.x_offset as f32 * advance_scale * fit_x;
+
+                    let mut info = rustybuzz::GlyphInfo::default();
+                    info.glyph_id = glyph.glyph_id;
 
                     // Don't apply fake styling to emoji characters to avoid distortion
                     let final_fake_italic = cell_fake_italic && !is_emoji;
@@ -922,7 +960,7 @@ impl BevyTerminalBackend {
                     let (rect, image) = rasterize_glyph(
                         cached,
                         metrics,
-                        info,
+                        &info,
                         final_fake_italic, // Don't distort emoji
                         final_fake_bold,   // Don't distort emoji
                         advance_scale,
@@ -931,13 +969,11 @@ impl BevyTerminalBackend {
                         fit_x,
                     );
 
-                    shared.pending_cache_updates.push((rect, image));
+                    shared
+                        .pending_cache_updates
+                        .push((rect, glyph_coverage(&image)));
                 }
             }
-
-            // Calculate screen position - align to cell grid since offset is already in atlas
-            let screen_x = cell_idx as f32 * self.fonts.min_width_px() as f32;
-            let screen_y = y as f32 * self.fonts.height_px() as f32;
 
             // Get colors
             let reverse = cell.modifier.contains(ratatui::style::Modifier::REVERSED);
@@ -948,98 +984,46 @@ impl BevyTerminalBackend {
             // the "this cell has no explicit background" information
             // `transparent_reset_bg` needs.
             let bg_source = if reverse { cell.fg } else { cell.bg };
-            let bg_color = if reverse {
+            let [bg_r, bg_g, bg_b] = if reverse {
                 c2c(cell.fg, self.reset_fg)
             } else {
                 c2c(cell.bg, self.reset_bg)
             };
-            let fg_color = if reverse {
+            let [fg_r, fg_g, fg_b] = if reverse {
                 c2c(cell.bg, self.reset_bg)
             } else {
                 c2c(cell.fg, self.reset_fg)
             };
-
             let bg_alpha =
                 if self.transparent_reset_bg && matches!(bg_source, ratatui::style::Color::Reset) {
                     0
                 } else {
                     255
                 };
-            let [r, g, b] = bg_color;
-            let bg_color_u32 = u32::from_be_bytes([r, g, b, bg_alpha]);
 
-            let [r, g, b] = fg_color;
-            let fg_color_u32 = u32::from_be_bytes([r, g, b, 255]);
-
-            // Render at actual glyph width (no compression)
-            let render_width_px = glyph_width_px as f32;
-
-            // Background vertices - skipped when this cell's background
-            // exactly matches the render pass's own clear color (see
-            // `initial_fill_u32` above); the fg (text) quad below is
-            // unaffected, so bg/fg quad counts intentionally diverge here.
-            if bg_color_u32 != initial_fill_u32 {
-                bg_vertices.push(TextBgVertexMember {
-                    vertex: [screen_x, screen_y],
-                    bg_color: bg_color_u32,
-                });
-                bg_vertices.push(TextBgVertexMember {
-                    vertex: [screen_x + render_width_px, screen_y],
-                    bg_color: bg_color_u32,
-                });
-                bg_vertices.push(TextBgVertexMember {
-                    vertex: [screen_x, screen_y + self.fonts.height_px() as f32],
-                    bg_color: bg_color_u32,
-                });
-                bg_vertices.push(TextBgVertexMember {
-                    vertex: [
-                        screen_x + render_width_px,
-                        screen_y + self.fonts.height_px() as f32,
-                    ],
-                    bg_color: bg_color_u32,
-                });
-            }
-
-            // Text vertices - 1:1 mapping between atlas and screen
-            let uv_x = cached.x as f32;
-            let uv_y = cached.y as f32;
-            let uv_w = cached.width as f32; // Matches glyph_width_px
-            let uv_h = cached.height as f32;
-
-            text_vertices.push(TextVertexMember {
-                vertex: [screen_x, screen_y],
-                uv: [uv_x, uv_y],
-                fg_color: fg_color_u32,
-                underline_pos: 0,
-                underline_color: fg_color_u32,
-            });
-            text_vertices.push(TextVertexMember {
-                vertex: [screen_x + render_width_px, screen_y],
-                uv: [uv_x + uv_w, uv_y],
-                fg_color: fg_color_u32,
-                underline_pos: 0,
-                underline_color: fg_color_u32,
-            });
-            text_vertices.push(TextVertexMember {
-                vertex: [screen_x, screen_y + self.fonts.height_px() as f32],
-                uv: [uv_x, uv_y + uv_h],
-                fg_color: fg_color_u32,
-                underline_pos: 0,
-                underline_color: fg_color_u32,
-            });
-            text_vertices.push(TextVertexMember {
-                vertex: [
-                    screen_x + render_width_px,
-                    screen_y + self.fonts.height_px() as f32,
+            // Aligned to the cell grid (the glyph's bearing is already
+            // baked into its atlas slot), sampled 1:1 from the atlas.
+            let instance = CellInstance {
+                rect: [
+                    px_u16(cell_idx as u32 * cell_width_px),
+                    px_u16(y as u32 * cell_height_px),
+                    px_u16(glyph_width_px),
+                    px_u16(cell_height_px),
                 ],
-                uv: [uv_x + uv_w, uv_y + uv_h],
-                fg_color: fg_color_u32,
-                underline_pos: 0,
-                underline_color: fg_color_u32,
-            });
+                uv: [px_u16(cached.x), px_u16(cached.y)],
+                fg: [fg_r, fg_g, fg_b, 255],
+                bg: [bg_r, bg_g, bg_b, bg_alpha],
+            };
+            // The first glyph of a cell writes the whole cell (background
+            // included); any further glyph there is blended on top.
+            if std::mem::replace(&mut self.covered[cell_idx], true) {
+                out.overlays.push(instance);
+            } else {
+                out.cells.push(instance);
+            }
         }
 
-        (bg_vertices, text_vertices)
+        self.glyphs = glyphs;
     }
 }
 
@@ -1159,15 +1143,14 @@ impl ratatui::backend::Backend for BevyTerminalBackend {
         })
     }
 
-    /// Maintain the per-row geometry cache for GPU rendering (IMPROVEMENT.md
-    /// A2) and accumulate which rows need re-rendering
-    /// (`rows_dirty_since_take` - Phase 2 partial redraw). Concatenating
-    /// `row_geometry` into an actual draw payload - deciding full vs.
-    /// partial, synthesizing row-clear quads - happens later, in
-    /// `take_draw_payload`; this method only keeps `row_geometry` correct
-    /// and notes which rows changed.
+    /// Maintain the per-row geometry cache for GPU rendering and
+    /// accumulate which rows need re-rendering (`rows_dirty_since_take`,
+    /// for partial redraw). Concatenating `row_geometry` into an actual
+    /// draw payload - deciding full vs. partial, adding row-clear
+    /// instances - happens later, in `take_draw_payload`; this method only
+    /// keeps `row_geometry` correct and notes which rows changed.
     ///
-    /// Two-pass, row-incremental design (IMPROVEMENT.md A2):
+    /// Row-incremental, in two steps:
     /// 1. Regenerate every row `dirty_rows` says actually changed, via
     ///    `shape_row`, storing each row's geometry into
     ///    `row_geometry[y]` stamped with the atlas generation as of that
@@ -1175,11 +1158,10 @@ impl ratatui::backend::Backend for BevyTerminalBackend {
     /// 2. For every remaining (clean) row, reuse its cached geometry
     ///    verbatim - UNLESS shaping this frame's dirty rows evicted
     ///    anything from the glyph atlas (`Atlas::generation()` advanced
-    ///    since this flush started), in which case a cached row's UVs
-    ///    might now point at a reassigned slot, so it is reshaped too,
+    ///    since this flush started), in which case a cached row's atlas
+    ///    rects might point at a reassigned slot, so it is reshaped too,
     ///    this once. This is a graceful-degradation path: it only engages
-    ///    under atlas pressure, at the same per-frame cost the pre-A2 code
-    ///    always paid every frame. Rows reshaped here are NOT added to
+    ///    under atlas pressure. Rows reshaped here are NOT added to
     ///    `rows_dirty_since_take` - eviction only invalidates a row's
     ///    cached UVs for a FUTURE redraw of that row; the pixels already
     ///    rendered to the destination texture from its last actual redraw
@@ -1187,16 +1169,12 @@ impl ratatui::backend::Backend for BevyTerminalBackend {
     ///
     /// A cached row is trustworthy only while nothing has reassigned an
     /// atlas slot since it was recorded: `Atlas::get`'s eviction branch
-    /// bumps `Atlas`'s generation counter, and `evictor::Lru::get` marks
-    /// an entry "recently used" on every cache hit - so any row processed
-    /// THIS flush (dirty, or reshaped here in pass 2) has its glyphs
-    /// protected from eviction by later rows in the same flush; a row
-    /// that stays cache-hit throughout is the one at risk, which is
-    /// exactly what the generation check guards against.
-    ///
-    /// No index buffer is generated here - quad indices are a pure function
-    /// of vertex count, derived in the render world (`TerminalGpuState` in
-    /// `backend/mod.rs`) from a static, grow-only index buffer instead.
+    /// bumps `Atlas`'s generation counter. Every glyph a row looks up is
+    /// stamped as used by the current flush (`Atlas::begin_flush`), and an
+    /// eviction only takes such a slot once nothing else is left - so rows
+    /// processed THIS flush keep their glyphs; a clean row whose glyphs
+    /// weren't looked up is the one at risk, which is exactly what the
+    /// generation check guards against.
     ///
     /// Pending glyph rasterizations are stored in `pending_cache_updates` and will be
     /// uploaded to the GPU texture by the render world (see `take_draw_payload`).
@@ -1223,12 +1201,12 @@ impl ratatui::backend::Backend for BevyTerminalBackend {
         let height = bounds.height as usize;
 
         // `pending_cache_updates` must NOT be cleared here: its entries are
-        // one-shot atlas uploads for slots the `Atlas` LRU already
-        // considers cached, queued by a *previous* flush (or by
+        // one-shot atlas uploads for slots the `Atlas` already considers
+        // cached, queued by a *previous* flush (or by
         // `populate_programmatic_glyphs` at creation) and not yet drained
         // by `take_draw_payload`. Clearing them here destroys the only
         // copy of those glyphs' pixels - the glyph is never re-rasterized
-        // (the LRU says it's cached) and its slot stays garbage forever,
+        // (the atlas says it's cached) and its slot stays garbage forever,
         // i.e. permanently invisible characters. This is exactly what
         // happens when `Terminal::draw` runs more than once between
         // payload-takes: creation-time populate + a setup-time initial
@@ -1258,10 +1236,13 @@ impl ratatui::backend::Backend for BevyTerminalBackend {
         // an independent `&mut self` for `self.shape_row(...)` - `self.fonts`
         // itself can't be borrowed for the `with_shared_cpu_state` receiver
         // while a closure captures all of `self` mutably for the `shape_row`
-        // calls (IMPROVEMENT.md C3: the atlas/plan cache live in `Fonts`,
-        // shared by every terminal using the same `Arc<Fonts>`).
+        // calls (the atlas/plan cache live in `Fonts`, shared by every
+        // terminal using the same `Arc<Fonts>`).
         let fonts = Arc::clone(&self.fonts);
         fonts.with_shared_cpu_state(|shared| {
+            // Every glyph looked up from here on is stamped as in use by
+            // this flush - the last thing an atlas eviction will pick.
+            shared.cached.begin_flush();
             let generation_before_flush = shared.cached.generation();
 
             // Pass 1: regenerate every row that actually changed.
@@ -1269,12 +1250,7 @@ impl ratatui::backend::Backend for BevyTerminalBackend {
                 if !dirty {
                     continue;
                 }
-                let (bg_vertices, text_vertices) = self.shape_row(y, width, shared);
-                self.row_geometry[y] = RowGeometry {
-                    bg_vertices,
-                    text_vertices,
-                    atlas_generation: shared.cached.generation(),
-                };
+                self.reshape_row(y, width, shared);
                 self.dirty_rows[y] = false;
             }
 
@@ -1297,12 +1273,7 @@ impl ratatui::backend::Backend for BevyTerminalBackend {
                     continue;
                 }
 
-                let (bg_vertices, text_vertices) = self.shape_row(y, width, shared);
-                self.row_geometry[y] = RowGeometry {
-                    bg_vertices,
-                    text_vertices,
-                    atlas_generation: shared.cached.generation(),
-                };
+                self.reshape_row(y, width, shared);
             }
         });
 
@@ -1313,17 +1284,16 @@ impl ratatui::backend::Backend for BevyTerminalBackend {
         &mut self,
         _clear_type: ratatui::backend::ClearType,
     ) -> Result<(), Self::Error> {
-        // For now, just delegate to clear() for all clear types
+        // Every clear type clears the whole terminal.
         self.clear()
     }
 }
 
 // ============================================================================
-// Test: cell-level transparency (P2-2). Pure CPU - drives ratatui's
-// `Backend::draw()` directly and inspects the packed vertex color, no
-// GPU/App needed. `bg_color`'s alpha byte is what `composite_bg.wgsl`
-// outputs unmodified (`BlendState::REPLACE`), so this is the whole story:
-// no shader/pipeline test is needed on top of this.
+// Test: cell-level transparency. Pure CPU - drives ratatui's
+// `Backend::draw()` directly and inspects `CellInstance::bg`, no GPU/App
+// needed: the cell pipeline writes that RGBA as-is wherever the glyph has
+// no coverage (`BlendState::REPLACE`).
 // ============================================================================
 
 #[cfg(test)]
@@ -1363,32 +1333,24 @@ mod tests {
         RatatuiBackend::flush(&mut backend).expect("flush failed");
         let payload = backend.take_draw_payload();
 
-        // First-ever take on this backend is always full (no synthesized
-        // row-clear quad), so this is exactly one quad per cell.
+        // First-ever take on this backend is always full (no row-clear
+        // instance), so this is exactly one instance per cell.
         assert!(
             payload.is_full(),
             "the first take on a fresh backend must be full"
         );
+        assert_eq!(payload.cells().len(), 2, "one instance per cell, 2 cells");
         assert_eq!(
-            payload.bg_vertices.len(),
-            8,
-            "one quad (4 vertices) per cell, 2 cells"
+            payload.cells()[0].bg[3],
+            0,
+            "a Color::Reset background must carry alpha 0 when \
+             transparent_reset_bg is enabled"
         );
-        for vertex in &payload.bg_vertices[0..4] {
-            assert_eq!(
-                vertex.bg_color & 0xFF,
-                0,
-                "a Color::Reset background must pack alpha 0 when \
-                 transparent_reset_bg is enabled"
-            );
-        }
-        for vertex in &payload.bg_vertices[4..8] {
-            assert_eq!(
-                vertex.bg_color & 0xFF,
-                255,
-                "an explicit background color must stay fully opaque"
-            );
-        }
+        assert_eq!(
+            payload.cells()[1].bg,
+            [10, 20, 30, 255],
+            "an explicit background color must stay fully opaque"
+        );
     }
 
     #[test]
@@ -1396,11 +1358,6 @@ mod tests {
         let mut backend = TerminalBuilder::new(test_fonts())
             .with_dimensions(1, 1)
             .with_transparent_reset_bg(false) // the default
-            // A `reset_bg` distinct from the default `initial_fill` (opaque
-            // black) - otherwise this cell's resolved background exactly
-            // matches the render pass's own clear color and B3's redundant-
-            // quad skip (IMPROVEMENT.md B3) correctly omits it entirely,
-            // which would starve this test of the vertices it inspects.
             .with_reset_bg([10, 20, 30])
             .build();
 
@@ -1413,16 +1370,13 @@ mod tests {
         RatatuiBackend::flush(&mut backend).expect("flush failed");
         let payload = backend.take_draw_payload();
 
-        assert!(
-            !payload.bg_vertices.is_empty(),
-            "flush must generate vertices"
-        );
-        for vertex in &payload.bg_vertices {
+        assert!(!payload.cells().is_empty(), "flush must generate instances");
+        for cell in payload.cells() {
             assert_eq!(
-                vertex.bg_color & 0xFF,
-                255,
+                cell.bg,
+                [10, 20, 30, 255],
                 "without transparent_reset_bg, Reset backgrounds render \
-                 opaque (using reset_bg), matching pre-P2-2 behavior"
+                 opaque (using reset_bg)"
             );
         }
     }
@@ -1447,21 +1401,17 @@ mod tests {
         RatatuiBackend::flush(&mut backend).expect("flush failed");
         let payload = backend.take_draw_payload();
 
-        assert!(
-            !payload.bg_vertices.is_empty(),
-            "flush must generate vertices"
-        );
-        for vertex in &payload.bg_vertices {
+        assert!(!payload.cells().is_empty(), "flush must generate instances");
+        for cell in payload.cells() {
             assert_eq!(
-                vertex.bg_color & 0xFF,
-                0,
+                cell.bg[3], 0,
                 "reversed cell.fg == Reset must still zero the background alpha"
             );
         }
     }
 
     // ========================================================================
-    // Test: A1 - flush() early-out on an unchanged frame (IMPROVEMENT.md A1).
+    // Test: flush() early-out on an unchanged frame.
     // ========================================================================
 
     #[test]
@@ -1475,13 +1425,13 @@ mod tests {
         cell.bg = Color::Rgb(10, 20, 30);
 
         // First draw: content changes (empty -> "a"), so this flush must do
-        // real work and produce vertices.
+        // real work and produce instances.
         RatatuiBackend::draw(&mut backend, [(0u16, 0u16, &cell)].into_iter()).expect("draw failed");
         RatatuiBackend::flush(&mut backend).expect("flush failed");
         let payload = backend.take_draw_payload();
         assert!(
-            !payload.bg_vertices.is_empty(),
-            "first draw onto an empty buffer must generate vertices"
+            !payload.cells().is_empty(),
+            "first draw onto an empty buffer must generate instances"
         );
 
         // Second draw: byte-identical content. Note ratatui's own
@@ -1501,23 +1451,16 @@ mod tests {
 
         let payload = backend.take_draw_payload();
         assert!(
-            payload.bg_vertices.is_empty(),
-            "flush must skip regenerating bg vertices for an unchanged frame"
-        );
-        assert!(
-            payload.text_vertices.is_empty(),
-            "flush must skip regenerating text vertices for an unchanged frame"
+            payload.cells().is_empty() && payload.overlays().is_empty(),
+            "flush must skip regenerating instances for an unchanged frame"
         );
     }
 
     // ========================================================================
-    // Test: A2 - row-incremental flush (IMPROVEMENT.md A2). Vertex order
-    // is not part of the contract (two-pass processing visits rows in a
-    // different order than a straight 0..height scan - see the doc
-    // comment on `flush`), so vertices are compared as an order-independent
-    // multiset via their raw bytes (`TextBgVertexMember`/`TextVertexMember`
-    // are `bytemuck::Pod`, so this is a byte-exact comparison, not a
-    // fuzzy one).
+    // Test: row-incremental flush. Instance order within a row is not part
+    // of the contract, so instances are compared as an order-independent
+    // multiset via their raw bytes (`CellInstance` is `bytemuck::Pod`, so
+    // this is a byte-exact comparison, not a fuzzy one).
     // ========================================================================
 
     fn sorted_bytes<T: bytemuck::Pod>(items: &[T]) -> Vec<Vec<u8>> {
@@ -1578,12 +1521,12 @@ mod tests {
             .expect("draw failed");
         RatatuiBackend::flush(&mut backend).expect("flush failed");
 
-        // Snapshot the row cache produced incrementally. `row_geometry` -
-        // what IMPROVEMENT.md A2 caches - is what this test verifies;
-        // `take_draw_payload`'s full/partial concatenation and row-clear-quad
-        // synthesis (Phase 2) are orthogonal to row-cache correctness, so
-        // comparing `row_geometry` directly (rather than a concatenated
-        // payload) keeps this test decoupled from that later concern.
+        // Snapshot the row cache produced incrementally. `row_geometry` is
+        // what this test verifies; `take_draw_payload`'s full/partial
+        // concatenation and row-clear instances are orthogonal to
+        // row-cache correctness, so comparing `row_geometry` directly
+        // (rather than a concatenated payload) keeps this test decoupled
+        // from that concern.
         let incremental_rows: Vec<RowGeometry> = backend.row_geometry.clone();
         let _ = backend.take_draw_payload();
 
@@ -1591,7 +1534,7 @@ mod tests {
         // backend. "A", "B", "Z", "D" are all already in the atlas from
         // the two flushes above, so this introduces no new glyphs and
         // therefore no new allocations - `Atlas::get` hits the existing
-        // LRU entries and returns the SAME UV rects it already handed out,
+        // entries and returns the SAME atlas rects it already handed out,
         // making this a true apples-to-apples comparison against the
         // incremental flush above.
         backend
@@ -1607,22 +1550,22 @@ mod tests {
             .enumerate()
         {
             assert_eq!(
-                sorted_bytes(&incremental.bg_vertices),
-                sorted_bytes(&reshaped.bg_vertices),
-                "row {y} bg vertices from an incremental (row-cached) flush must \
+                sorted_bytes(&incremental.cells),
+                sorted_bytes(&reshaped.cells),
+                "row {y} cell instances from an incremental (row-cached) flush must \
                  match a full reshape of the same content on the same atlas state"
             );
             assert_eq!(
-                sorted_bytes(&incremental.text_vertices),
-                sorted_bytes(&reshaped.text_vertices),
-                "row {y} text vertices from an incremental (row-cached) flush must \
+                sorted_bytes(&incremental.overlays),
+                sorted_bytes(&reshaped.overlays),
+                "row {y} overlay instances from an incremental (row-cached) flush must \
                  match a full reshape of the same content on the same atlas state"
             );
         }
     }
 
     // ========================================================================
-    // Phase 2 tests: partial redraw (full vs. dirty-rows-only payloads).
+    // Tests: partial redraw (full vs. dirty-rows-only payloads).
     // ========================================================================
 
     #[test]
@@ -1685,29 +1628,26 @@ mod tests {
             "a single-row change must take a partial payload"
         );
 
-        let cell_height_px = backend.fonts.height_px() as f32;
-        let y0 = 1.0 * cell_height_px;
-        let y1 = 2.0 * cell_height_px;
-        let expected_color = u32::from_be_bytes(backend.initial_fill);
+        let cell_width_px = backend.fonts.min_width_px() as u16;
+        let cell_height_px = backend.fonts.height_px() as u16;
 
-        // The first 4 vertices are the synthesized row-clear quad for row 1
-        // (TL, TR, BL, BR), in the `initial_fill` color.
-        assert_eq!(payload.bg_vertices[0].vertex, [0.0, y0]);
-        assert_eq!(payload.bg_vertices[1].vertex[1], y0);
-        assert_eq!(payload.bg_vertices[2].vertex, [0.0, y1]);
-        assert_eq!(payload.bg_vertices[3].vertex[1], y1);
-        for vertex in &payload.bg_vertices[0..4] {
-            assert_eq!(vertex.bg_color, expected_color);
-        }
+        // The first instance is the row-clear rectangle for row 1: the
+        // whole row, in the `initial_fill` color, glyph coverage off.
+        let clear = payload.cells()[0];
+        assert_eq!(
+            clear.rect,
+            [0, cell_height_px, cell_width_px, cell_height_px]
+        );
+        assert_eq!(clear.bg, backend.initial_fill);
+        assert_eq!(clear.fg[3], 0, "a row-clear instance must not draw a glyph");
 
-        // No vertex (row-clear quad or actual glyph/bg content) may lie
-        // outside row 1's pixel span - partial redraw must not touch rows
-        // it didn't mark dirty.
-        for vertex in &payload.bg_vertices {
-            assert!(vertex.vertex[1] >= y0 && vertex.vertex[1] <= y1);
-        }
-        for vertex in &payload.text_vertices {
-            assert!(vertex.vertex[1] >= y0 && vertex.vertex[1] <= y1);
+        // No instance (row clear or actual content) may lie outside row
+        // 1's pixel span - partial redraw must not touch rows it didn't
+        // mark dirty.
+        assert_eq!(payload.cells().len(), 2, "row clear + the one changed cell");
+        for instance in payload.cells().iter().chain(payload.overlays()) {
+            assert_eq!(instance.rect[1], cell_height_px);
+            assert_eq!(instance.rect[3], cell_height_px);
         }
     }
 
@@ -1743,9 +1683,9 @@ mod tests {
 
         assert!(!payload.is_full());
         assert_eq!(
-            payload.bg_vertices[0].bg_color & 0xFF,
+            payload.cells()[0].bg[3],
             0,
-            "the synthesized row-clear quad must carry initial_fill's alpha (0), \
+            "the row-clear instance must carry initial_fill's alpha (0), \
              matching what a LoadOp::Clear(initial_fill) would have produced"
         );
     }
@@ -1819,7 +1759,7 @@ mod tests {
         let _ = backend.take_draw_payload(); // consume the initial full take
 
         // Change every row - `all_dirty` should route this back through the
-        // full path (cheaper than synthesizing a clear quad per row), even
+        // full path (cheaper than a row-clear instance per row), even
         // though `full_redraw_needed` is false at this point.
         let row_a2 = cell_with_symbol("C");
         let row_b2 = cell_with_symbol("D");

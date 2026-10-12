@@ -170,22 +170,16 @@ mod boot_status {
     /// - Stage 2: the CRT material landed on the monitor mesh. Landing does
     ///   NOT mean the mesh renders yet: bevy skips a mesh whose specialized
     ///   pipeline isn't compiled, and `CrtMaterial`'s pipeline can't even
-    ///   start compiling until `crt_extended.wgsl` finishes loading over
+    ///   start compiling until `crt_extended.wesl` finishes loading over
     ///   HTTP.
     /// - Stage 3: hold for a fixed `GRACE_PERIOD_SECONDS` after the material
     ///   landed, then send "ready" - index.html removes the overlay.
     ///
-    ///   An earlier version of this stage waited for a render-world pipeline
-    ///   cache counter to read zero instead of a fixed delay, to close the
-    ///   overlay exactly when the CRT screen's own pipeline finished
-    ///   compiling rather than guessing. That counted the ENTIRE
-    ///   `PipelineCache`, though, not just the CRT screen's pipeline - and
-    ///   in this scene (auto-orbit camera, moving shadows) something else
-    ///   keeps getting re-specialized every frame, so the global count
-    ///   never reliably reached zero. Confirmed in testing: the CRT screen
-    ///   was already rendering correctly while the overlay lingered for the
-    ///   full fallback timeout regardless. A plain fixed delay is both
-    ///   simpler and - per that same testing - actually more accurate here.
+    ///   A fixed delay rather than waiting for the render world's
+    ///   `PipelineCache` to report nothing pending: that count covers
+    ///   every pipeline, not just the CRT screen's, and in this scene
+    ///   (auto-orbit camera, moving shadows) something else is
+    ///   re-specialized every frame, so it never reliably reaches zero.
     fn report_boot_status(
         scene_spawned: Query<(), Added<WorldAssetRoot>>,
         crt_material_added: Query<(), Added<MeshMaterial3d<CrtMaterial>>>,
@@ -256,15 +250,14 @@ mod boot_status {
 // (also in retro_crt.rs) caps `max_texture_dimension_2d` at 2048 - on a
 // HiDPI/Retina display (e.g. Apple Silicon Macs) even a modest ~1160
 // CSS-px-wide browser window already produces a >2048 PHYSICAL-pixel
-// surface, which fails `Surface::configure`'s validation and - per bevy
-// 0.19's fatal render-error policy - silently quits the app to a black
-// screen (observed on macOS Brave: "Requested was (2312, 810), maximum
-// extent for either dimension is 2048").
+// surface, which fails `Surface::configure`'s validation and - per bevy's
+// fatal render-error policy - silently quits the app to a black screen
+// ("Requested was (2312, 810), maximum extent for either dimension is
+// 2048").
 //
-// An earlier version of this function tried to fix that by overriding
-// `window.devicePixelRatio` to always read `1.0` (same DOM-spoofing trick as
-// `suppress_canvas_escape_key` below). That does NOT work: winit's actual
-// resize/scale detection (see
+// Overriding `window.devicePixelRatio` to read `1.0` (the DOM-spoofing
+// trick `suppress_canvas_escape_key` below uses) does NOT fix that: winit's
+// actual resize/scale detection (see
 // `winit::platform_impl::web::web_sys::resize_scaling::ResizeScaleInternal`)
 // watches the canvas with a `ResizeObserver` requesting
 // `ResizeObserverBoxOptions::DevicePixelContentBox` wherever the browser
@@ -272,12 +265,10 @@ mod boot_status {
 // lacks it) - that API reports the browser's own device-pixel measurement
 // of the canvas's box directly from the compositor, which is NOT the same
 // thing as the JS-visible `devicePixelRatio` property and can't be spoofed
-// by redefining it (verified: overriding the property to `2` on a real
-// devicePixelRatio-1 display left the canvas's actual backing-buffer width
-// completely unaffected).
+// by redefining it.
 //
 // The only thing that actually changes what `ResizeObserver` reports is the
-// canvas's own CSS layout box, so this instead reads the REAL (unspoofed)
+// canvas's own CSS layout box, so this reads the real
 // `devicePixelRatio` and clamps the canvas's CSS size with `max-width`/
 // `max-height` such that `css_size * devicePixelRatio` never exceeds 2048 -
 // CSS `max-width` wins over whatever width winit's `fit_canvas_to_parent`
@@ -294,7 +285,7 @@ mod boot_status {
 // tip the surface past 2048, whose Surface::configure validation
 // failure leaves the surface unconfigured and the next
 // get_current_texture panics ("Surface is not configured for
-// presentation" - observed on iPhone Safari). 16 physical px of margin
+// presentation", e.g. on iPhone Safari). 16 physical px of margin
 // costs nothing visible and absorbs any such off-by-a-few measurement.
 // Shared by both clamps below: the CSS ceiling on the live canvas and the
 // pre-`run()` clamp of bevy's initial `WindowResolution`.
@@ -326,12 +317,12 @@ fn clamp_canvas_to_safe_texture_size() {
 // (winit's web backend never measures the canvas at creation - its cached
 // size starts at 0x0 until the observer fires). `bevy_winit` hands
 // retro_crt.rs's `WindowResolution::new(1024, 768)` to winit as a *logical*
-// size (bevy_winit-0.19.0/src/winit_windows.rs:114-119 - no scale-factor
+// size (bevy_winit's `winit_windows.rs` - no scale-factor
 // override set, and the stored scale factor is still 1.0 at creation), the
 // browser multiplies by the real devicePixelRatio, and the first
 // `Surface::configure` requests 1024x768 x DPR - on an iPhone (DPR 3)
 // that's 3072x2304, over the WebGL2-priority 2048 ceiling. The configure
-// fails (bevy 0.19 catches it as a render error), the surface stays
+// fails (bevy catches it as a render error), the surface stays
 // unconfigured, and the very next `get_current_texture` panics - all
 // before `fit_canvas_to_parent` or the CSS clamp above ever get to correct
 // the size. (DPR-2 desktop displays squeaked through by luck: 1024 x 2 =

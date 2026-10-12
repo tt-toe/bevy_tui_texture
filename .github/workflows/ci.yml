@@ -13,8 +13,8 @@ jobs:
   # a stock runner (winit's x11 backend, ALSA/udev pulled in transitively
   # even though this crate never uses audio/gamepad) - and a software
   # Vulkan implementation (lavapipe, via mesa-vulkan-drivers) so wgpu can
-  # get a real (if slow) adapter. Without it, the one GPU-backed test
-  # (`flush_renders_drawn_content_synchronously`) would fall back to its
+  # get a real (if slow) adapter. Without it, the GPU-backed tests
+  # (`tui_flush_tests` in src/setup.rs) would fall back to their
   # "no adapter" skip path instead of actually running. libfontconfig1-dev
   # is needed only by jobs that build dev-dependencies (--all-targets /
   # examples): font-kit (a non-wasm dev-dependency used by some examples
@@ -75,7 +75,7 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
-  # P0-1's feature matrix: the 2d/3d split must each build independently,
+  # Feature matrix: the 2d/3d split must each build independently,
   # and the crate must build with no display surface at all.
   feature-matrix:
     name: cargo check (${{ matrix.features }})

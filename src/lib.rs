@@ -6,7 +6,7 @@
 //!
 //! | bevy | ratatui | wgpu | bevy_tui_texture |
 //! |------|---------|------|------------------|
-//! | 0.19 | 0.30.2  | 29   | 0.3              |
+//! | 0.20 | 0.30.2  | 30   | 0.4              |
 //!
 //! The `wgpu` dependency version must exactly match the one pinned inside
 //! this bevy version - see the comment above the `wgpu` dependency in
@@ -220,10 +220,8 @@ pub use setup::{HitRegions, TerminalConfig, Tui, TuiFontSource, TuiKind, TuiRequ
 
 // Error types
 
-/// Errors that can occur creating or operating a terminal. Replaces the
-/// previous `Result<_, String>` used throughout `setup`/`backend` - callers
-/// can now match on a specific variant or chain `source()` instead of
-/// parsing a message string.
+/// Errors that can occur creating or operating a terminal. Callers can
+/// match on a specific variant or chain `source()`.
 #[derive(thiserror::Error, Debug)]
 pub enum TerminalError {
     /// ratatui's own `Terminal::new()` failed.

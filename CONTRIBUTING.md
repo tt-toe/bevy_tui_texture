@@ -25,7 +25,7 @@ Thank you for your interest in contributing to bevy_tui_texture! This document p
 
 ### Prerequisites
 
-- Rust 1.96 or later (2024 edition)
+- Rust 1.97.1 or later (2024 edition)
 - A GPU with WGPU support
 - Basic familiarity with Bevy, ratatui, and WGPU
 
@@ -223,8 +223,9 @@ bevy_tui_texture/
 │   │   └── ray.rs          # 3D mouse raycasting (feature `3d`)
 │   └── utils/
 │       ├── mod.rs          # Shared small utilities (outline geometry, ...)
-│       ├── text_atlas.rs   # GPU glyph cache (LRU-evicted)
-│       └── plan_cache.rs   # Text shaping cache
+│       ├── text_atlas.rs   # Glyph atlas slot index (epoch-stamped, clock eviction)
+│       ├── shape_cache.rs  # Shaped-run cache + per-cell font-choice cache
+│       └── plan_cache.rs   # rustybuzz shape-plan cache
 └── examples/               # Example applications, one per feature area (see README.md)
     ├── assets/             # Fonts, glTF model, shaders (shared by native + wasm)
     └── web/                # WASM demo site (index.html, generated wasm/js)
