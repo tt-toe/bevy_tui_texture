@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.4.1
+
+### Changed
+- **Text is shaped per cell.** Each cell is shaped on its own and cached by
+  its symbol, instead of each row being shaped as one run and cached by its
+  text. The shaper now runs once per distinct symbol, so a row costs the
+  same whether or not its text was seen before: a 120×40 screen of
+  never-seen ASCII goes from about 1050 µs to about 300 µs of CPU per frame
+  (Apple M1); every other workload is within a few percent. Output is
+  pixel-identical for fonts without cross-cell substitutions. A font with
+  programming ligatures now renders each character separately, where 0.4.0
+  drew the ligature glyph clipped to one cell.
+
+### Added
+- `Fonts::set_shaping(Shaping::Row)` restores shaping a row's font runs as
+  one piece, for scripts whose letters join across cells. It is not cached:
+  every changed row is shaped again.
+
+### Removed
+- The `ascii_fast_shaping` feature. Per-cell shaping is faster than that
+  path was and has none of its restrictions; remove the feature from your
+  `Cargo.toml` if you enabled it.
+
+### Fixed
+- A font with embedded bitmap glyphs no longer panics (`chunk size must be
+  non-zero`) on a zero-size glyph image, as stored for the space in e.g.
+  macOS's Monaco.
+
 ## 0.4.0
 
 Dependencies: bevy 0.20, wgpu 30 (ratatui stays at 0.30.2). MSRV is now

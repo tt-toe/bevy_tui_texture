@@ -224,7 +224,7 @@ bevy_tui_texture/
 │   └── utils/
 │       ├── mod.rs          # Shared small utilities (outline geometry, ...)
 │       ├── text_atlas.rs   # Glyph atlas slot index (epoch-stamped, clock eviction)
-│       ├── shape_cache.rs  # Shaped-run cache + per-cell font-choice cache
+│       ├── shape_cache.rs  # Per-cell shape cache + font-choice cache
 │       └── plan_cache.rs   # rustybuzz shape-plan cache
 └── examples/               # Example applications, one per feature area (see README.md)
     ├── assets/             # Fonts, glTF model, shaders (shared by native + wasm)

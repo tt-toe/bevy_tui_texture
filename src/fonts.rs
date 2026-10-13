@@ -195,10 +195,10 @@ pub(crate) struct SharedFontCpuState {
     pub(crate) cached: crate::utils::text_atlas::Atlas,
     pub(crate) plan_cache: crate::utils::plan_cache::PlanCache,
     pub(crate) pending_cache_updates: Vec<(crate::utils::text_atlas::CacheRect, Vec<u8>)>,
-    /// Shaped runs by text - see [`crate::utils::shape_cache`].
-    pub(crate) shape_cache: crate::utils::shape_cache::ShapeCache,
     /// Memoized per-cell font fallback - see [`Fonts::font_for_cell_cached`].
     pub(crate) font_choices: crate::utils::shape_cache::FontChoiceCache,
+    /// Shaped single cells - see [`crate::utils::shape_cache::CellShapeCache`].
+    pub(crate) cell_shapes: crate::utils::shape_cache::CellShapeCache,
 }
 
 impl SharedFontCpuState {
@@ -212,19 +212,37 @@ impl SharedFontCpuState {
             // from rebuilding plans every row.
             plan_cache: crate::utils::plan_cache::PlanCache::new(fonts.count().max(2) * 4),
             pending_cache_updates: Vec::new(),
-            // Enough for several screens of distinct rows: a hit needs the
-            // same run text, so capacity is what lets scrolled-away content
-            // come back for free.
-            shape_cache: crate::utils::shape_cache::ShapeCache::new(1024),
             font_choices: crate::utils::shape_cache::FontChoiceCache::new(),
+            cell_shapes: Default::default(),
         }
     }
+}
+
+/// What is handed to the text shaper as one unit - see
+/// [`Fonts::set_shaping`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Shaping {
+    /// Each cell is shaped on its own and cached by its symbol, so shaping
+    /// runs once per distinct symbol and a row costs the same whether or
+    /// not its text was seen before. Nothing is shaped across cell
+    /// boundaries: no ligatures, and no joining forms for scripts that
+    /// connect letters in separate cells.
+    #[default]
+    Cell,
+    /// Each stretch of a row that uses one font is shaped as a single run,
+    /// so the font's contextual substitutions apply across cells. Nothing
+    /// is cached: every row that changed is shaped again, which costs
+    /// several times more than [`Shaping::Cell`]. A substitution that
+    /// merges several cells into one glyph (a programming ligature) is
+    /// still drawn one cell wide, i.e. clipped.
+    Row,
 }
 
 /// A collection of fonts to use for rendering. Supports font fallback.
 pub struct Fonts {
     char_width: u32,
     char_height: u32,
+    shaping: Shaping,
 
     last_resort: Font,
 
@@ -251,6 +269,7 @@ impl Fonts {
         Self {
             char_width: font.char_width(size_px),
             char_height: size_px,
+            shaping: Shaping::default(),
             last_resort: font,
             regular: vec![],
             bold: vec![],
@@ -258,6 +277,17 @@ impl Fonts {
             bold_italic: vec![],
             shared_cpu_state: Mutex::new(None),
         }
+    }
+
+    /// Chooses how text is shaped (default [`Shaping::Cell`]). Set it while
+    /// building the collection, before it is shared with a terminal.
+    pub fn set_shaping(&mut self, shaping: Shaping) {
+        self.shaping = shaping;
+    }
+
+    /// The shaping mode set by [`Self::set_shaping`].
+    pub fn shaping(&self) -> Shaping {
+        self.shaping
     }
 
     /// Stable identity for this `Fonts` instance - used to key the

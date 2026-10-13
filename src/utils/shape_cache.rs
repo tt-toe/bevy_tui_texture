@@ -1,87 +1,101 @@
 //! Caches for the per-row text pipeline, shared by every terminal using the
 //! same `Fonts` (they live in `SharedFontCpuState`).
 //!
-//! Shaping a row with rustybuzz is by far the most expensive step of a
-//! flush, yet terminal content is overwhelmingly repetitive: a row whose
-//! colors changed still has the same text, and scrolled content is the same
-//! text on a different row. [`ShapeCache`] keys shaped runs by their text so
-//! both cases skip rustybuzz entirely; [`FontChoiceCache`] does the same for
-//! the per-cell font fallback probe that precedes shaping.
-
-use std::hash::BuildHasher;
-use std::num::NonZeroUsize;
+//! Shaping with rustybuzz is by far the most expensive step of a flush, and
+//! a terminal shows the same few symbols over and over. [`CellShapeCache`]
+//! keeps the shaped glyphs of each cell symbol, so rustybuzz runs once per
+//! distinct symbol; [`FontChoiceCache`] does the same for the per-cell font
+//! fallback probe that precedes shaping.
 
 use bevy::platform::collections::HashMap;
-use bevy::platform::hash::FixedHasher;
-use evictor::Lru;
 
 use crate::fonts::Font;
 
-/// One shaped glyph of a run - the subset of rustybuzz's output the
-/// terminal grid uses.
+/// One shaped glyph - the subset of rustybuzz's output the terminal grid
+/// uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ShapedGlyph {
     pub(crate) glyph_id: u32,
-    /// Byte offset of the glyph's cluster, relative to the run's start.
+    /// Byte offset of the glyph's cluster within the shaped text.
     pub(crate) cluster: u32,
     pub(crate) x_advance: i32,
     pub(crate) x_offset: i32,
 }
 
-struct ShapedRun {
-    /// The exact run text, compared on every hit: the LRU is keyed by a
-    /// 64-bit hash, and a collision must degrade to a reshape, never to
-    /// another run's glyphs.
-    text: Box<str>,
-    font: u64,
-    glyphs: Box<[ShapedGlyph]>,
+/// Shaped glyphs of single cells, keyed by `(font, cell symbol)` - the
+/// cache behind [`Shaping::Cell`](crate::fonts::Shaping::Cell). A cell's symbol
+/// is one grapheme cluster, so the number of distinct keys is bounded by the
+/// characters an application displays, not by how they are arranged: text
+/// never seen before costs the same as text seen every frame.
+#[derive(Default)]
+pub(crate) struct CellShapeCache {
+    fonts: HashMap<u64, FontCellShapes>,
 }
 
-/// LRU of shaped runs keyed by `(font, text)`.
-pub(crate) struct ShapeCache {
-    lru: Lru<u64, ShapedRun>,
+impl CellShapeCache {
+    /// One font's cells. Looked up once per font run, so the per-cell work
+    /// below involves no font hashing.
+    pub(crate) fn font(&mut self, font: &Font) -> &mut FontCellShapes {
+        self.fonts.entry(font.id()).or_default()
+    }
 }
 
-// SAFETY: evictor 0.7's `Lru` exclusively owns its arena (the raw pointers
-// it holds only point into that arena) and has no thread-affine state, so
-// moving it to another thread is sound for `Send` keys/values. Only `Send`
-// is asserted - shared access always goes through the `Mutex` in
-// `Fonts::with_shared_cpu_state`.
-unsafe impl Send for ShapeCache {}
+pub(crate) struct FontCellShapes {
+    /// Direct-mapped front for the usual cell: a single `char` shaping to
+    /// a single glyph, found without hashing a string. Two chars sharing a
+    /// slot just take turns - `all` stays the source of truth.
+    single: Box<[Option<(char, ShapedGlyph)>; Self::SINGLE_SLOTS]>,
+    all: HashMap<Box<str>, Box<[ShapedGlyph]>>,
+}
 
-impl ShapeCache {
-    pub(crate) fn new(capacity: usize) -> Self {
+impl Default for FontCellShapes {
+    fn default() -> Self {
         Self {
-            lru: Lru::new(NonZeroUsize::new(capacity.max(1)).expect("capacity is non-zero")),
+            single: Box::new([None; Self::SINGLE_SLOTS]),
+            all: HashMap::default(),
         }
     }
+}
 
-    /// The shaped glyphs of `text` in `font`, calling `shape` only when
-    /// this exact run isn't cached.
+impl FontCellShapes {
+    /// A power of two; ASCII maps onto its own code points.
+    const SINGLE_SLOTS: usize = 2048;
+    /// Distinct symbols kept per font. Far above what real content shows;
+    /// reaching it (endless novel combining sequences) drops the cache
+    /// rather than letting it grow without bound.
+    const MAX_SYMBOLS: usize = 32 * 1024;
+
+    /// The shaped glyphs of `symbol`, calling `shape` only the first time
+    /// this symbol is seen in this font.
     pub(crate) fn get_or_shape(
         &mut self,
-        font: &Font,
-        text: &str,
+        symbol: &str,
         shape: impl FnOnce() -> Vec<ShapedGlyph>,
     ) -> &[ShapedGlyph] {
-        let key = FixedHasher.hash_one((font.id(), text));
-        let hit = self
-            .lru
-            .peek(&key)
-            .is_some_and(|run| run.font == font.id() && &*run.text == text);
-        if !hit {
-            // Also the hash-collision path: replaces the colliding entry.
-            self.lru.insert(
-                key,
-                ShapedRun {
-                    text: text.into(),
-                    font: font.id(),
-                    glyphs: shape().into_boxed_slice(),
-                },
-            );
+        let mut chars = symbol.chars();
+        let single = match (chars.next(), chars.next()) {
+            (Some(ch), None) => Some((ch, ch as usize & (Self::SINGLE_SLOTS - 1))),
+            _ => None,
+        };
+        if let Some((ch, slot)) = single
+            && self.single[slot].is_some_and(|(cached, _)| cached == ch)
+        {
+            return self.single[slot]
+                .as_ref()
+                .map(|(_, glyph)| std::slice::from_ref(glyph))
+                .expect("checked above");
         }
-        // `get` (not `peek`) so a hit counts as a use.
-        &self.lru.get(&key).expect("present or just inserted").glyphs
+        if !self.all.contains_key(symbol) {
+            if self.all.len() >= Self::MAX_SYMBOLS {
+                self.all.clear();
+            }
+            self.all.insert(symbol.into(), shape().into_boxed_slice());
+        }
+        let glyphs = &self.all[symbol];
+        if let (Some((ch, slot)), [glyph]) = (single, &**glyphs) {
+            self.single[slot] = Some((ch, *glyph));
+        }
+        glyphs
     }
 }
 
@@ -140,38 +154,70 @@ mod tests {
     }
 
     #[test]
-    fn a_cached_run_is_not_reshaped() {
-        let font = Font::new(MPLUS).expect("font parses");
-        let mut cache = ShapeCache::new(8);
-        assert_eq!(cache.get_or_shape(&font, "abc", || glyph(1))[0].glyph_id, 1);
-        let again = cache.get_or_shape(&font, "abc", || panic!("must be a cache hit"));
-        assert_eq!(again[0].glyph_id, 1);
-    }
-
-    #[test]
-    fn runs_are_keyed_by_text_and_font() {
+    fn a_cell_is_shaped_once_per_font() {
         let font = Font::new(MPLUS).expect("font parses");
         let other = Font::new(MPLUS).expect("font parses"); // fresh id
-        let mut cache = ShapeCache::new(8);
-        cache.get_or_shape(&font, "abc", || glyph(1));
-        assert_eq!(cache.get_or_shape(&font, "abd", || glyph(2))[0].glyph_id, 2);
-        assert_eq!(
-            cache.get_or_shape(&other, "abc", || glyph(3))[0].glyph_id,
-            3
-        );
-        assert_eq!(cache.get_or_shape(&font, "abc", || glyph(9))[0].glyph_id, 1);
+        let mut cache = CellShapeCache::default();
+        for symbol in ["a", "あ", "e\u{301}"] {
+            assert_eq!(
+                cache.font(&font).get_or_shape(symbol, || glyph(1))[0].glyph_id,
+                1
+            );
+            let again = cache
+                .font(&font)
+                .get_or_shape(symbol, || panic!("must be a cache hit"));
+            assert_eq!(again[0].glyph_id, 1);
+            assert_eq!(
+                cache.font(&other).get_or_shape(symbol, || glyph(2))[0].glyph_id,
+                2
+            );
+        }
     }
 
+    /// A single char shaping to something other than one glyph still
+    /// round-trips (it just isn't direct-mapped).
     #[test]
-    fn the_least_recently_used_run_is_evicted() {
+    fn an_ascii_cell_may_shape_to_no_glyph_or_several() {
         let font = Font::new(MPLUS).expect("font parses");
-        let mut cache = ShapeCache::new(2);
-        cache.get_or_shape(&font, "a", || glyph(1));
-        cache.get_or_shape(&font, "b", || glyph(2));
-        cache.get_or_shape(&font, "a", || glyph(9)); // refresh "a"
-        cache.get_or_shape(&font, "c", || glyph(3)); // evicts "b"
-        assert_eq!(cache.get_or_shape(&font, "a", || glyph(9))[0].glyph_id, 1);
-        assert_eq!(cache.get_or_shape(&font, "b", || glyph(7))[0].glyph_id, 7);
+        let mut cache = CellShapeCache::default();
+        assert!(cache.font(&font).get_or_shape("a", Vec::new).is_empty());
+        assert!(
+            cache
+                .font(&font)
+                .get_or_shape("a", || panic!("cached"))
+                .is_empty()
+        );
+        let two = || [glyph(1), glyph(2)].concat();
+        assert_eq!(cache.font(&font).get_or_shape("b", two).len(), 2);
+        assert_eq!(
+            cache
+                .font(&font)
+                .get_or_shape("b", || panic!("cached"))
+                .len(),
+            2
+        );
+    }
+
+    /// Chars sharing a direct-mapped slot evict each other there, never
+    /// from the cache.
+    #[test]
+    fn colliding_single_chars_stay_cached() {
+        let font = Font::new(MPLUS).expect("font parses");
+        let mut cache = CellShapeCache::default();
+        let (a, b) = ("a", "\u{861}"); // 0x61 and 0x861 share a slot
+        assert_eq!(
+            cache.font(&font).get_or_shape(a, || glyph(1))[0].glyph_id,
+            1
+        );
+        assert_eq!(
+            cache.font(&font).get_or_shape(b, || glyph(2))[0].glyph_id,
+            2
+        );
+        for _ in 0..2 {
+            let cells = cache.font(&font);
+            assert_eq!(cells.get_or_shape(a, || panic!("cached"))[0].glyph_id, 1);
+            assert_eq!(cells.get_or_shape(b, || panic!("cached"))[0].glyph_id, 2);
+        }
     }
 
     #[test]

@@ -145,7 +145,6 @@ features = ["3d", "keyboard_input", "mouse_input"]   # e.g. a 3D-only app
 - **`mouse_input`** (default) — mouse events for 2D UI and 3D mesh terminals; touch taps ride the same path (a tap emulates a left-button click at the touch position)
 - **`bold_italic_fonts`** — real bold/italic font slots; without it, bold/italic are faked from the regular font
 - **`emoji`** — emoji and extended Unicode support (WIP)
-- **`ascii_fast_shaping`** — skip text shaping for all-ASCII rows (assumes zero glyph offsets, true for most monospace fonts; inert when `bold_italic_fonts` is enabled)
 - **`crossterm-compat`** (native-only) — lossy conversions between `input::InputEvent` and `crossterm::event::Event`, for interop with ratatui-ecosystem widget crates or a bevy_ratatui adapter; not available on wasm32 (crossterm doesn't build there)
 
 `TuiKind` variants gate individually: `Ui` needs `2d`, `WorldQuad` needs `3d`, `Headless` is always available.
@@ -154,7 +153,7 @@ features = ["3d", "keyboard_input", "mouse_input"]   # e.g. a 3D-only app
 
 - Dirty-cell tracking: byte-identical redraws cost nothing, and redraws touching only a few rows upload only those rows
 - One instanced draw per terminal: each glyph is a single 20-byte instance, and background + glyph are resolved in one fragment pass (no separate background pass, no index buffer)
-- Shaped text is cached by content — recolored rows and scrolled content are never reshaped
+- Text is shaped per cell and cached per symbol — the shaper runs once per distinct character, so text never seen before costs the same as repeated text
 - Glyph atlas shared across terminals using the same fonts — each glyph is rasterized and uploaded once
 - Persistent, grow-only GPU buffers; all terminal draws ride the frame's single batched submit alongside the camera passes
 - Terminal content lands in the same frame it is drawn (no one-frame lag)
@@ -169,14 +168,14 @@ CPU cost of a dirty frame on a 120×40 terminal (the `cpu_hot_path`
 benchmark above; Apple M1, microseconds per frame, including ratatui's
 own buffer diff of about 70):
 
-| workload                          | 0.3.5 | 0.4.0 |
-|-----------------------------------|------:|------:|
-| every cell: scrolling text+colors |  1350 |   290 |
-| every cell: colors only           |  1190 |   265 |
-| every cell: block glyph gradient  |  1985 |   385 |
-| every cell: never-seen text       |  1485 |  1080 |
-| one row changes                   |   100 |    75 |
-| nothing changes                   |    74 |    69 |
+| workload                          | 0.3.5 | 0.4.0 | 0.4.1 |
+|-----------------------------------|------:|------:|------:|
+| every cell: scrolling text+colors |  1350 |   290 |   275 |
+| every cell: colors only           |  1190 |   265 |   280 |
+| every cell: block glyph gradient  |  1985 |   385 |   385 |
+| every cell: never-seen text       |  1485 |  1080 |   280 |
+| one row changes                   |   100 |    75 |    75 |
+| nothing changes                   |    74 |    69 |    68 |
 
 `examples/benchmark` (full-frame redraw, uncapped, same machine): about
 250 fps → about 390 fps.

@@ -206,7 +206,7 @@ pub use backend::bevy_backend::{BevyTerminalBackend, TerminalBuilder};
 pub use backend::{Dimensions, Viewport};
 
 // Re-export font types
-pub use fonts::{Font, Fonts, TerminalFontAsset};
+pub use fonts::{Font, Fonts, Shaping, TerminalFontAsset};
 
 // Re-export bevy plugin types
 pub use bevy_plugin::{TerminalDimensions, TerminalPlugin};
@@ -252,7 +252,9 @@ pub mod prelude {
     };
 
     // Backend and builders
-    pub use crate::{BevyTerminalBackend, Font, Fonts, TerminalBuilder, TerminalFontAsset};
+    pub use crate::{
+        BevyTerminalBackend, Font, Fonts, Shaping, TerminalBuilder, TerminalFontAsset,
+    };
 
     // Input handling. `KeyCode` is deliberately NOT re-exported here:
     // `bevy::prelude::*` (glob-imported by every example alongside this

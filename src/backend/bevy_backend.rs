@@ -154,6 +154,36 @@ mod font_run_tests {
     }
 }
 
+/// Shapes `text` with `font` through rustybuzz. Clusters are byte offsets
+/// into `text`. `buffer` is scratch, reused across calls.
+fn shape_text(
+    font: &crate::fonts::Font,
+    text: &str,
+    buffer: &mut UnicodeBuffer,
+    plan_cache: &mut crate::utils::plan_cache::PlanCache,
+) -> Vec<crate::utils::shape_cache::ShapedGlyph> {
+    let mut unicode = std::mem::take(buffer);
+    unicode.clear();
+    for (idx, ch) in text.char_indices() {
+        unicode.add(ch, idx as u32);
+    }
+    let glyph_buffer =
+        rustybuzz::shape_with_plan(font.font(), plan_cache.get(font, &mut unicode), unicode);
+    let shaped = glyph_buffer
+        .glyph_infos()
+        .iter()
+        .zip(glyph_buffer.glyph_positions())
+        .map(|(info, pos)| crate::utils::shape_cache::ShapedGlyph {
+            glyph_id: info.glyph_id,
+            cluster: info.cluster,
+            x_advance: pos.x_advance,
+            x_offset: pos.x_offset,
+        })
+        .collect();
+    *buffer = glyph_buffer.clear();
+    shaped
+}
+
 /// Horizontal squeeze for a glyph whose advance (`advance_px`) is wider
 /// than the cells it occupies (`cells_px`). The cell width comes from the
 /// narrowest font, so a wider fallback font's glyphs would otherwise have
@@ -176,7 +206,7 @@ mod fit_to_cells_tests {
     fn a_rounded_down_advance_is_not_squeezed() {
         assert_eq!(fit_to_cells(6.4, 6.0), 1.0);
         assert_eq!(fit_to_cells(12.8, 12.0), 1.0);
-        assert_eq!(fit_to_cells(0.0, 6.0), 1.0); // synthesized fast-path glyphs
+        assert_eq!(fit_to_cells(0.0, 6.0), 1.0);
     }
 
     #[test]
@@ -245,15 +275,6 @@ pub struct BevyTerminalBackend {
     covered: Vec<bool>,
     /// Scratch for `shape_row`: the row's glyphs, in shaping order.
     glyphs: Vec<RowGlyph>,
-    /// cmap lookup cache for the ASCII fast path (feature
-    /// `ascii_fast_shaping`) - `None` means "checked, this font
-    /// has no glyph for this char", cached to avoid re-probing every
-    /// frame. Keyed by `(font id, char)` since a terminal's font can
-    /// change via `update_fonts` (which clears this) and, in principle,
-    /// differ row to row if multiple fonts were ever in play.
-    #[cfg(feature = "ascii_fast_shaping")]
-    pub(super) ascii_glyph_cache:
-        std::collections::HashMap<(u64, char), Option<rustybuzz::ttf_parser::GlyphId>>,
 
     // ====== Draw data (owned) ======
     // `flush()` only maintains `row_geometry`; the full-frame or
@@ -377,8 +398,6 @@ impl TerminalBuilder {
             rowmap: vec![],
             covered: vec![],
             glyphs: vec![],
-            #[cfg(feature = "ascii_fast_shaping")]
-            ascii_glyph_cache: std::collections::HashMap::new(),
             row_geometry: vec![],
             reset_fg: self.reset_fg,
             reset_bg: self.reset_bg,
@@ -696,8 +715,6 @@ impl BevyTerminalBackend {
         self.row_geometry.clear();
         self.rows_dirty_since_take.clear();
         self.full_redraw_needed = true;
-        #[cfg(feature = "ascii_fast_shaping")]
-        self.ascii_glyph_cache.clear();
         self.fonts = new_fonts;
     }
 
@@ -715,7 +732,6 @@ impl BevyTerminalBackend {
         out: &mut RowGeometry,
     ) {
         use crate::backend::c2c;
-        use rustybuzz::shape_with_plan;
 
         out.cells.clear();
         out.overlays.clear();
@@ -724,19 +740,23 @@ impl BevyTerminalBackend {
         let row_end = (row_start + width).min(self.cells.len());
         let row_cells = &self.cells[row_start..row_end];
 
-        // Build row string for shaping
+        // Build row string for shaping (per-cell shaping reads each cell's
+        // symbol directly and only needs the byte -> cell map)
+        let per_cell = self.fonts.shaping() == crate::fonts::Shaping::Cell;
         self.row.clear();
         self.rowmap.clear();
         for (x, cell) in row_cells.iter().enumerate() {
             let symbol = cell.symbol();
-            self.row.push_str(symbol);
+            if !per_cell {
+                self.row.push_str(symbol);
+            }
             // Map each byte to its cell index
             for _ in 0..symbol.len() {
                 self.rowmap.push(x as u16);
             }
         }
 
-        if self.row.is_empty() {
+        if self.rowmap.is_empty() {
             return;
         }
         self.covered.clear();
@@ -749,90 +769,40 @@ impl BevyTerminalBackend {
         let mut glyphs = std::mem::take(&mut self.glyphs);
         glyphs.clear();
 
-        // ASCII fast path (opt-in via the `ascii_fast_shaping` feature -
-        // compiled out entirely otherwise, and requires `bold_italic_fonts`
-        // to be off, since that feature makes per-cell font selection
-        // meaningful while this path assumes the whole row shares one font
-        // - which is also why it only runs for a row that `font_runs`
-        // resolved to a single run). Synthesizes glyphs straight from the
-        // font's cmap instead of invoking rustybuzz, feeding the SAME
-        // per-glyph loop below as shaped output. Bails to the shaping path
-        // the moment any cell isn't a single ASCII printable byte or the
-        // font lacks that glyph.
-        #[cfg(all(feature = "ascii_fast_shaping", not(feature = "bold_italic_fonts")))]
-        let fast_path = 'fast: {
-            use rustybuzz::ttf_parser::Face;
-
-            let [run] = runs.as_slice() else {
-                break 'fast false;
-            };
-            let font = run.font;
-
-            for (x, cell) in row_cells.iter().enumerate() {
-                let bytes = cell.symbol().as_bytes();
-                // Exactly one ASCII printable byte - this single check also
-                // excludes an empty symbol (NULL_CELL wide-char
-                // continuation) and any multi-byte UTF-8 grapheme cluster.
-                if bytes.len() != 1 || !(0x20..=0x7E).contains(&bytes[0]) {
-                    glyphs.clear();
-                    break 'fast false;
+        if per_cell {
+            // Every cell's symbol is shaped on its own, in the font
+            // `font_runs` picked for it, and cached by symbol - so the cost
+            // of a row does not depend on whether its text was seen before.
+            let mut cells = row_cells.iter();
+            let mut offset = 0;
+            for (run_idx, run) in runs.iter().enumerate() {
+                let shapes = shared.cell_shapes.font(run.font);
+                let plan_cache = &mut shared.plan_cache;
+                while offset < run.bytes.end {
+                    let Some(cell) = cells.next() else { break };
+                    let symbol = cell.symbol();
+                    if symbol.is_empty() {
+                        continue;
+                    }
+                    let shaped = shapes.get_or_shape(symbol, || {
+                        shape_text(run.font, symbol, &mut self.buffer, plan_cache)
+                    });
+                    glyphs.extend(shaped.iter().map(|glyph| RowGlyph {
+                        glyph_id: glyph.glyph_id,
+                        cluster: offset as u32 + glyph.cluster,
+                        x_advance: glyph.x_advance,
+                        x_offset: glyph.x_offset,
+                        run: run_idx as u16,
+                    }));
+                    offset += symbol.len();
                 }
-                let ch = bytes[0] as char;
-
-                let glyph_id = *self
-                    .ascii_glyph_cache
-                    .entry((font.id(), ch))
-                    .or_insert_with(|| Face::glyph_index(font.font(), ch));
-                let Some(glyph_id) = glyph_id else {
-                    glyphs.clear();
-                    break 'fast false; // font lacks this glyph - defer to shaping
-                };
-                glyphs.push(RowGlyph {
-                    glyph_id: glyph_id.0 as u32,
-                    cluster: x as u32,
-                    x_advance: 0,
-                    x_offset: 0,
-                    run: 0,
-                });
             }
-            true
-        };
-        #[cfg(not(all(feature = "ascii_fast_shaping", not(feature = "bold_italic_fonts"))))]
-        let fast_path = false;
+        }
 
-        if !fast_path {
+        if !per_cell {
             for (run_idx, run) in runs.iter().enumerate() {
                 let text = &self.row[run.bytes.clone()];
-                let buffer = &mut self.buffer;
-                let plan_cache = &mut shared.plan_cache;
-                // Shaped once per distinct run text: an unchanged row whose
-                // colors moved, or content that merely scrolled to another
-                // row, is served from the cache without touching rustybuzz.
-                let shaped = shared.shape_cache.get_or_shape(run.font, text, || {
-                    let mut unicode = std::mem::take(buffer);
-                    unicode.clear();
-                    for (idx, ch) in text.char_indices() {
-                        unicode.add(ch, idx as u32);
-                    }
-                    let glyph_buffer = shape_with_plan(
-                        run.font.font(),
-                        plan_cache.get(run.font, &mut unicode),
-                        unicode,
-                    );
-                    let shaped = glyph_buffer
-                        .glyph_infos()
-                        .iter()
-                        .zip(glyph_buffer.glyph_positions())
-                        .map(|(info, pos)| crate::utils::shape_cache::ShapedGlyph {
-                            glyph_id: info.glyph_id,
-                            cluster: info.cluster,
-                            x_advance: pos.x_advance,
-                            x_offset: pos.x_offset,
-                        })
-                        .collect();
-                    *buffer = glyph_buffer.clear();
-                    shaped
-                });
+                let shaped = shape_text(run.font, text, &mut self.buffer, &mut shared.plan_cache);
                 // Clusters become byte offsets into the whole row - what
                 // `rowmap` is indexed by.
                 glyphs.extend(shaped.iter().map(|glyph| RowGlyph {
@@ -849,7 +819,7 @@ impl BevyTerminalBackend {
         let cell_height_px = self.fonts.height_px();
         let last_resort_id = self.fonts.last_resort_id();
 
-        // Process shaped (or synthesized) glyphs
+        // Process shaped glyphs
         for glyph in &glyphs {
             let run = &runs[glyph.run as usize];
 
@@ -1772,5 +1742,86 @@ mod tests {
         let payload = backend.take_draw_payload();
 
         assert!(payload.is_full(), "every row dirty must take the full path");
+    }
+}
+
+#[cfg(test)]
+mod shaping_mode_tests {
+    use super::*;
+    use crate::fonts::{Font, Shaping};
+    use ratatui::style::{Modifier, Style};
+
+    const MPLUS: &[u8] = include_bytes!("../../examples/assets/fonts/Mplus1Code-Regular.ttf");
+    const FUSION: &[u8] =
+        include_bytes!("../../examples/assets/fonts/fusion-pixel-10px-monospaced-ja.ttf");
+    const ATLAS: usize = crate::backend::CACHE_WIDTH as usize;
+
+    /// Draws a few rows covering ASCII, wide chars, a fallback font,
+    /// combining marks, programmatic glyphs and every style, and composites
+    /// the resulting instances on the CPU: per-pixel glyph coverage of the
+    /// whole terminal.
+    fn coverage(shaping: Shaping) -> Vec<u8> {
+        // M+ first, fusion-pixel (which has Hangul) as the fallback.
+        let mut fonts = Fonts::new(Font::new(FUSION).expect("fusion-pixel parses"), 16);
+        fonts.add_regular_fonts([Font::new(MPLUS).expect("M+ parses")]);
+        #[cfg(feature = "bold_italic_fonts")]
+        fonts.add_bold_fonts([Font::new(MPLUS).expect("M+ parses")]);
+        fonts.set_shaping(shaping);
+
+        let backend = TerminalBuilder::new(Arc::new(fonts))
+            .with_dimensions(40, 6)
+            .build();
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        let plain = Style::default();
+        let rows = [
+            ("The quick brown fox -> != == 0123456789", plain),
+            ("日本語テキスト ｶﾅ 한글 mixed", plain),
+            ("e\u{301} a\u{308} ┌─┐│█▓ ⣿ x", plain),
+            ("Bold 日本 -> quick", plain.add_modifier(Modifier::BOLD)),
+            ("Italic 한 != quick", plain.add_modifier(Modifier::ITALIC)),
+            (
+                "Both == quick",
+                plain.add_modifier(Modifier::BOLD | Modifier::ITALIC),
+            ),
+        ];
+        terminal
+            .draw(|frame| {
+                for (y, (text, style)) in rows.iter().enumerate() {
+                    frame.buffer_mut().set_string(0, y as u16, text, *style);
+                }
+            })
+            .expect("draw");
+
+        let payload = terminal.backend_mut().take_draw_payload();
+        let mut atlas = vec![0u8; ATLAS * ATLAS];
+        for (rect, bytes) in terminal.backend_mut().take_shared_glyph_uploads() {
+            let width = rect.width as usize;
+            for (row, line) in bytes.chunks_exact(width).enumerate() {
+                let start = (rect.y as usize + row) * ATLAS + rect.x as usize;
+                atlas[start..start + width].copy_from_slice(line);
+            }
+        }
+        let width = payload.screen_width_px as usize;
+        let mut image = vec![0u8; width * payload.screen_height_px as usize];
+        for instance in &payload.instances {
+            let [x, y, w, h] = instance.rect.map(usize::from);
+            let [u, v] = instance.uv.map(usize::from);
+            for dy in 0..h {
+                for dx in 0..w {
+                    let pixel = &mut image[(y + dy) * width + x + dx];
+                    *pixel = (*pixel).max(atlas[(v + dy) * ATLAS + u + dx]);
+                }
+            }
+        }
+        image
+    }
+
+    /// With fonts that have no cross-cell substitutions (both shipped ones),
+    /// shaping per cell is only a different way to reach the same glyphs.
+    #[test]
+    fn cell_and_row_shaping_draw_the_same_pixels() {
+        let row = coverage(Shaping::Row);
+        assert!(row.iter().any(|&c| c > 0), "something must be drawn");
+        assert!(row == coverage(Shaping::Cell));
     }
 }
