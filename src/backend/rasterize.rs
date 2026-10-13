@@ -272,12 +272,23 @@ pub(super) fn rasterize_glyph(
     )
 }
 
+/// An embedded bitmap with no pixels - what a bitmap strike stores for a
+/// blank glyph such as the space. There is nothing to decode (and the
+/// row-wise decoders cannot chunk a zero-width image); the caller falls
+/// back to an empty slot.
+fn raster_is_empty(raster: &RasterGlyphImage) -> bool {
+    raster.width == 0 || raster.height == 0
+}
+
 fn extract_color_image(
     image: &mut Vec<u32>,
     raster: RasterGlyphImage,
     cached: Entry,
     scale: f32,
 ) -> Option<(CacheRect, Vec<u32>)> {
+    if raster_is_empty(&raster) {
+        return None;
+    }
     match raster.format {
         RasterImageFormat::PNG => {
             // PNG format not supported (simplified implementation)
@@ -330,6 +341,9 @@ fn extract_bw_image(
     cached: Entry,
     scale: f32,
 ) -> Option<(CacheRect, Vec<u32>)> {
+    if raster_is_empty(&raster) {
+        return None;
+    }
     image.resize(raster.width as usize * raster.height as usize, 0);
 
     match raster.format {
@@ -421,5 +435,57 @@ fn from_gray_packed<const BITS: usize, const ENTRIES: usize>(
         }
         let value = steps[index as usize];
         *dst = u32::from_be_bytes([value, 255, 255, 255]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn raster(width: u16, height: u16, format: RasterImageFormat) -> RasterGlyphImage<'static> {
+        RasterGlyphImage {
+            x: 0,
+            y: 0,
+            width,
+            height,
+            pixels_per_em: 16,
+            format,
+            data: &[],
+        }
+    }
+
+    /// A bitmap strike stores blank glyphs (the space) as zero-size images.
+    /// They decode to "no image" rather than reaching the row-wise decoders.
+    #[test]
+    fn a_zero_size_bitmap_glyph_has_no_image() {
+        let slot = Entry::Uncached(CacheRect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 16,
+        });
+        let formats = [
+            RasterImageFormat::BitmapMono,
+            RasterImageFormat::BitmapMonoPacked,
+            RasterImageFormat::BitmapGray2,
+            RasterImageFormat::BitmapGray2Packed,
+            RasterImageFormat::BitmapGray4,
+            RasterImageFormat::BitmapGray4Packed,
+            RasterImageFormat::BitmapGray8,
+            RasterImageFormat::BitmapPremulBgra32,
+        ];
+        for format in formats {
+            for (width, height) in [(0, 0), (0, 12), (7, 0)] {
+                let mut image = Vec::new();
+                assert!(
+                    extract_bw_image(&mut image, raster(width, height, format), slot, 1.0)
+                        .is_none()
+                );
+                assert!(
+                    extract_color_image(&mut image, raster(width, height, format), slot, 1.0)
+                        .is_none()
+                );
+            }
+        }
     }
 }

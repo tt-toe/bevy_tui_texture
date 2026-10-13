@@ -63,11 +63,6 @@ feature (the lib's own bevy is default-features=false and logs nothing).
   (`Fonts::add_bold_fonts`/`add_italic_fonts`/`add_bold_italic_fonts`);
   otherwise bold/italic are faked from the regular font
 - `emoji` (opt-in, WIP) — emoji-aware glyph handling (pulls in `unicode-properties`)
-- `ascii_fast_shaping` (opt-in) — bypasses rustybuzz for rows that are all
-  single ASCII printable bytes. Assumes zero
-  x_offset, which most monospace fonts satisfy but isn't guaranteed.
-  Silently inert when `bold_italic_fonts` is enabled (that feature makes
-  per-cell font selection meaningful; this path assumes one font per row)
 - `crossterm-compat` (opt-in, native-only) — `InputEvent::to_crossterm`/
   `from_crossterm` (src/input/crossterm_compat.rs), lossy conversions
   to/from `crossterm::event::Event` for interop with ratatui-ecosystem
@@ -185,17 +180,26 @@ rows.
 
 ### Text caches (per `Fonts`, in `SharedFontCpuState`)
 
-Reshaping a row is: split into font runs → shape each run → look each
-glyph up in the atlas. Each step is cached, because terminal content
-repeats (a recolored row has the same text; scrolled content is the same
-text on another row):
+Reshaping a row is: pick each cell's font → shape → look each glyph up in
+the atlas. Each step is cached, because a terminal shows the same few
+symbols over and over:
 
 - `FontChoiceCache` (src/utils/shape_cache.rs) memoizes
   `Fonts::font_for_cell` per `(char, bold, italic)` — the fallback probe is
   a cmap lookup per font per cell otherwise.
-- `ShapeCache` (same file) is an LRU of shaped runs keyed by
-  `(font, run text)`; a hit skips rustybuzz entirely. Only never-seen text
-  pays for shaping.
+- `CellShapeCache` (same file): each cell's symbol is shaped alone and
+  cached per `(font, symbol)`, with a direct-mapped front for
+  single-`char` symbols. The key space is the set of characters shown, not
+  their arrangement, so rustybuzz runs once per distinct symbol and
+  never-seen text costs the same as repeated text.
+- `Shaping` (`Fonts::set_shaping`, set before the `Fonts` is shared)
+  selects the unit: `Cell` (default, the cache above) or `Row`, which
+  shapes each font run of a row as one piece, uncached - several times
+  slower, there for scripts whose letters join across cells. Neither
+  renders programming ligatures: under `Row` the ligature glyph is drawn
+  into a one-cell slot and clipped, under `Cell` each character is drawn
+  separately. The `shaping_mode_tests` pixel test pins both modes to
+  identical output for the shipped fonts.
 - `Atlas` (src/utils/text_atlas.rs) maps glyph → fixed slot. A hit is one
   hash probe plus stamping the slot with the current flush's epoch
   (`Atlas::begin_flush`); eviction, only once the atlas is full, is a
@@ -231,7 +235,7 @@ this whole path without a GPU (src/setup.rs `perf_bench`).
   `.notdef` advance and can shrink every cell — prefer a patched
   "Nerd Font Mono" primary.
 - **src/utils/** — `text_atlas.rs` (glyph atlas slot index),
-  `shape_cache.rs` (shaped-run + font-choice caches), `plan_cache.rs`
+  `shape_cache.rs` (per-cell shape + font-choice caches), `plan_cache.rs`
   (rustybuzz shape plans, `evictor` LRU)
 
 ## Key Patterns

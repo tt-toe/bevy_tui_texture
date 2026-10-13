@@ -1968,9 +1968,22 @@ mod perf_bench {
     const FRAMES: u32 = 600;
     const TEXT: &[u8] = b"The quick brown fox jumps over the lazy dog. 0123456789 +-*/=<>[]{}() ";
 
+    /// Times `paint` under both shaping modes.
     fn run(name: &str, mut paint: impl FnMut(u32, &mut ratatui::buffer::Buffer)) {
+        for shaping in [crate::fonts::Shaping::Row, crate::fonts::Shaping::Cell] {
+            run_with(name, shaping, &mut paint);
+        }
+    }
+
+    fn run_with(
+        name: &str,
+        shaping: crate::fonts::Shaping,
+        paint: &mut impl FnMut(u32, &mut ratatui::buffer::Buffer),
+    ) {
         let font_data = include_bytes!("../examples/assets/fonts/Mplus1Code-Regular.ttf");
-        let fonts = Arc::new(Fonts::new(Font::new(font_data).expect("font"), 16));
+        let mut fonts = Fonts::new(Font::new(font_data).expect("font"), 16);
+        fonts.set_shaping(shaping);
+        let fonts = Arc::new(fonts);
         let mut images = Assets::<Image>::default();
         let texture =
             TerminalTexture::create(COLS, ROWS, fonts, true, false, [0, 0, 0, 255], &mut images)
@@ -1995,7 +2008,7 @@ mod perf_bench {
             }
         }
         println!(
-            "[cpu_hot_path] {name:<12} draw+shape {:>7.1} us  payload {:>6.1} us  total {:>7.1} us/frame",
+            "[cpu_hot_path] {name:<12} {shaping:<4?} draw+shape {:>7.1} us  payload {:>6.1} us  total {:>7.1} us/frame",
             draw.as_secs_f64() * 1e6 / FRAMES as f64,
             take.as_secs_f64() * 1e6 / FRAMES as f64,
             (draw + take).as_secs_f64() * 1e6 / FRAMES as f64,
@@ -2020,6 +2033,28 @@ mod perf_bench {
                         Style::default()
                             .fg(RColor::Rgb(c, 255 - c, 128))
                             .bg(RColor::Rgb(c / 4, 0, 64 - c / 4)),
+                    );
+                }
+            }
+        });
+        // The same, with bold and italic words: with `bold_italic_fonts`
+        // every style change starts a new font run.
+        run("styled_text", |n, buf| {
+            use ratatui::style::Modifier;
+            const STYLES: [Modifier; 4] = [
+                Modifier::empty(),
+                Modifier::BOLD,
+                Modifier::ITALIC,
+                Modifier::BOLD.union(Modifier::ITALIC),
+            ];
+            for y in 0..ROWS {
+                for x in 0..COLS {
+                    let c = (x as u32 * 2 + y as u32 * 5 + n) as u8;
+                    let style = STYLES[(x as usize / 6 + y as usize) % STYLES.len()];
+                    buf[(x, y)].set_symbol(text_at(n, x, y)).set_style(
+                        Style::default()
+                            .fg(RColor::Rgb(c, 255 - c, 128))
+                            .add_modifier(style),
                     );
                 }
             }

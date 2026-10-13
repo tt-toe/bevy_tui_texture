@@ -263,8 +263,9 @@ a complete interactive form built on nothing but `TerminalEvent` +
   draw (one 20-byte instance per glyph, background and glyph resolved in
   the fragment shader) directly into the destination
   `GpuImage::texture_view`.
-- Shaped runs are cached by text: a row whose colors changed, or content
-  that scrolled to another row, is not reshaped.
+- Text is shaped per cell and cached per symbol, so never-seen text costs
+  the same as repeated text. `Fonts::set_shaping(Shaping::Row)` (uncached,
+  slower) shapes whole runs instead, for scripts that join across cells.
 - Partial redraws upload only dirty rows; unchanged frames upload nothing.
 
 ## Invariants agents must not break
@@ -287,9 +288,7 @@ a complete interactive form built on nothing but `TerminalEvent` +
   `<MESH>.<MATERIAL>` (e.g. `Object_2.Monitor_Glass`), not after the node;
   exact-match, never prefix-match (`Object_2` also hits `Object_20`).
 - **Feature gates**: `2d`/`3d`/`keyboard_input`/`mouse_input` (all
-  default), plus opt-in `bold_italic_fonts`, `emoji`, and
-  `ascii_fast_shaping` (shaping bypass for all-ASCII rows; silently inert
-  when `bold_italic_fonts` is on). `TuiKind::Ui` needs `2d`, `WorldQuad`
+  default), plus opt-in `bold_italic_fonts` and `emoji`. `TuiKind::Ui` needs `2d`, `WorldQuad`
   needs `3d`, `Headless` is always available.
 
 ## Verification (what CI runs — .github/workflows/ci.yml)

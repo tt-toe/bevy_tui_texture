@@ -1,6 +1,6 @@
 [package]
 name = "bevy_tui_texture"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 rust-version = "1.97.1"
 authors = ["TTT"]
@@ -23,14 +23,6 @@ keyboard_input = []
 mouse_input = []
 bold_italic_fonts = []
 emoji = ["dep:unicode-properties"]
-# Bypasses rustybuzz shaping for rows where every cell is a single ASCII
-# printable byte with a glyph present in the row's font. Off by default: skipping real shaping means a glyph's
-# rustybuzz-computed x_offset (kerning/bearing) is assumed to be zero,
-# which holds for most monospace fonts' basic Latin glyphs but isn't
-# guaranteed for all of them. Requires `bold_italic_fonts` to stay
-# disabled (that feature makes per-cell font selection meaningful, which
-# this path's single-font-per-row assumption does not account for).
-ascii_fast_shaping = []
 # Lossy conversions between `input::InputEvent` and `crossterm::event::Event`
 # (src/input/crossterm_compat.rs) - native-only, crossterm does not build on
 # wasm32-unknown-unknown. Lets `InputEvent` values round-trip through
