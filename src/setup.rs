@@ -1971,17 +1971,41 @@ mod perf_bench {
     /// Times `paint` under both shaping modes.
     fn run(name: &str, mut paint: impl FnMut(u32, &mut ratatui::buffer::Buffer)) {
         for shaping in [crate::fonts::Shaping::Row, crate::fonts::Shaping::Cell] {
-            run_with(name, shaping, &mut paint);
+            run_with(name, shaping, false, &mut paint);
+        }
+    }
+
+    /// [`run`], with fusion-pixel as a fallback font after M+: its Private
+    /// Use Area glyphs and arrows stand in for a symbol font's.
+    fn run_symbols(name: &str, mut paint: impl FnMut(u32, &mut ratatui::buffer::Buffer)) {
+        for shaping in [crate::fonts::Shaping::Row, crate::fonts::Shaping::Cell] {
+            run_with(name, shaping, true, &mut paint);
         }
     }
 
     fn run_with(
         name: &str,
         shaping: crate::fonts::Shaping,
+        symbol_font: bool,
         paint: &mut impl FnMut(u32, &mut ratatui::buffer::Buffer),
     ) {
+        // `CPU_HOT_PATH=<workload>[:<Row|Cell>]` runs only that workload.
+        if let Ok(only) = std::env::var("CPU_HOT_PATH") {
+            let (workload, mode) = only.split_once(':').unwrap_or((&only, ""));
+            if workload != name || (!mode.is_empty() && mode != format!("{shaping:?}")) {
+                return;
+            }
+        }
         let font_data = include_bytes!("../examples/assets/fonts/Mplus1Code-Regular.ttf");
-        let mut fonts = Fonts::new(Font::new(font_data).expect("font"), 16);
+        let mut fonts = if symbol_font {
+            let fusion =
+                include_bytes!("../examples/assets/fonts/fusion-pixel-10px-monospaced-ja.ttf");
+            let mut fonts = Fonts::new(Font::new(fusion).expect("font"), 16);
+            fonts.add_regular_fonts([Font::new(font_data).expect("font")]);
+            fonts
+        } else {
+            Fonts::new(Font::new(font_data).expect("font"), 16)
+        };
         fonts.set_shaping(shaping);
         let fonts = Arc::new(fonts);
         let mut images = Assets::<Image>::default();
@@ -1993,7 +2017,11 @@ mod perf_bench {
         let mut draw = Duration::ZERO;
         let mut take = Duration::ZERO;
         // Warm-up frames populate the glyph atlas / plan cache.
-        for frame_no in 0..FRAMES + 20 {
+        let frames = std::env::var("CPU_HOT_PATH_FRAMES")
+            .ok()
+            .and_then(|f| f.parse().ok())
+            .unwrap_or(FRAMES);
+        for frame_no in 0..frames + 20 {
             let t0 = Instant::now();
             tui.draw(|frame| paint(frame_no, frame.buffer_mut()));
             let t1 = Instant::now();
@@ -2009,9 +2037,9 @@ mod perf_bench {
         }
         println!(
             "[cpu_hot_path] {name:<12} {shaping:<4?} draw+shape {:>7.1} us  payload {:>6.1} us  total {:>7.1} us/frame",
-            draw.as_secs_f64() * 1e6 / FRAMES as f64,
-            take.as_secs_f64() * 1e6 / FRAMES as f64,
-            (draw + take).as_secs_f64() * 1e6 / FRAMES as f64,
+            draw.as_secs_f64() * 1e6 / frames as f64,
+            take.as_secs_f64() * 1e6 / frames as f64,
+            (draw + take).as_secs_f64() * 1e6 / frames as f64,
         );
     }
 
@@ -2100,6 +2128,23 @@ mod perf_bench {
                 for x in 0..COLS {
                     let frame_no = if y == 5 { n } else { 0 };
                     buf[(x, y)].set_symbol(text_at(frame_no, x, y));
+                }
+            }
+        });
+        // A file list: every row is an icon, a blank, a name and an arrow,
+        // scrolling every frame.
+        run_symbols("symbols", |n, buf| {
+            for y in 0..ROWS {
+                let i = (y as u32 + n) as usize;
+                let icon = char::from_u32(0xE000 + (i % 14) as u32).unwrap();
+                let line = format!("{icon} file_{i:04}.rs → {icon}{icon} size {} ", i * 37);
+                for (x, ch) in line
+                    .chars()
+                    .chain(std::iter::repeat(' '))
+                    .take(COLS as usize)
+                    .enumerate()
+                {
+                    buf[(x as u16, y)].set_char(ch);
                 }
             }
         });

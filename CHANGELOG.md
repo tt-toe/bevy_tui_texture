@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- **Nerd Font icons fill two cells.** A symbol followed by a space is drawn
+  over its own cell and the space, as in Ghostty, kitty and WezTerm, so
+  `"\u{f07b} src"` shows a full-size folder icon. A symbol is a Nerd Font
+  icon (anything in a Private Use Area) or an ambiguous-width character
+  its font draws wider than a cell, such as the full-width arrows and
+  stars of Japanese fonts. A symbol right after another symbol stays in one
+  cell, so runs of them keep their alignment; the space keeps its own
+  background.
+- Symbols are scaled and aligned into their cells by the rules Nerd Fonts'
+  font-patcher applies to each icon set (generated into
+  `src/backend/glyph_constraint/nerd_font.rs` by
+  `tools/nerd_font_constraints.py`), keeping their aspect ratio. Icons now
+  look the same whichever Nerd Font provides them - patched or the
+  symbols-only font, Mono or not - where they used to be squeezed
+  horizontally into one cell or cut off at its edge.
+- `Fonts::set_fit_symbols(false)` turns both off.
+- `cpu_hot_path` has a `symbols` workload, and runs a single workload with
+  `CPU_HOT_PATH=<workload>[:Row|:Cell]` (frames: `CPU_HOT_PATH_FRAMES`).
+
 ## 0.4.1
 
 ### Changed

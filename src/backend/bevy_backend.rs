@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use crate::backend::CellInstance;
 use crate::backend::Viewport;
-use crate::backend::rasterize::rasterize_glyph;
+use crate::backend::glyph_constraint::{CellClass, GlyphConstraint};
+use crate::backend::rasterize::{Placement, rasterize_glyph};
 use crate::colors::Rgb;
 use crate::fonts::Fonts;
 use crate::utils::text_atlas::Key;
@@ -53,6 +54,11 @@ struct FontRun<'f> {
     font: &'f crate::fonts::Font,
     fake_bold: bool,
     fake_italic: bool,
+    /// Whether any of its cells is a symbol (see
+    /// [`crate::backend::glyph_constraint`]) - known for free from the
+    /// font choice, and false for practically every run of text, which
+    /// then never asks again per cell.
+    symbols: bool,
     bytes: std::ops::Range<usize>,
 }
 
@@ -77,7 +83,7 @@ fn font_runs<'f>(
             }
             continue;
         }
-        let (font, fake_bold, fake_italic) = fonts.font_for_cell_cached(cell, choices);
+        let (font, fake_bold, fake_italic, class) = fonts.font_for_cell_cached(cell, choices);
         // Fake styling only applies with real per-style font slots.
         let styled = cfg!(feature = "bold_italic_fonts");
         let (fake_bold, fake_italic) = (styled && fake_bold, styled && fake_italic);
@@ -88,11 +94,13 @@ fn font_runs<'f>(
                     && run.fake_italic == fake_italic =>
             {
                 run.bytes.end = end;
+                run.symbols |= class.is_symbol();
             }
             _ => runs.push(FontRun {
                 font,
                 fake_bold,
                 fake_italic,
+                symbols: class.is_symbol(),
                 bytes: start..end,
             }),
         }
@@ -270,9 +278,9 @@ pub struct BevyTerminalBackend {
     pub(super) buffer: UnicodeBuffer,
     pub(super) row: String,
     pub(super) rowmap: Vec<u16>,
-    /// Scratch for `shape_row`: which cells of the row being shaped already
-    /// have a cell instance (so a further glyph there becomes an overlay).
-    covered: Vec<bool>,
+    /// Scratch for `shape_row`: what each cell of the row being shaped has
+    /// drawn so far (a further glyph in a drawn cell becomes an overlay).
+    covered: Vec<Cover>,
     /// Scratch for `shape_row`: the row's glyphs, in shaping order.
     glyphs: Vec<RowGlyph>,
 
@@ -432,6 +440,203 @@ fn px_u16(px: u32) -> u16 {
     px.min(u16::MAX as u32) as u16
 }
 
+/// What `shape_row` has drawn into a cell so far.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cover {
+    /// Nothing yet: the cell's first glyph writes it outright.
+    Free,
+    /// A glyph: further glyphs there are overlays.
+    Glyph,
+    /// The right half of the symbol to its left, spread over this blank
+    /// cell: the cell's own (blank) glyph is not drawn.
+    SymbolTail,
+}
+
+/// A cell's foreground and background as instance colors.
+/// `Modifier::REVERSED` swaps them; with `transparent_reset_bg`, a cell
+/// whose *effective* background is `Color::Reset` gets alpha 0.
+fn cell_colors(
+    cell: &Cell,
+    reset_fg: Rgb,
+    reset_bg: Rgb,
+    transparent_reset_bg: bool,
+) -> ([u8; 4], [u8; 4]) {
+    use crate::backend::c2c;
+    let reverse = cell.modifier.contains(ratatui::style::Modifier::REVERSED);
+    // The color actually being used *as the background* - `cell.fg` when
+    // reversed. Checked against `Color::Reset` before `c2c()` resolves it
+    // to an opaque RGB, since that resolution is exactly what erases the
+    // "this cell has no explicit background" information
+    // `transparent_reset_bg` needs.
+    let bg_source = if reverse { cell.fg } else { cell.bg };
+    let [bg_r, bg_g, bg_b] = if reverse {
+        c2c(cell.fg, reset_fg)
+    } else {
+        c2c(cell.bg, reset_bg)
+    };
+    let [fg_r, fg_g, fg_b] = if reverse {
+        c2c(cell.bg, reset_bg)
+    } else {
+        c2c(cell.fg, reset_fg)
+    };
+    let bg_alpha = if transparent_reset_bg && matches!(bg_source, ratatui::style::Color::Reset) {
+        0
+    } else {
+        255
+    };
+    ([fg_r, fg_g, fg_b, 255], [bg_r, bg_g, bg_b, bg_alpha])
+}
+
+/// The styling part of a glyph's atlas key: bold/italic only matter with
+/// real per-style fonts.
+fn key_style(cell: &Cell) -> ratatui::style::Modifier {
+    #[cfg(feature = "bold_italic_fonts")]
+    let style = cell.modifier & (ratatui::style::Modifier::BOLD | ratatui::style::Modifier::ITALIC);
+    #[cfg(not(feature = "bold_italic_fonts"))]
+    let style = {
+        let _ = cell;
+        ratatui::style::Modifier::empty()
+    };
+    style
+}
+
+/// What [`draw_symbol`] needs to know about the row being shaped.
+struct SymbolRow<'a> {
+    fonts: &'a Fonts,
+    cells: &'a [Cell],
+    y: usize,
+    /// `reset_fg`, `reset_bg`, `transparent_reset_bg` - see [`cell_colors`].
+    colors: (Rgb, Rgb, bool),
+}
+
+/// Draws the first glyph of cell `x` if the cell is a symbol (see
+/// [`crate::backend::glyph_constraint`]), returning whether it was: fitted
+/// to the grid by its constraint, across two cells when [`symbol_span`]
+/// allows it. A two-cell symbol is one instance over both cells when their
+/// backgrounds match, else one per cell - the blank keeps its own
+/// background and draws the slot's right half - and the blank is marked
+/// [`Cover::SymbolTail`] so its own glyph is skipped. Either way each cell
+/// is written once, by the cell pipeline.
+///
+/// Out of line: symbols are rare, and the text path in `shape_row`
+/// compiles as it would without them.
+///
+/// [`symbol_span`]: crate::backend::glyph_constraint::symbol_span
+#[inline(never)]
+fn draw_symbol(
+    row: &SymbolRow,
+    glyph: &RowGlyph,
+    font: &crate::fonts::Font,
+    x: usize,
+    covered: &mut [Cover],
+    shared: &mut crate::fonts::SharedFontCpuState,
+    out: &mut RowGeometry,
+) -> bool {
+    use crate::backend::glyph_constraint::{is_blank, symbol_span};
+    use unicode_width::UnicodeWidthChar;
+
+    // A cell's class rides along with its (cached) font choice.
+    let mut class_of = |cell: &Cell| match cell.symbol() {
+        "" => CellClass::TEXT,
+        _ => {
+            row.fonts
+                .font_for_cell_cached(cell, &mut shared.font_choices)
+                .3
+        }
+    };
+    let cell = &row.cells[x];
+    let class = class_of(cell);
+    if !class.is_symbol() {
+        return false;
+    }
+    let ch = cell.symbol().chars().next().unwrap_or(' ');
+    let cell_width_px = row.fonts.min_width_px();
+    let cell_height_px = row.fonts.height_px();
+
+    // Wide chars own their second cell already; a narrow symbol may take
+    // the next one if it is blank and not drawn yet (only possible in a
+    // right-to-left run).
+    let span = match ch.width().unwrap_or(1).max(1) as u32 {
+        1 => {
+            let blank_next = row
+                .cells
+                .get(x + 1)
+                .is_some_and(|next| is_blank(next.symbol()))
+                && covered[x + 1] == Cover::Free;
+            let prev = x.checked_sub(1).map(|prev| class_of(&row.cells[prev]));
+            symbol_span(class, prev, blank_next)
+        }
+        wide => wide,
+    };
+    let spreads = span == 2 && ch.width() == Some(1);
+    let width_px = span * cell_width_px;
+
+    let key = Key {
+        style: key_style(cell),
+        glyph: glyph.glyph_id,
+        font: font.id(),
+        cells: span as u8,
+    };
+    let cached = shared.cached.get(&key, width_px, cell_height_px);
+    if !cached.cached() {
+        let face = font.font();
+        let mut info = rustybuzz::GlyphInfo::default();
+        info.glyph_id = glyph.glyph_id;
+        // No fake styling: it would push the glyph out of the box its
+        // constraint fitted it to.
+        let (rect, image) = rasterize_glyph(
+            cached,
+            face,
+            &info,
+            false,
+            false,
+            cell_height_px as f32 / face.height() as f32,
+            Placement::Constrained {
+                constraint: GlyphConstraint::for_symbol(ch),
+                metrics: row.fonts.cell_metrics(),
+                cells: span,
+            },
+        );
+        shared
+            .pending_cache_updates
+            .push((rect, glyph_coverage(&image)));
+    }
+
+    let (reset_fg, reset_bg, transparent) = row.colors;
+    let (fg, bg) = cell_colors(cell, reset_fg, reset_bg, transparent);
+    let x_px = x as u32 * cell_width_px;
+    let instance = |x_px: u32, width_px: u32, u: u32, bg: [u8; 4]| CellInstance {
+        rect: [
+            px_u16(x_px),
+            px_u16(row.y as u32 * cell_height_px),
+            px_u16(width_px),
+            px_u16(cell_height_px),
+        ],
+        uv: [px_u16(u), px_u16(cached.y)],
+        fg,
+        bg,
+    };
+    covered[x] = Cover::Glyph;
+    if !spreads {
+        out.cells.push(instance(x_px, width_px, cached.x, bg));
+        return true;
+    }
+    let (_, tail_bg) = cell_colors(&row.cells[x + 1], reset_fg, reset_bg, transparent);
+    if tail_bg == bg {
+        out.cells.push(instance(x_px, width_px, cached.x, bg));
+    } else {
+        out.cells.push(instance(x_px, cell_width_px, cached.x, bg));
+        out.cells.push(instance(
+            x_px + cell_width_px,
+            cell_width_px,
+            cached.x + cell_width_px,
+            tail_bg,
+        ));
+    }
+    covered[x + 1] = Cover::SymbolTail;
+    true
+}
+
 impl BevyTerminalBackend {
     /// Whether the most recent `draw()` call's ratatui buffer diff touched
     /// at least one cell. `false` means the redraw was byte-identical to
@@ -516,6 +721,7 @@ impl BevyTerminalBackend {
                 style: Modifier::empty(),
                 glyph: unicode_char as u32,
                 font: font_id,
+                cells: 1,
             };
 
             // Get atlas slot (this allocates space in the shared atlas -
@@ -731,8 +937,6 @@ impl BevyTerminalBackend {
         shared: &mut crate::fonts::SharedFontCpuState,
         out: &mut RowGeometry,
     ) {
-        use crate::backend::c2c;
-
         out.cells.clear();
         out.overlays.clear();
 
@@ -760,7 +964,7 @@ impl BevyTerminalBackend {
             return;
         }
         self.covered.clear();
-        self.covered.resize(row_cells.len(), false);
+        self.covered.resize(row_cells.len(), Cover::Free);
 
         // One run per stretch of cells resolving to the same font, so each
         // char is shaped by a font that actually has it.
@@ -833,6 +1037,30 @@ impl BevyTerminalBackend {
                 continue;
             }
 
+            let cover = self.covered[cell_idx];
+            if cover != Cover::Free {
+                if cover == Cover::SymbolTail {
+                    // Already drawn by the symbol to its left.
+                    continue;
+                }
+            } else if run.symbols // false for practically every run of text
+                && draw_symbol(
+                    &SymbolRow {
+                        fonts: &self.fonts,
+                        cells: row_cells,
+                        y,
+                        colors: (self.reset_fg, self.reset_bg, self.transparent_reset_bg),
+                    },
+                    glyph,
+                    run.font,
+                    cell_idx,
+                    &mut self.covered,
+                    shared,
+                    out,
+                )
+            {
+                continue;
+            }
             let cell = &row_cells[cell_idx];
 
             let (cell_font, cell_fake_bold, cell_fake_italic) =
@@ -867,24 +1095,21 @@ impl BevyTerminalBackend {
             // For programmatic glyphs: use Unicode codepoint + last_resort font (matches populate_programmatic_glyphs)
             // For font glyphs: use shaped glyph ID + actual font
 
-            #[cfg(feature = "bold_italic_fonts")]
-            let style =
-                cell.modifier & (ratatui::style::Modifier::BOLD | ratatui::style::Modifier::ITALIC);
-
-            #[cfg(not(feature = "bold_italic_fonts"))]
-            let style = ratatui::style::Modifier::empty();
+            let style = key_style(cell);
 
             let key = if is_programmatic {
                 Key {
                     style,
                     glyph: ch as u32,
                     font: last_resort_id,
+                    cells: ch_width as u8,
                 }
             } else {
                 Key {
                     style,
                     glyph: glyph.glyph_id,
                     font: cell_font.id(),
+                    cells: ch_width as u8,
                 }
             };
 
@@ -934,9 +1159,10 @@ impl BevyTerminalBackend {
                         final_fake_italic, // Don't distort emoji
                         final_fake_bold,   // Don't distort emoji
                         advance_scale,
-                        glyph_width_px,   // Use actual glyph width
-                        bearing_offset_x, // Apply offset in atlas
-                        fit_x,
+                        Placement::Natural {
+                            bearing_offset_x, // Apply offset in atlas
+                            fit_x,
+                        },
                     );
 
                     shared
@@ -945,31 +1171,12 @@ impl BevyTerminalBackend {
                 }
             }
 
-            // Get colors
-            let reverse = cell.modifier.contains(ratatui::style::Modifier::REVERSED);
-            // The color actually being used *as the background* -
-            // `cell.fg` when reversed, matching the swap below. Checked
-            // against `Color::Reset` before `c2c()` resolves it to an
-            // opaque RGB, since that resolution is exactly what erases
-            // the "this cell has no explicit background" information
-            // `transparent_reset_bg` needs.
-            let bg_source = if reverse { cell.fg } else { cell.bg };
-            let [bg_r, bg_g, bg_b] = if reverse {
-                c2c(cell.fg, self.reset_fg)
-            } else {
-                c2c(cell.bg, self.reset_bg)
-            };
-            let [fg_r, fg_g, fg_b] = if reverse {
-                c2c(cell.bg, self.reset_bg)
-            } else {
-                c2c(cell.fg, self.reset_fg)
-            };
-            let bg_alpha =
-                if self.transparent_reset_bg && matches!(bg_source, ratatui::style::Color::Reset) {
-                    0
-                } else {
-                    255
-                };
+            let (fg, bg) = cell_colors(
+                cell,
+                self.reset_fg,
+                self.reset_bg,
+                self.transparent_reset_bg,
+            );
 
             // Aligned to the cell grid (the glyph's bearing is already
             // baked into its atlas slot), sampled 1:1 from the atlas.
@@ -981,15 +1188,16 @@ impl BevyTerminalBackend {
                     px_u16(cell_height_px),
                 ],
                 uv: [px_u16(cached.x), px_u16(cached.y)],
-                fg: [fg_r, fg_g, fg_b, 255],
-                bg: [bg_r, bg_g, bg_b, bg_alpha],
+                fg,
+                bg,
             };
             // The first glyph of a cell writes the whole cell (background
             // included); any further glyph there is blended on top.
-            if std::mem::replace(&mut self.covered[cell_idx], true) {
-                out.overlays.push(instance);
-            } else {
+            if cover == Cover::Free {
+                self.covered[cell_idx] = Cover::Glyph;
                 out.cells.push(instance);
+            } else {
+                out.overlays.push(instance);
             }
         }
 
@@ -1757,7 +1965,7 @@ mod shaping_mode_tests {
     const ATLAS: usize = crate::backend::CACHE_WIDTH as usize;
 
     /// Draws a few rows covering ASCII, wide chars, a fallback font,
-    /// combining marks, programmatic glyphs and every style, and composites
+    /// combining marks, programmatic glyphs, symbols and every style, and composites
     /// the resulting instances on the CPU: per-pixel glyph coverage of the
     /// whole terminal.
     fn coverage(shaping: Shaping) -> Vec<u8> {
@@ -1769,7 +1977,7 @@ mod shaping_mode_tests {
         fonts.set_shaping(shaping);
 
         let backend = TerminalBuilder::new(Arc::new(fonts))
-            .with_dimensions(40, 6)
+            .with_dimensions(40, 7)
             .build();
         let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
         let plain = Style::default();
@@ -1783,6 +1991,8 @@ mod shaping_mode_tests {
                 "Both == quick",
                 plain.add_modifier(Modifier::BOLD | Modifier::ITALIC),
             ),
+            // Symbols: spread over a blank, one cell otherwise.
+            ("\u{E000} src \u{E001}x → y \u{E002}\u{E003} ", plain),
         ];
         terminal
             .draw(|frame| {
@@ -1823,5 +2033,227 @@ mod shaping_mode_tests {
         let row = coverage(Shaping::Row);
         assert!(row.iter().any(|&c| c > 0), "something must be drawn");
         assert!(row == coverage(Shaping::Cell));
+    }
+}
+
+// ============================================================================
+// Tests: symbols fitted to the grid (Nerd Font icons, PUA, wide-drawn
+// ambiguous-width symbols). fusion-pixel stands in for a symbol font: its
+// Private Use Area glyphs (U+E000..) and its arrows are drawn a full em
+// wide - more than two cells of the M+ primary.
+// ============================================================================
+
+#[cfg(test)]
+mod symbol_tests {
+    use super::*;
+    use crate::fonts::Font;
+    use ratatui::style::{Color, Style};
+
+    const MPLUS: &[u8] = include_bytes!("../../examples/assets/fonts/Mplus1Code-Regular.ttf");
+    const FUSION: &[u8] =
+        include_bytes!("../../examples/assets/fonts/fusion-pixel-10px-monospaced-ja.ttf");
+    const ATLAS: usize = crate::backend::CACHE_WIDTH as usize;
+    const ICON: &str = "\u{E000}";
+
+    fn fonts(fit_symbols: bool) -> Fonts {
+        let mut fonts = Fonts::new(Font::new(FUSION).expect("fusion-pixel parses"), 16);
+        fonts.add_regular_fonts([Font::new(MPLUS).expect("M+ parses")]);
+        fonts.set_fit_symbols(fit_symbols);
+        fonts
+    }
+
+    /// Draws `rows` (one string each, styled per `style`) and returns the
+    /// payload plus the CPU-composited glyph coverage of the terminal.
+    fn render(
+        fonts: Fonts,
+        rows: &[&str],
+        style: impl Fn(u16, u16) -> Style,
+    ) -> (crate::backend::TerminalDrawPayload, Vec<u8>, usize) {
+        let backend = TerminalBuilder::new(Arc::new(fonts))
+            .with_dimensions(12, rows.len() as u16)
+            .build();
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                let buffer = frame.buffer_mut();
+                for (y, row) in rows.iter().enumerate() {
+                    buffer.set_string(0, y as u16, row, Style::default());
+                    for x in 0..12 {
+                        buffer[(x, y as u16)].set_style(style(x, y as u16));
+                    }
+                }
+            })
+            .expect("draw");
+        let payload = terminal.backend_mut().take_draw_payload();
+        let mut atlas = vec![0u8; ATLAS * ATLAS];
+        for (rect, bytes) in terminal.backend_mut().take_shared_glyph_uploads() {
+            let width = rect.width as usize;
+            for (row, line) in bytes.chunks_exact(width).enumerate() {
+                let start = (rect.y as usize + row) * ATLAS + rect.x as usize;
+                atlas[start..start + width].copy_from_slice(line);
+            }
+        }
+        let width = payload.screen_width_px as usize;
+        let mut image = vec![0u8; width * payload.screen_height_px as usize];
+        for instance in &payload.instances {
+            let [x, y, w, h] = instance.rect.map(usize::from);
+            let [u, v] = instance.uv.map(usize::from);
+            for dy in 0..h {
+                for dx in 0..w {
+                    let pixel = &mut image[(y + dy) * width + x + dx];
+                    *pixel = (*pixel).max(atlas[(v + dy) * ATLAS + u + dx]);
+                }
+            }
+        }
+        (payload, image, width)
+    }
+
+    /// Inked pixel bounds `(x0, x1, y0, y1)` (exclusive ends) of row `row`'s
+    /// first `columns` pixels.
+    fn ink_bounds(
+        image: &[u8],
+        width: usize,
+        row: usize,
+        cell_height: usize,
+        columns: usize,
+    ) -> (usize, usize, usize, usize) {
+        let mut bounds = (usize::MAX, 0, usize::MAX, 0);
+        for y in row * cell_height..(row + 1) * cell_height {
+            for x in 0..columns {
+                if image[y * width + x] > 127 {
+                    bounds = (
+                        bounds.0.min(x),
+                        bounds.1.max(x + 1),
+                        bounds.2.min(y),
+                        bounds.3.max(y + 1),
+                    );
+                }
+            }
+        }
+        bounds
+    }
+
+    #[test]
+    fn a_symbol_before_a_blank_spreads_over_both_cells() {
+        let fonts = fonts(true);
+        let (cw, ch) = (fonts.min_width_px() as u16, fonts.height_px() as u16);
+        let (payload, image, width) = render(
+            fonts,
+            // A no-break space is not blank: it leaves the icon one cell.
+            &[&format!("{ICON} a"), &format!("{ICON}\u{A0}a")],
+            |_, _| Style::default(),
+        );
+
+        // Row 0: one instance across the icon cell and the blank, then 'a'.
+        let row0: Vec<_> = payload.cells().iter().filter(|i| i.rect[1] == 0).collect();
+        assert_eq!(row0[0].rect, [0, 0, 2 * cw, ch]);
+        assert!(
+            row0.iter().all(|i| i.rect[0] != cw),
+            "the blank draws no glyph of its own"
+        );
+        // Row 1: no blank after it - one cell.
+        let row1: Vec<_> = payload.cells().iter().filter(|i| i.rect[1] == ch).collect();
+        assert_eq!(row1[0].rect, [0, ch, cw, ch]);
+        assert_ne!(
+            row0[0].uv, row1[0].uv,
+            "one- and two-cell renderings are separate atlas entries"
+        );
+
+        // Fitted, not squeezed: the em-wide square icon fills the two
+        // cells and stays square; in one cell it shrinks to a square there.
+        let (x0, x1, y0, y1) = ink_bounds(&image, width, 0, ch as usize, 2 * cw as usize);
+        assert!(
+            x0 < 2 && x1 > (2 * cw - 2) as usize && x1 <= (2 * cw) as usize,
+            "{x0}..{x1}"
+        );
+        assert!(
+            (x1 - x0).abs_diff(y1 - y0) <= 2,
+            "aspect kept: {}x{}",
+            x1 - x0,
+            y1 - y0
+        );
+        let (x0, x1, y0, y1) = ink_bounds(&image, width, 1, ch as usize, 2 * cw as usize);
+        assert!(x1 <= cw as usize, "stays in its cell: {x0}..{x1}");
+        assert!(
+            (x1 - x0).abs_diff(y1 - y0) <= 2,
+            "aspect kept: {}x{}",
+            x1 - x0,
+            y1 - y0
+        );
+    }
+
+    #[test]
+    fn the_blank_keeps_its_own_background() {
+        let fonts = fonts(true);
+        let cw = fonts.min_width_px() as u16;
+        let (payload, ..) = render(fonts, &[&format!("{ICON} a")], |x, _| {
+            Style::default().bg(if x == 1 {
+                Color::Rgb(1, 2, 3)
+            } else {
+                Color::Rgb(9, 9, 9)
+            })
+        });
+        let cells = payload.cells();
+        assert_eq!(cells[0].rect[0..3], [0, 0, cw]);
+        assert_eq!(cells[1].rect[0..3], [cw, 0, cw]);
+        assert_eq!(
+            cells[1].uv,
+            [cells[0].uv[0] + cw, cells[0].uv[1]],
+            "the slot's right half"
+        );
+        assert_eq!(cells[1].fg, cells[0].fg, "drawn in the symbol's color");
+        assert_eq!(cells[1].bg, [1, 2, 3, 255]);
+        assert_eq!(cells[0].bg, [9, 9, 9, 255]);
+        assert!(payload.overlays().is_empty());
+    }
+
+    #[test]
+    fn symbols_stay_in_one_cell_in_a_run_at_the_row_end_or_when_disabled() {
+        let fonts_on = fonts(true);
+        let (cw, ch) = (fonts_on.min_width_px() as u16, fonts_on.height_px() as u16);
+        let widths = |payload: &crate::backend::TerminalDrawPayload, row: u16| -> Vec<u16> {
+            payload
+                .cells()
+                .iter()
+                .filter(|i| i.rect[1] == row * ch)
+                .map(|i| i.rect[2])
+                .collect()
+        };
+        let row_end = format!("{}{ICON}", " ".repeat(11));
+        let (payload, ..) = render(
+            fonts_on,
+            &[&format!("{ICON}{ICON} "), &row_end, "\u{E0B0}\u{E001} x"],
+            |_, _| Style::default(),
+        );
+        // A symbol after a symbol stays in one cell.
+        assert_eq!(widths(&payload, 0)[..2], [cw, cw]);
+        assert_eq!(*widths(&payload, 1).last().unwrap(), cw, "last column");
+        // A Powerline separator doesn't hold the next symbol back.
+        assert_eq!(widths(&payload, 2)[..2], [cw, 2 * cw]);
+
+        let (payload, image, width) = render(fonts(false), &[&format!("{ICON} a")], |_, _| {
+            Style::default()
+        });
+        assert_eq!(
+            widths(&payload, 0)[..2],
+            [cw, cw],
+            "disabled: drawn like text"
+        );
+        let (x0, x1, ..) = ink_bounds(&image, width, 0, ch as usize, 2 * cw as usize);
+        assert!(
+            x1 <= cw as usize && x1 - x0 >= cw as usize - 1,
+            "squeezed into one cell: {x0}..{x1}"
+        );
+    }
+
+    #[test]
+    fn a_wide_drawn_ambiguous_symbol_spreads_like_an_icon() {
+        // fusion-pixel draws '→' a full em wide; unicode-width says 1 cell.
+        let fonts = fonts(true);
+        let (cw, ch) = (fonts.min_width_px() as u16, fonts.height_px() as u16);
+        let (payload, ..) = render(fonts, &["→ x", "→x"], |_, _| Style::default());
+        assert_eq!(payload.cells()[0].rect, [0, 0, 2 * cw, ch]);
+        let row1: Vec<_> = payload.cells().iter().filter(|i| i.rect[1] == ch).collect();
+        assert_eq!(row1[0].rect, [0, ch, cw, ch]);
     }
 }

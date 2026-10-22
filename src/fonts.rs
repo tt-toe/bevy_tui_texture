@@ -243,6 +243,7 @@ pub struct Fonts {
     char_width: u32,
     char_height: u32,
     shaping: Shaping,
+    fit_symbols: bool,
 
     last_resort: Font,
 
@@ -270,6 +271,7 @@ impl Fonts {
             char_width: font.char_width(size_px),
             char_height: size_px,
             shaping: Shaping::default(),
+            fit_symbols: true,
             last_resort: font,
             regular: vec![],
             bold: vec![],
@@ -288,6 +290,73 @@ impl Fonts {
     /// The shaping mode set by [`Self::set_shaping`].
     pub fn shaping(&self) -> Shaping {
         self.shaping
+    }
+
+    /// Whether symbols are fitted to the cell grid (default `true`). Set it
+    /// while building the collection, before it is shared with a terminal.
+    ///
+    /// A symbol is a Nerd Font icon (or anything else in a Private Use
+    /// Area) or an ambiguous-width character its font draws wider than a
+    /// cell, such as the arrows and stars of Japanese fonts. When enabled,
+    /// each is scaled and aligned into its cells by the rules Nerd Fonts'
+    /// font-patcher uses for that codepoint (aspect ratio kept, shrunk to
+    /// fit otherwise), and may take two cells when the cell after it is
+    /// blank - the convention of Ghostty, kitty and WezTerm: in
+    /// `"\u{f07b} src"`, the folder icon is drawn full size over its own
+    /// cell and the space. A symbol right after another symbol stays in one
+    /// cell, so a run of them keeps its alignment.
+    ///
+    /// When disabled, symbols are drawn like text: one cell, squeezed
+    /// horizontally when their font draws them wider.
+    pub fn set_fit_symbols(&mut self, enabled: bool) {
+        self.fit_symbols = enabled;
+    }
+
+    /// Whether symbols are fitted to the cell grid - see
+    /// [`Self::set_fit_symbols`].
+    pub fn fit_symbols(&self) -> bool {
+        self.fit_symbols
+    }
+
+    /// The cell grid symbol constraints resolve against. The one-cell icon
+    /// height follows font-patcher: `(2 * cap height + line height) / 3`
+    /// of the primary font.
+    pub(crate) fn cell_metrics(&self) -> crate::backend::glyph_constraint::CellMetrics {
+        let primary = self.regular.first().unwrap_or(&self.last_resort).font();
+        let cap_height = primary
+            .capital_height()
+            .filter(|&cap| cap > 0)
+            .or_else(|| {
+                let h = primary.glyph_index('H')?;
+                Some(primary.glyph_bounding_box(h)?.y_max)
+            })
+            .map_or(primary.ascender() as f32 * 0.75, f32::from);
+        let cell_height = self.char_height as f32;
+        let cap_px = cap_height * cell_height / primary.height() as f32;
+        crate::backend::glyph_constraint::CellMetrics {
+            cell_width: self.char_width as f32,
+            cell_height,
+            icon_height_single: (2.0 * cap_px + cell_height) / 3.0,
+        }
+    }
+
+    /// Whether `ch`, drawn by `font`, is a symbol - see
+    /// [`crate::backend::glyph_constraint::CellClass::of`]. Always text
+    /// when [`Self::fit_symbols`] is off.
+    fn cell_class(&self, ch: char, font: &Font) -> crate::backend::glyph_constraint::CellClass {
+        use crate::backend::glyph_constraint::CellClass;
+        if !self.fit_symbols {
+            return CellClass::TEXT;
+        }
+        let advance_px = || {
+            let face = font.font();
+            let advance = face
+                .glyph_index(ch)
+                .and_then(|glyph| face.glyph_hor_advance(glyph))
+                .unwrap_or_default();
+            advance as f32 * self.char_height as f32 / face.height() as f32
+        };
+        CellClass::of(ch, advance_px, self.char_width as f32)
     }
 
     /// Stable identity for this `Fonts` instance - used to key the
@@ -474,25 +543,34 @@ impl Fonts {
         1 + self.bold.len() + self.italic.len() + self.bold_italic.len() + self.regular.len()
     }
 
-    /// [`Self::font_for_cell`], memoized through `cache` for the usual
+    /// [`Self::font_for_cell`] plus the cell's symbol class (see
+    /// [`Self::set_fit_symbols`]), memoized through `cache` for the usual
     /// single-`char` symbol. Multi-codepoint clusters always take the full
-    /// probe (the best font depends on every codepoint of the cluster).
+    /// probe (the best font depends on every codepoint of the cluster) and
+    /// are classified by their first char.
     pub(crate) fn font_for_cell_cached(
         &self,
         cell: &Cell,
         cache: &mut crate::utils::shape_cache::FontChoiceCache,
-    ) -> (&Font, bool, bool) {
+    ) -> (
+        &Font,
+        bool,
+        bool,
+        crate::backend::glyph_constraint::CellClass,
+    ) {
         let mut chars = cell.symbol().chars();
         let (Some(ch), None) = (chars.next(), chars.next()) else {
-            return self.font_for_cell(cell);
+            let (font, fake_bold, fake_italic) = self.font_for_cell(cell);
+            let first = cell.symbol().chars().next().unwrap_or(' ');
+            return (font, fake_bold, fake_italic, self.cell_class(first, font));
         };
         let style = u8::from(cell.modifier.contains(ratatui::style::Modifier::BOLD))
             | u8::from(cell.modifier.contains(ratatui::style::Modifier::ITALIC)) << 1;
-        let (id, fake_bold, fake_italic) = cache.get_or_insert_with(ch, style, || {
+        let (id, fake_bold, fake_italic, class) = cache.get_or_insert_with(ch, style, || {
             let (font, fake_bold, fake_italic) = self.font_for_cell(cell);
-            (font.id(), fake_bold, fake_italic)
+            (font.id(), fake_bold, fake_italic, self.cell_class(ch, font))
         });
-        (self.font_by_id(id), fake_bold, fake_italic)
+        (self.font_by_id(id), fake_bold, fake_italic, class)
     }
 
     /// The font with this id. Ids come from this same `Fonts` (via

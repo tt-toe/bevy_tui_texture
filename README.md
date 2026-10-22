@@ -13,6 +13,7 @@ https://github.com/user-attachments/assets/64e1e136-7d2d-4e32-9c10-1da2cfb78ccd
 - **Flexible display targets** — Bevy UI nodes, world-unit 3D quads, or attach to an existing mesh (e.g. a glTF screen) via `AttachTerminal`
 - **Interactive input** — keyboard, mouse, and touch (taps emulate left-click) with focus management and per-widget hit testing
 - **Full Unicode** — CJK support, font fallback chains, and procedural box-drawing / block / Braille / powerline glyphs
+- **Nerd Font icons** — icons (and other symbols, e.g. the full-width arrows of Japanese fonts) are fitted to the cell grid by Nerd Fonts' own scaling rules and spread over two cells when followed by a space, as in Ghostty, kitty and WezTerm (`Fonts::set_fit_symbols(false)` turns it off)
 - **Efficient updates** — dirty-cell tracking, partial row redraws, and a glyph atlas shared across terminals using the same fonts
 - **WebAssembly** — runs in the browser on WebGL2
 

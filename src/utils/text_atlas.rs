@@ -6,11 +6,27 @@ use tracing::info;
 
 use crate::Fonts;
 
-#[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) struct Key {
     pub(crate) style: Modifier,
+    /// Glyph id, or the codepoint of a procedurally drawn glyph (< 2^21).
     pub(crate) glyph: u32,
     pub(crate) font: u64,
+    /// Cells the glyph is rasterized across: a symbol drawn into one cell
+    /// and the same symbol spread over two are different images.
+    pub(crate) cells: u8,
+}
+
+/// One hasher write per lookup instead of one per field: the font id is
+/// already a random 64-bit hash, so the small fields are folded into it,
+/// each in its own bits. Keys that differ only in their font still differ
+/// after the XOR; a coincidence across fonts is a mere collision.
+impl std::hash::Hash for Key {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let small =
+            u64::from(self.style.bits()) << 48 | u64::from(self.glyph) << 8 | u64::from(self.cells);
+        state.write_u64(self.font ^ small);
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -220,6 +236,7 @@ mod tests {
                     style: Modifier::default(),
                     glyph: idx as _,
                     font: idx as _,
+                    cells: 1,
                 },
                 char_width,
                 char_height,
@@ -230,6 +247,7 @@ mod tests {
             style: Modifier::default(),
             glyph: u32::MAX,
             font: u32::MAX as _,
+            cells: 1,
         };
 
         let last_inserted = atlas.get(&last_key, char_width, char_height);
@@ -243,6 +261,7 @@ mod tests {
             style: Modifier::default(),
             glyph,
             font: 0,
+            cells: 1,
         }
     }
 

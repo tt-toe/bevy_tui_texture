@@ -3,6 +3,7 @@ use bitvec::slice::BitSlice;
 use raqote::{DrawOptions, DrawTarget, SolidSource, Transform};
 use rustybuzz::ttf_parser::{GlyphId, RasterGlyphImage, RasterImageFormat, RgbaColor};
 
+use crate::backend::glyph_constraint::{CellMetrics, GlyphConstraint, GlyphRect};
 use crate::utils::text_atlas::{CacheRect, Entry};
 use crate::utils::{Outline, Painter};
 
@@ -110,7 +111,85 @@ fn apply_fake_bold(target: &mut DrawTarget<&mut [u32]>, path: &raqote::Path, bas
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Where a glyph lands in its atlas slot.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum Placement<'a> {
+    /// Where its font puts it: baseline at the font's ascender, shifted by
+    /// the shaper's `bearing_offset_x` (pixels) and squeezed horizontally
+    /// by `fit_x` (<= 1, see `fit_to_cells`).
+    Natural { bearing_offset_x: f32, fit_x: f32 },
+    /// Scaled and aligned into the slot's `cells` cells by a symbol
+    /// constraint.
+    Constrained {
+        constraint: &'a GlyphConstraint,
+        metrics: CellMetrics,
+        cells: u32,
+    },
+}
+
+/// Font units -> pixels of the 2x supersampled canvas:
+/// `(x * sx + tx, -y * sy + ty)`.
+struct CanvasTransform {
+    sx: f32,
+    sy: f32,
+    tx: f32,
+    ty: f32,
+}
+
+impl CanvasTransform {
+    fn new(
+        face: &rustybuzz::Face,
+        glyph: GlyphId,
+        advance_scale: f32,
+        cell_height: f32,
+        placement: Placement,
+    ) -> Self {
+        let natural = |bearing_offset_x: f32, fit_x: f32| Self {
+            sx: advance_scale * 2.0 * fit_x,
+            sy: advance_scale * 2.0,
+            tx: bearing_offset_x,
+            ty: face.ascender() as f32 * advance_scale * 2.0,
+        };
+        let (constraint, metrics, cells) = match placement {
+            Placement::Natural {
+                bearing_offset_x,
+                fit_x,
+            } => return natural(bearing_offset_x, fit_x),
+            Placement::Constrained {
+                constraint,
+                metrics,
+                cells,
+            } => (constraint, metrics, cells),
+        };
+        // Constraints work on the ink box; a glyph without ink has nothing
+        // to place.
+        let Some(bbox) = face
+            .glyph_bounding_box(glyph)
+            .filter(|b| b.x_max > b.x_min && b.y_max > b.y_min)
+        else {
+            return natural(0.0, 1.0);
+        };
+        let (x_min, x_max) = (bbox.x_min as f32, bbox.x_max as f32);
+        let (y_min, y_max) = (bbox.y_min as f32, bbox.y_max as f32);
+        let ascender = face.ascender() as f32;
+        let ink = GlyphRect {
+            x: x_min * advance_scale,
+            y: cell_height - (ascender - y_min) * advance_scale,
+            width: (x_max - x_min) * advance_scale,
+            height: (y_max - y_min) * advance_scale,
+        };
+        let placed = constraint.constrain(ink, &metrics, cells);
+        let (kx, ky) = (placed.width / ink.width, placed.height / ink.height);
+        let top = cell_height - (placed.y + placed.height);
+        Self {
+            sx: advance_scale * 2.0 * kx,
+            sy: advance_scale * 2.0 * ky,
+            tx: 2.0 * (placed.x - x_min * advance_scale * kx),
+            ty: 2.0 * (top + y_max * advance_scale * ky),
+        }
+    }
+}
+
 pub(super) fn rasterize_glyph(
     cached: Entry,
     metrics: &rustybuzz::Face,
@@ -118,15 +197,16 @@ pub(super) fn rasterize_glyph(
     fake_italic: bool,
     fake_bold: bool,
     advance_scale: f32,
-    actual_width: u32,
-    bearing_offset_x: f32, // Horizontal bearing offset from rustybuzz
-    fit_x: f32,            // Horizontal squeeze (<= 1.0) fitting a too-wide glyph into its cells
+    placement: Placement,
 ) -> (CacheRect, Vec<u32>) {
-    let scale = cached.width as f32 / actual_width as f32;
-    // Apply bearing offset to position glyph within atlas entry
-    let computed_offset_x = -(cached.width as f32 * (1.0 - scale)) + bearing_offset_x;
-    let computed_offset_y = cached.height as f32 * (1.0 - scale);
-    let scale = scale * advance_scale * 2.0;
+    let natural = matches!(placement, Placement::Natural { .. });
+    let CanvasTransform { sx, sy, tx, ty } = CanvasTransform::new(
+        metrics,
+        GlyphId(info.glyph_id as _),
+        advance_scale,
+        cached.height as f32,
+        placement,
+    );
 
     let skew = if fake_italic {
         Transform::new(
@@ -151,12 +231,12 @@ pub(super) fn rasterize_glyph(
     let mut painter = Painter::new(
         metrics,
         &mut target,
-        // `Painter` applies this after its uniform `scale`, so the
-        // squeeze lands on x alone - same as the outline path below.
-        Transform::scale(fit_x, 1.0).then(&skew),
-        scale,
-        metrics.ascender() as f32 * scale + computed_offset_y,
-        computed_offset_x,
+        // `Painter` applies this after its uniform `sy`, so the x-only
+        // part lands on x alone - same as the outline path below.
+        Transform::scale(sx / sy, 1.0).then(&skew),
+        sy,
+        ty,
+        tx,
     );
     if metrics
         .paint_color_glyph(
@@ -208,13 +288,12 @@ pub(super) fn rasterize_glyph(
         // Some fonts return bounds that are entirely negative. I'm not sure why this
         // is, but it means the glyph won't render at all. We check for this here and
         // offset it if so. This seems to let those fonts render correctly.
-        let x_off = if bounds.x_max < 0 {
+        let x_off = if natural && bounds.x_max < 0 {
             -bounds.x_min as f32
         } else {
             0.
         };
-        let x_off = x_off * scale * fit_x + computed_offset_x;
-        let y_off = metrics.ascender() as f32 * scale + computed_offset_y;
+        let x_off = x_off * sx + tx;
 
         let mut target = DrawTarget::from_backing(
             cached.width as i32 * 2,
@@ -222,9 +301,9 @@ pub(super) fn rasterize_glyph(
             &mut image[..],
         );
         target.set_transform(
-            &Transform::scale(scale * fit_x, -scale)
+            &Transform::scale(sx, -sy)
                 .then(&skew)
-                .then_translate((x_off, y_off).into()),
+                .then_translate((x_off, ty).into()),
         );
 
         target.fill(
@@ -234,7 +313,7 @@ pub(super) fn rasterize_glyph(
         );
 
         if fake_bold {
-            let bold_offset = calculate_bold_offset(metrics, scale);
+            let bold_offset = calculate_bold_offset(metrics, sy);
             apply_fake_bold(&mut target, &path, bold_offset);
         }
 

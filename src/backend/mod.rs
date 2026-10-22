@@ -41,6 +41,7 @@
 //! - **Unicode Shaping** - Full Unicode support with complex text layout
 
 pub mod bevy_backend;
+pub(crate) mod glyph_constraint;
 pub(crate) mod programmatic_glyphs;
 pub(crate) mod rasterize;
 

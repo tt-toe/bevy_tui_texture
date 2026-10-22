@@ -99,12 +99,13 @@ impl FontCellShapes {
     }
 }
 
-/// Which font renders a cell, and with which fake styling - the result of
-/// `Fonts::font_for_cell`, stored by font id so it can outlive the borrow.
-type FontChoice = (u64, bool, bool);
+/// Which font renders a cell, with which fake styling, and whether the
+/// glyph is a symbol - the result of `Fonts::font_for_cell` plus
+/// `Fonts::cell_class`, stored by font id so it can outlive the borrow.
+pub(crate) type FontChoice = (u64, bool, bool, crate::backend::glyph_constraint::CellClass);
 
-/// Memoizes `Fonts::font_for_cell` for single-`char` symbols (practically
-/// every cell). The uncached probe walks the fallback chain doing a cmap
+/// Memoizes `Fonts::font_for_cell` (and the cell's symbol class) for
+/// single-`char` symbols (practically every cell). The uncached probe walks the fallback chain doing a cmap
 /// lookup per font, for every cell of every reshaped row; a `Fonts` is
 /// immutable once shared, so its answer for a given `(char, bold, italic)`
 /// never changes.
@@ -222,11 +223,28 @@ mod tests {
 
     #[test]
     fn font_choices_are_memoized_per_char_and_style() {
+        use crate::backend::glyph_constraint::CellClass;
+        let text = CellClass::TEXT;
         let mut cache = FontChoiceCache::new();
-        assert_eq!(cache.get_or_insert_with('a', 0, || (1, false, false)).0, 1);
+        assert_eq!(
+            cache
+                .get_or_insert_with('a', 0, || (1, false, false, text))
+                .0,
+            1
+        );
         assert_eq!(cache.get_or_insert_with('a', 0, || panic!("cached")).0, 1);
-        assert_eq!(cache.get_or_insert_with('a', 1, || (2, true, false)).0, 2);
-        assert_eq!(cache.get_or_insert_with('あ', 0, || (3, false, false)).0, 3);
+        assert_eq!(
+            cache
+                .get_or_insert_with('a', 1, || (2, true, false, text))
+                .0,
+            2
+        );
+        assert_eq!(
+            cache
+                .get_or_insert_with('あ', 0, || (3, false, false, text))
+                .0,
+            3
+        );
         assert_eq!(cache.get_or_insert_with('あ', 0, || panic!("cached")).0, 3);
     }
 }

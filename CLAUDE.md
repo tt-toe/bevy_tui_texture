@@ -33,6 +33,8 @@ cargo run --example shader_mesh         # ExtendedMaterial CRT shader effects
 cargo run --example retro_crt           # full CRT demo: glTF + shader + overlay UI
 cargo run --example resize              # Tui::request_resize following the window
 cargo run --example transparent_world_quad  # see-through HUD screen
+NERD_FONT=/path/to/SymbolsNerdFontMono-Regular.ttf \
+  cargo run --example nerd_font_icons   # icons fitted (left) vs. squeezed (right)
 cargo run --example benchmark           # full-frame throughput
 cargo run --example benchmark_partial   # BENCH_MODE=static|partial redraw costs
 
@@ -149,6 +151,17 @@ by a second, alpha-blended pipeline over the tail of the same instance
 buffer (`TerminalDrawPayload::cell_count` splits the two ranges). A
 row-clear rectangle is a cell instance with `fg` alpha 0.
 
+A *symbol* (Nerd Font icon / Private Use Area, or an ambiguous-width char
+its font draws wider than a cell) is drawn by `draw_symbol`
+(src/backend/bevy_backend.rs, deliberately `#[inline(never)]` so the text
+path compiles as before): it may take the blank cell after it
+(`glyph_constraint::symbol_span`, Ghostty's rule), rasterized into a
+two-cell atlas slot (`Key::cells`), emitted as one instance over both cells
+or - when their backgrounds differ - one per cell, the blank sampling the
+slot's right half; the blank is marked `Cover::SymbolTail` so its own glyph
+is skipped. Whether a cell is a symbol (`CellClass`) is memoized with its
+font choice; `FontRun::symbols` keeps text runs from asking per cell.
+
 ### Render-world GPU state & eviction
 
 - `TerminalGpuStore` — per-terminal state (globals uniform, rewritten only
@@ -207,7 +220,13 @@ symbols over and over:
   the current flush used unless nothing else is left.
 
 `cargo test --release --lib cpu_hot_path -- --ignored --nocapture` times
-this whole path without a GPU (src/setup.rs `perf_bench`).
+this whole path without a GPU (src/setup.rs `perf_bench`);
+`CPU_HOT_PATH=<workload>[:Row|:Cell]` runs one workload and
+`CPU_HOT_PATH_FRAMES=<n>` changes the frame count. Wall time is noisy on a
+busy machine; `/usr/bin/time -l` reports retired instructions, but those
+shift by a few percent with unrelated inlining changes (including in the
+benchmark's own paint closures), so confirm with a time profile
+(`xcrun xctrace record --template 'Time Profiler'`) before chasing them.
 
 ### Other modules
 
@@ -225,12 +244,23 @@ this whole path without a GPU (src/setup.rs `perf_bench`).
   mouse handling that auto-detects 2D UI vs 3D mesh via raycasting
   (src/input/ray.rs) when both features are on; touch fallback (see
   Gotchas)
+- **src/backend/glyph_constraint/** — fitting symbols to the grid:
+  `GlyphConstraint::constrain` (port of Ghostty's `Glyph.zig` constraint
+  math: size rule, alignment, padding, scale groups, max cells) and
+  `nerd_font.rs`, font-patcher's per-codepoint rules. `nerd_font.rs` is
+  GENERATED - never hand-edit; rerun
+  `python3 tools/nerd_font_constraints.py <font-patcher.py>
+  <SymbolsNerdFont-Regular.ttf (not Mono)> [cache-dir]` (needs `fonttools`;
+  both inputs from the same Nerd Fonts release). Symbols without a rule get
+  `GlyphConstraint::FIT` (shrink to fit, else untouched). The icon height
+  for one cell comes from the primary font's cap height (`Fonts::cell_metrics`).
 - **src/fonts.rs** — TrueType via rustybuzz; CJK; metrics
   `min_width_px()` / `height_px()` for texture sizing. Fallback is per
   cell: `shape_row` splits each row into `FontRun`s (`font_runs`, via
   `Fonts::font_for_cell`) and shapes each run with its own font. The cell
   width is the minimum `m` advance over all fonts, so a glyph from a wider
-  fallback font is squeezed horizontally to fit (`fit_to_cells`). A
+  fallback font is squeezed horizontally to fit (`fit_to_cells`) - except
+  symbols, which keep their aspect ratio (see `glyph_constraint` above). A
   symbols-only font with no `m` (e.g. Symbols Nerd Font) is measured by its
   `.notdef` advance and can shrink every cell — prefer a patched
   "Nerd Font Mono" primary.

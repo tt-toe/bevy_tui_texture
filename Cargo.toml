@@ -205,5 +205,8 @@ path = "examples/retro_crt.rs"
 name = "resize"
 path = "examples/resize.rs"
 [[example]]
+name = "nerd_font_icons"
+path = "examples/nerd_font_icons.rs"
+[[example]]
 name = "transparent_world_quad"
 path = "examples/transparent_world_quad.rs"
