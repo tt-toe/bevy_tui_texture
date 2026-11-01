@@ -1,16 +1,3 @@
-// ExtendedMaterial CRT Example - Custom Fragment Shader, Mesh3d with CRT Effects
-//
-// Demonstrates using ExtendedMaterial to extend StandardMaterial with custom
-// fragment shader uniforms for CRT post-processing effects (scan lines, vignette).
-//
-// This approach avoids binding conflicts by:
-// - Using StandardMaterial for terminal texture (bindings 0-30)
-// - Extending with custom uniforms at binding 100
-// - Letting Bevy's PBR system handle texture sampling
-//
-// Press SPACE to toggle CRT effects
-// Press ESC to quit
-
 use bevy::app::AppExit;
 use bevy::pbr::{ExtendedMaterial, MaterialExtension};
 use bevy::prelude::*;
@@ -39,8 +26,6 @@ fn main() {
                     }),
                     ..default()
                 })
-                // assets/ lives at examples/assets/, not the crate-root
-                // default `assets/` bevy's AssetPlugin assumes.
                 .set(AssetPlugin {
                     file_path: "examples/assets".into(),
                     ..default()
@@ -55,19 +40,17 @@ fn main() {
         .run();
 }
 
-// CRT effect uniforms (matches WGSL memory layout)
 #[derive(Clone, Copy, Debug, ShaderType, Reflect)]
 struct CrtUniforms {
-    effect_intensity: f32,     // 0.0 = off, 1.0 = full effect
-    time: f32,                 // For animated scan lines
-    scan_line_intensity: f32,  // How pronounced scan lines are
-    chromatic_aberration: f32, // RGB channel separation amount
+    effect_intensity: f32,
+    time: f32,
+    scan_line_intensity: f32,
+    chromatic_aberration: f32,
 }
 
-// Material extension for CRT effects
 #[derive(Asset, AsBindGroup, Clone, Reflect, Debug)]
 struct CrtExtension {
-    #[uniform(100)] // Binding 100 - safely above StandardMaterial's 0-30 range
+    #[uniform(100)]
     pub uniforms: CrtUniforms,
 }
 
@@ -77,7 +60,6 @@ impl MaterialExtension for CrtExtension {
     }
 }
 
-// Convenient type alias for our extended material
 type CrtMaterial = ExtendedMaterial<StandardMaterial, CrtExtension>;
 
 #[derive(Resource)]
@@ -104,7 +86,6 @@ fn setup(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<CrtMaterial>>,
 ) {
-    // Load font
     let font_data = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/examples/assets/fonts/fusion-pixel-10px-monospaced-ja.ttf"
@@ -112,7 +93,6 @@ fn setup(
     let font = TerminalFont::new(font_data).expect("Failed to load font");
     let fonts = Arc::new(Fonts::new(font, 16));
 
-    // Create terminal texture
     let texture_state = TerminalTexture::create(80, 30, fonts, true, false, [0, 0, 0, 255], &mut images)
         .expect("Failed to create terminal");
 
@@ -120,12 +100,9 @@ fn setup(
     let dimensions = texture_state.dimensions();
     let mut tui = Tui::from_texture_state(texture_state);
 
-    // Initial draw (the zero-latency flush shows this on the first
-    // presented frame - no synchronous GPU call needed at creation time).
     tui.draw(|frame| {
         let area = frame.area();
 
-        // Clear with colorful background
         let clear = Block::default().style(Style::default().bg(RatatuiColor::Rgb(10, 10, 30)));
         frame.render_widget(clear, area);
 
@@ -141,10 +118,9 @@ fn setup(
         frame.render_widget(title, area);
     });
 
-    // Create ExtendedMaterial (KEY DIFFERENCE from standard material)
     let material = CrtMaterial {
         base: StandardMaterial {
-            base_color: bevy::color::Color::WHITE, // CRITICAL: White to show texture colors accurately
+            base_color: bevy::color::Color::WHITE,
             base_color_texture: Some(image_handle),
             unlit: false, // Must be false for pbr_input_from_standard_material to work
             alpha_mode: AlphaMode::Opaque,
@@ -154,20 +130,18 @@ fn setup(
         },
         extension: CrtExtension {
             uniforms: CrtUniforms {
-                effect_intensity: 1.0, // Start with effects enabled
+                effect_intensity: 1.0,
                 time: 0.0,
-                scan_line_intensity: 0.1,    // Subtle scan lines
-                chromatic_aberration: 0.002, // Slight color separation
+                scan_line_intensity: 0.1,
+                chromatic_aberration: 0.002,
             },
         },
     };
     let material_handle = materials.add(material);
 
-    // Create mesh (Y-up plane facing camera)
     let mesh = Mesh::from(Plane3d::new(Vec3::Y, Vec2::new(4.0, 3.0)));
     let mesh_handle = meshes.add(mesh);
 
-    // Spawn terminal entity
     let terminal_entity = commands
         .spawn((
             Mesh3d(mesh_handle),
@@ -185,13 +159,11 @@ fn setup(
         },
     ));
 
-    // Camera
     commands.spawn((
         Camera3d::default(),
         Transform::from_xyz(0.0, 10.0, 5.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
 
-    // Directional light
     commands.spawn((
         DirectionalLight {
             illuminance: 5000.0,
@@ -255,7 +227,6 @@ fn render_terminal(mut screens: Query<&mut Tui, With<MainTerminal>>, mut app_sta
     term.draw(|frame| {
             let area = frame.area();
 
-            // Title
             let title = Paragraph::new("Shader with ExtendedMaterial - Terminal Texture")
                 .style(
                     Style::default()
@@ -266,7 +237,6 @@ fn render_terminal(mut screens: Query<&mut Tui, With<MainTerminal>>, mut app_sta
                 .alignment(Alignment::Center)
                 .block(Block::bordered().border_style(Style::default().fg(RatatuiColor::White)));
 
-            // Status
             let status = format!(
                 "Frame: {} | SPACE: Toggle Effects | ESC: Quit",
                 app_state.frame_count
@@ -279,7 +249,6 @@ fn render_terminal(mut screens: Query<&mut Tui, With<MainTerminal>>, mut app_sta
                 )
                 .alignment(Alignment::Center);
 
-            // Demo content
             let content_lines = vec![
                 Line::from(""),
                 Line::from(Span::styled(
@@ -368,13 +337,12 @@ fn render_terminal(mut screens: Query<&mut Tui, With<MainTerminal>>, mut app_sta
                         .style(Style::default().bg(RatatuiColor::Rgb(20, 20, 40))),
                 );
 
-            // Layout
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(3), // Title
-                    Constraint::Min(0),    // Content
-                    Constraint::Length(1), // Status
+                    Constraint::Length(3),
+                    Constraint::Min(0),
+                    Constraint::Length(1),
                 ])
                 .split(area);
 

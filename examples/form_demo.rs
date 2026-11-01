@@ -1,13 +1,5 @@
 //! form_demo - a complete interactive form built on nothing but the
 //! low-level event contract (`TerminalEvent` + `HitRegions`).
-//!
-//! This crate deliberately ships no form/widget framework; this example
-//! is the reference for how little app code that decision costs. Widget
-//! identity, focus traversal, and value state are plain Rust:
-//! - Click a field to focus it; click Subscribe/Submit/Clear to activate.
-//! - Tab / Shift+Tab cycle widget focus; Enter activates the focused one.
-//! - Type / Backspace edit the Name field. Esc clears the form.
-//! - The scroll wheel (or Enter/click) cycles the Plan field.
 
 use bevy::prelude::*;
 use bevy_tui_texture::Font as TerminalFont;
@@ -23,8 +15,7 @@ use std::sync::Arc;
 struct FormTerminal;
 
 /// Widget identity: a plain enum encoded into the `u64` ids that
-/// `HitRegions` already speaks. `From`/`TryFrom` are the entire
-/// "framework integration".
+/// `HitRegions` already speaks.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Widget {
     Name,
@@ -124,7 +115,7 @@ fn handle_events(
                         == Some(Widget::Plan) =>
                 {
                     let step = if m.kind == MouseEventKind::ScrollUp {
-                        PLANS.len() - 1 // backwards, wrapping
+                        PLANS.len() - 1
                     } else {
                         1
                     };
@@ -161,7 +152,7 @@ fn shift_focus(form: &mut FormModel, by: usize) {
 
 fn activate(form: &mut FormModel, widget: Widget) {
     match widget {
-        Widget::Name => {} // focus only; typing edits it
+        Widget::Name => {}
         Widget::Plan => form.plan = (form.plan + 1) % PLANS.len(),
         Widget::Subscribe => form.subscribe = !form.subscribe,
         Widget::Submit => {
@@ -188,11 +179,11 @@ fn render_form(mut terminals: Query<&mut Tui, With<FormTerminal>>, form: Res<For
     let focused = form.focused;
     term.draw_with_hits(|frame, hits| {
         let rows = Layout::vertical([
-            Constraint::Length(3), // Name
-            Constraint::Length(3), // Plan
-            Constraint::Length(3), // Subscribe
-            Constraint::Length(3), // buttons
-            Constraint::Min(1),    // status line
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(1),
         ])
         .split(frame.area());
 

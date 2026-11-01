@@ -1,28 +1,4 @@
 //! `Tui` — the ECS-native terminal Component
-//!
-//! Demonstrates the new architecture:
-//! - a terminal is a plain `Tui` Component, spawned on an ordinary entity
-//!   (no wrapping Resource, no `event.target == my_resource.entity()`
-//!   comparisons — query for `&Tui`/`&mut Tui` like anything else),
-//! - user drawing systems take **zero render-resource parameters**
-//!   (`Tui::draw` only touches the ratatui buffer; the plugin's
-//!   `gpu_flush_system`, registered automatically by `TerminalPlugin`,
-//!   renders into the library-owned texture, and a render-world system
-//!   copies it straight into whatever `Image`/`GpuImage` the material's
-//!   bind group already references),
-//! - this works identically for a custom (`ExtendedMaterial`-based)
-//!   material type - **no plugin registration and no per-frame touching
-//!   needed for any material type**, custom or `StandardMaterial`, since
-//!   the render-world copy writes into the same GPU texture the material
-//!   already samples.
-//!
-//! See also `world_terminal.rs`, which uses the same zero-render-resource
-//! pattern for a single in-world screen spawned via `TuiRequest::world_quad`.
-//! Here, `update_screen_a`/`update_screen_b` take only what they actually
-//! need for gameplay logic - no `render_device`, `render_queue`, `images`,
-//! or `materials` in either signature.
-//!
-//! Run with: `cargo run --example tui_component`
 
 use bevy::pbr::{ExtendedMaterial, MaterialExtension};
 use bevy::prelude::*;
@@ -45,10 +21,6 @@ fn main() {
             ..default()
         }))
         .add_plugins(TerminalPlugin::default())
-        // Only registration ScreenB's ExtendedMaterial needs: the ordinary
-        // bevy MaterialPlugin, so its shader pipeline exists at all. No
-        // terminal-specific plugin - the render-world GPU copy updates its
-        // texture exactly the same way it updates ScreenA's StandardMaterial.
         .add_plugins(MaterialPlugin::<ScreenBMaterial>::default())
         .init_resource::<ClickCounts>()
         .add_systems(Startup, setup)
@@ -110,7 +82,6 @@ fn setup(
     let font = TerminalFont::new(font_data).expect("failed to load font");
     let fonts = Arc::new(Fonts::new(font, 24));
 
-    // --- Screen A: StandardMaterial, no plugin registration needed ---
     let texture_a = TerminalTexture::create(24, 8, fonts.clone(), true, false, [0, 0, 0, 255], &mut images)
         .expect("failed to create terminal texture (screen A)");
     let aspect_a = texture_a.width as f32 / texture_a.height as f32;
@@ -137,7 +108,6 @@ fn setup(
         TerminalInput::default(),
     ));
 
-    // --- Screen B: custom ExtendedMaterial, updated via the render-world copy ---
     let texture_b = TerminalTexture::create(24, 8, fonts, true, false, [0, 0, 0, 255], &mut images)
         .expect("failed to create terminal texture (screen B)");
     let aspect_b = texture_b.width as f32 / texture_b.height as f32;
@@ -169,8 +139,7 @@ fn setup(
 }
 
 /// Zero render-resource parameters: no RenderDevice, RenderQueue,
-/// Assets<Image>, or Assets<StandardMaterial> in sight. gpu_flush_system
-/// (registered by TerminalPlugin) handles all of that.
+/// Assets<Image>, or Assets<StandardMaterial> in sight.
 fn update_screen_a(
     mut screens: Query<&mut Tui, With<ScreenA>>,
     time: Res<Time>,
@@ -198,9 +167,6 @@ fn update_screen_a(
 }
 
 /// Same zero-plumbing pattern, on a screen using a custom ExtendedMaterial.
-/// No terminal-specific setup was needed at all beyond the ordinary bevy
-/// `MaterialPlugin` registration in `main` - this draw system needs
-/// nothing more than the StandardMaterial screen's.
 fn update_screen_b(
     mut screens: Query<&mut Tui, With<ScreenB>>,
     time: Res<Time>,

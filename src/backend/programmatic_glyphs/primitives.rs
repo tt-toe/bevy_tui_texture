@@ -1,13 +1,6 @@
-// Primitive drawing functions for programmatic glyph rendering
-//
-// This module provides low-level drawing functions that are used by the
-// specific glyph rendering modules (box_drawing, block_elements, etc.)
-
 use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, Stroke, Transform};
 
 /// Calculate stroke width based on cell height
-///
-/// Follows Rio's convention: height / 10, with a minimum of 1.0 pixel
 pub fn stroke_width(height: u32) -> f32 {
     (height as f32 / 10.0).max(1.0).round()
 }
@@ -21,7 +14,6 @@ pub fn default_color() -> Color {
 pub fn draw_rect(pixmap: &mut Pixmap, x: f32, y: f32, width: f32, height: f32, color: Color) {
     let mut paint = Paint::default();
     paint.set_color(color);
-    // Disable antialiasing to prevent semi-transparent edges that create gaps
     paint.anti_alias = false;
 
     if let Some(rect) = tiny_skia::Rect::from_xywh(x, y, width, height) {
@@ -74,7 +66,6 @@ pub fn draw_line(
 ) {
     let mut paint = Paint::default();
     paint.set_color(color);
-    // Disable antialiasing for pixel-perfect edges
     paint.anti_alias = false;
 
     let mut pb = PathBuilder::new();
@@ -144,8 +135,6 @@ pub fn draw_circle(pixmap: &mut Pixmap, center_x: f32, center_y: f32, radius: f3
 }
 
 /// Draw an arc (for rounded corners)
-///
-/// Angles are in degrees (0° = right, 90° = down, 180° = left, 270° = up)
 #[allow(clippy::too_many_arguments)]
 pub fn draw_arc(
     pixmap: &mut Pixmap,
@@ -162,11 +151,9 @@ pub fn draw_arc(
     paint.anti_alias = false;
 
     let mut pb = PathBuilder::new();
-    // Convert angles to radians
     let start_rad = start_angle.to_radians();
     let end_rad = end_angle.to_radians();
 
-    // Draw arc using line segments (tiny-skia doesn't have native arc)
     let segments = 20;
     let angle_step = (end_rad - start_rad) / segments as f32;
 
@@ -195,7 +182,7 @@ pub fn draw_arc(
 /// Draw a filled polygon from a list of points
 pub fn draw_polygon(pixmap: &mut Pixmap, points: &[(f32, f32)], color: Color) {
     if points.len() < 3 {
-        return; // Need at least 3 points for a polygon
+        return;
     }
 
     let mut paint = Paint::default();
@@ -236,7 +223,6 @@ mod tests {
     fn test_draw_rect() {
         let mut pixmap = Pixmap::new(32, 32).unwrap();
         draw_rect(&mut pixmap, 0.0, 0.0, 32.0, 32.0, default_color());
-        // Should have drawn pixels
         assert!(pixmap.pixels().iter().any(|p| p.alpha() > 0));
     }
 
@@ -244,7 +230,6 @@ mod tests {
     fn test_draw_circle() {
         let mut pixmap = Pixmap::new(32, 32).unwrap();
         draw_circle(&mut pixmap, 16.0, 16.0, 8.0, default_color());
-        // Should have drawn pixels
         assert!(pixmap.pixels().iter().any(|p| p.alpha() > 0));
     }
 }

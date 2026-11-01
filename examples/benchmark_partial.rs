@@ -1,24 +1,3 @@
-// Benchmark Partial Example - Isolates the two flush-skipping paths
-// (unchanged-frame early-out, row-incremental reshape) that
-// examples/benchmark.rs cannot show, because that benchmark redraws every
-// cell every frame.
-//
-// Usage:
-//   BENCH_MODE=static  cargo run --release --example benchmark_partial   # unchanged-frame early-out
-//   BENCH_MODE=partial cargo run --release --example benchmark_partial  # row-incremental reshape
-//   (default: static)
-//
-// Mode "static": the terminal content is a fixed, purely deterministic
-// function of (row, col) - no frame count, no time - so every draw after
-// the first produces a byte-identical ratatui buffer diff (empty). The
-// user-side cost of recomputing that content every frame is deliberately
-// left in place, so the FPS/frame time measured here is that cost plus
-// BevyTerminalBackend::flush()'s early-out.
-//
-// Mode "partial": identical static content, except exactly one row shows
-// a live frame counter and therefore changes every frame. This isolates
-// the row-incremental reshape: only that one row is reshaped and
-// re-uploaded.
 
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::prelude::*;
@@ -35,9 +14,7 @@ use bevy_tui_texture::prelude::*;
 const COLS: u16 = 120;
 const ROWS: u16 = 40;
 
-/// The one row that changes in `Mode::Partial`. Arbitrary - anywhere
-/// inside the grid works, chosen away from the edges so it's easy to spot
-/// on screen.
+/// The one row that changes in `Mode::Partial`.
 const COUNTER_ROW: u16 = 5;
 
 #[derive(Clone, Copy, PartialEq, Eq, Resource)]
@@ -175,7 +152,6 @@ fn render_benchmark_partial(
 
 /// Purely deterministic function of `(y, x)` only - no time, no frame
 /// count - so the SAME row renders byte-identical content on every call.
-/// This is what makes "static" mode's redraw a no-op past the first frame.
 fn static_pattern_line(y: u16, width: usize) -> Line<'static> {
     let mut spans = Vec::with_capacity(width);
     for x in 0..width {
@@ -203,9 +179,6 @@ fn counter_line(frame_count: u32, width: usize) -> Line<'static> {
     ))
 }
 
-// Uses Permuted Congruential Generator for better quality and speed -
-// mirrors examples/benchmark.rs's hsv_to_rgb (kept identical so the two
-// benchmarks' visual style matches).
 fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
     let c = v * s;
     let h_prime = h * 6.0;

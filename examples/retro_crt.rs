@@ -1,23 +1,3 @@
-// ExtendedMaterial CRT Example - Custom Fragment Shader, Mesh3d with CRT Effects
-//
-// Demonstrates using ExtendedMaterial to extend StandardMaterial with custom
-// fragment shader uniforms for CRT post-processing effects (scan lines, vignette).
-//
-// This approach avoids binding conflicts by:
-// - Using StandardMaterial for terminal texture (bindings 0-30)
-// - Extending with custom uniforms at binding 100
-// - Letting Bevy's PBR system handle texture sampling
-//
-// examples/wasm_demo.rs includes this file as a module (`#[path =
-// "retro_crt.rs"] mod retro_crt;`) rather than duplicating it, so both
-// binaries share one scene. The few wasm32/WebGL2 differences (OIT
-// skipped, tonemapping without LUTs, canvas config) live inline behind
-// `#[cfg(target_arch = "wasm32")]` right here - `main` is `pub` so
-// wasm_demo.rs's shim can call `retro_crt::main()`.
-//
-// Press SPACE to toggle CRT effects
-// Press LEFT/RIGHT (or click the tab bar) to switch tabs on the CRT screen
-// Press ESC to quit (native only)
 
 use bevy::app::AppExit;
 use bevy::asset::AssetMetaCheck;
@@ -32,7 +12,6 @@ use bevy::reflect::Reflect;
 use bevy::render::render_resource::{AsBindGroup, ShaderType};
 use bevy::shader::ShaderRef;
 use bevy::window::WindowResolution;
-// glTF scenes are WorldAssets, spawned via WorldAssetRoot.
 use bevy::world_serialization::WorldAssetRoot;
 use ratatui::prelude::*;
 use ratatui::style::Color as RatatuiColor;
@@ -55,27 +34,12 @@ pub fn main() {
     build_app("assets").run();
 }
 
-/// Builds the fully configured scene `App` without running it. Split from
-/// `main` so examples/wasm_demo.rs can register its wasm-only boot-status
-/// reporting systems (which need this module's `CrtMaterial` type) on top
-/// before calling `run()` - keeping that browser plumbing out of this file.
-///
-/// `asset_file_path` (wasm32 only) is the asset root bevy's `AssetPlugin`
-/// fetches from, as a URL PATH RELATIVE TO THE HOSTING PAGE (not the
-/// filesystem) - e.g. `"../assets"` if the page lives one directory below
-/// the assets folder. Left for the caller to supply because it depends
-/// entirely on how the wasm build is hosted, which wasm_demo.rs - not this
-/// scene file - owns (see its module doc comment). Native has no such
-/// decision to make: assets are always read from `examples/assets`
-/// (relative to the crate root / `cargo run`'s cwd), hard-coded below.
+/// Builds the fully configured scene `App` without running it.
 pub(crate) fn build_app(#[cfg(target_arch = "wasm32")] asset_file_path: &str) -> App {
     let window_plugin = WindowPlugin {
         primary_window: Some(Window {
             title: "CRT Effect with Mesh3d".to_string(),
             resolution: WindowResolution::new(1024, 768),
-            // Ignored on native; on wasm, render into the page's
-            // <canvas id="bevy"> and follow its parent's size (see
-            // wasm_demo.rs / docs/index.html).
             canvas: Some("#bevy".to_string()),
             fit_canvas_to_parent: true,
             prevent_default_event_handling: false,
@@ -88,9 +52,6 @@ pub(crate) fn build_app(#[cfg(target_arch = "wasm32")] asset_file_path: &str) ->
     #[cfg(not(target_arch = "wasm32"))]
     app.add_plugins(DefaultPlugins.set(window_plugin).set(AssetPlugin {
         file_path: "examples/assets".into(),
-        // This project ships no `.meta` sidecar files anywhere; checking
-        // for them just adds a failed lookup (a 404 over HTTP on wasm,
-        // logged as a console error) per asset for no benefit.
         meta_check: AssetMetaCheck::Never,
         ..default()
     }));
@@ -120,9 +81,6 @@ pub(crate) fn build_app(#[cfg(target_arch = "wasm32")] asset_file_path: &str) ->
             })
             .set(AssetPlugin {
                 file_path: asset_file_path.into(),
-                // See the native branch above for why - same reasoning,
-                // and doubly worth it on wasm where the failed lookup is a
-                // visible 404 in the browser's network/console tabs.
                 meta_check: AssetMetaCheck::Never,
                 ..default()
             }),
@@ -154,19 +112,17 @@ pub(crate) fn build_app(#[cfg(target_arch = "wasm32")] asset_file_path: &str) ->
     app
 }
 
-// CRT effect uniforms (matches WGSL memory layout)
 #[derive(Clone, Copy, Debug, ShaderType, Reflect)]
 pub(crate) struct CrtUniforms {
-    effect_intensity: f32,     // 0.0 = off, 1.0 = full effect
-    time: f32,                 // For animated scan lines
-    scan_line_intensity: f32,  // How pronounced scan lines are
-    chromatic_aberration: f32, // RGB channel separation amount
+    effect_intensity: f32,
+    time: f32,
+    scan_line_intensity: f32,
+    chromatic_aberration: f32,
 }
 
-// Material extension for CRT effects
 #[derive(Asset, AsBindGroup, Clone, Reflect, Debug)]
 pub(crate) struct CrtExtension {
-    #[uniform(100)] // Binding 100 - safely above StandardMaterial's 0-30 range
+    #[uniform(100)]
     pub uniforms: CrtUniforms,
 }
 
@@ -176,20 +132,16 @@ impl MaterialExtension for CrtExtension {
     }
 }
 
-// Convenient type alias for our extended material (pub(crate): wasm_demo.rs's
-// boot-status reporting watches for this material landing on the screen mesh)
 pub(crate) type CrtMaterial = ExtendedMaterial<StandardMaterial, CrtExtension>;
 
-// Blur effect uniforms (matches WGSL memory layout)
 #[derive(Clone, Copy, Debug, ShaderType, Reflect)]
 struct BlurUniforms {
-    effect_intensity: f32, // 0.0 = off, 1.0 = full effect
-    time: f32,             // For animated effects
-    blur_radius: f32,      // Blur radius
-    blur_samples: f32,     // Blur sample count
+    effect_intensity: f32,
+    time: f32,
+    blur_radius: f32,
+    blur_samples: f32,
 }
 
-// Custom Material implementation for blur effects (shader-only, no PBR)
 #[derive(Asset, AsBindGroup, Clone, Debug, TypePath)]
 struct BlurMaterial {
     #[uniform(0)]
@@ -217,12 +169,6 @@ impl Material for BlurMaterial {
         layout: &bevy::mesh::MeshVertexBufferLayoutRef,
         _key: bevy::pbr::MaterialPipelineKey<Self>,
     ) -> Result<(), bevy::render::render_resource::SpecializedMeshPipelineError> {
-        // Explicitly match the vertex layout to the shader's VertexInput.
-        // Without this, bevy's default attribute assignment (location 1 =
-        // NORMAL) feeds normals into the shader's `color` (location 1),
-        // silently breaking vertex colors. COLOR is required here
-        // (Monitor_Reflection carries the model's COLOR_0 — a diamond fade,
-        // black corners / white edge midpoints — loaded by the glTF loader).
         let vertex_layout = layout.0.get_layout(&[
             Mesh::ATTRIBUTE_POSITION.at_shader_location(0),
             Mesh::ATTRIBUTE_COLOR.at_shader_location(1),
@@ -230,15 +176,12 @@ impl Material for BlurMaterial {
         ])?;
         descriptor.vertex.buffers = vec![vertex_layout];
 
-        // Disable depth writes
         if let Some(depth_stencil) = &mut descriptor.depth_stencil {
             depth_stencil.depth_write_enabled = Some(false);
         }
 
-        // Explicit additive blend state
         if let Some(fragment) = &mut descriptor.fragment {
             for color_target in fragment.targets.iter_mut().flatten() {
-                // Additive blending
                 color_target.blend = Some(bevy::render::render_resource::BlendState {
                     color: bevy::render::render_resource::BlendComponent {
                         src_factor: bevy::render::render_resource::BlendFactor::One,
@@ -258,16 +201,13 @@ impl Material for BlurMaterial {
     }
 }
 
-// ReflectionMaterial removed - additive blending implemented via StandardMaterial
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum CameraMode {
-    MouseFollow, // Follows the mouse (+-30 degrees)
-    Fixed,       // Fixed front view
-    Orbit,       // Orbits the model (current default)
+    MouseFollow,
+    Fixed,
+    Orbit,
 }
 
-// Helper functions for UI elements
 fn checkbox_span(checked: bool) -> Span<'static> {
     Span::styled(
         if checked { "[X]" } else { "[ ]" },
@@ -294,12 +234,9 @@ fn radio_span(selected: bool) -> Span<'static> {
 #[derive(Component)]
 struct OverlayScreen;
 
-// CRT screen tabs bar: labels, in display order.
 const TAB_TITLES: [&str; 3] = ["STATUS", "EFFECTS", "TABLE"];
 
-/// Click regions across both terminals. Each `Tui` has its own
-/// `HitRegions` registry, so there's no collision risk in sharing one enum
-/// between the overlay and the CRT screen.
+/// Click regions across both terminals.
 #[derive(Clone, Copy, Debug)]
 enum Hit {
     Tab(u8),
@@ -357,8 +294,6 @@ const OVERLAY_ROWS_COLLAPSED: u16 = 1;
 /// (0,0)-rooted grid coordinates - `render_overlay_terminal` always draws
 /// this panel at `frame.area()` with a 1-cell `Block::bordered()` border,
 /// so these are exact fixed columns/row, not read back from `HitRegions`.
-/// Kept in one place so the drawn bar, its `HitRegions` rect, and the
-/// column→value math used while dragging can't drift out of sync.
 const LIGHT_SLIDER_PREFIX: &str = "Light [";
 const LIGHT_SLIDER_TRACK_COLS: u16 = 15;
 const LIGHT_SLIDER_BORDER_LEFT: u16 = 1;
@@ -378,17 +313,7 @@ const LIGHT_ILLUMINANCE_MIN: f32 = 1.0;
 const LIGHT_ILLUMINANCE_MAX: f32 = 10_000.0;
 
 /// Maps an absolute terminal column to a `light_illuminance` value using
-/// the slider's fixed track geometry. Clamped at both ends, so dragging
-/// past either edge of the track pins the value at MIN/MAX instead of
-/// wrapping or panicking on the `saturating_sub`.
-///
-/// Logarithmic, not linear: perceived brightness and the range of useful
-/// scene-light values both span decades, so a linear mapping would spend
-/// most of the track on values well above anything visually distinct and
-/// leave almost no usable travel near the dark end. Interpolating
-/// `log10(value)` linearly with the column fraction (then exponentiating
-/// back) spends equal slider travel per decade instead - the inverse of
-/// this is [`light_slider_line`]'s fill-fraction calculation.
+/// the slider's fixed track geometry.
 fn light_illuminance_from_col(col: u16) -> f32 {
     let offset = col.saturating_sub(LIGHT_SLIDER_TRACK_X0);
     let frac = (offset as f32 / (LIGHT_SLIDER_TRACK_COLS - 1) as f32).clamp(0.0, 1.0);
@@ -398,23 +323,14 @@ fn light_illuminance_from_col(col: u16) -> f32 {
 }
 
 /// Builds the `light_illuminance` slider's `Line`: `Light [████░░░] 2.0k`.
-/// The inverse of [`light_illuminance_from_col`] - fill count from value,
-/// rather than value from column.
 fn light_slider_line(value: f32) -> Vec<Span<'static>> {
     let log_min = LIGHT_ILLUMINANCE_MIN.log10();
     let log_max = LIGHT_ILLUMINANCE_MAX.log10();
-    // `.max(LIGHT_ILLUMINANCE_MIN)` guards `log10` against a value at or
-    // below zero - can't happen from `light_illuminance_from_col` itself,
-    // but `AppState::light_illuminance` is a plain `f32` field, not clamped
-    // at the type level.
     let frac = ((value.max(LIGHT_ILLUMINANCE_MIN).log10() - log_min) / (log_max - log_min))
         .clamp(0.0, 1.0);
     let track_cols = LIGHT_SLIDER_TRACK_COLS as usize;
     let filled = (frac * track_cols as f32).round() as usize;
     let bar = "█".repeat(filled) + &"░".repeat(track_cols - filled);
-    // Below 1k, "{:.1}k" would render everything as a useless "0.0k" -
-    // the whole bottom decade of a log scale needs a plain-number format
-    // to stay readable.
     let label = if value >= 1000.0 {
         format!("{:.1}k", value / 1000.0)
     } else {
@@ -443,11 +359,8 @@ struct AppState {
     light_slider_dragging: bool,
     shadows_enabled: bool,
     camera_mode: CameraMode,
-    // CRT screen tabs (STATUS / EFFECTS / TABLE), switchable by click or arrow keys
     selected_tab: usize,
-    // TABLE tab: mouse-selectable diagnostics table
     table_state: TableState,
-    // Overlay panel folded down to just its title bar (click to toggle)
     panel_collapsed: bool,
 }
 
@@ -459,11 +372,10 @@ impl Default for AppState {
             fps: 0.0,
             button_clicked: false,
             button_click_count: 0,
-            // Dim ambient light so the CRT screen (unlit + emissive) stands out
             light_illuminance: 2000.0,
             light_slider_dragging: false,
-            shadows_enabled: true,          // shadows on by default
-            camera_mode: CameraMode::Orbit, // default: orbiting camera
+            shadows_enabled: true,
+            camera_mode: CameraMode::Orbit,
             selected_tab: 0,
             table_state: TableState::default(),
             panel_collapsed: false,
@@ -493,10 +405,7 @@ struct GltfModel;
 #[derive(Component)]
 pub(crate) struct GltfAsset(pub(crate) Handle<Gltf>);
 
-/// Marker for the main CRT screen's `Tui` entity. Object_2's mesh attaches
-/// to this via `AttachTerminal`, rather than carrying the `Tui` itself. Its
-/// material handle is found via `Query<&MeshMaterial3d<CrtMaterial>>` on
-/// Object_2 directly - no separate marker component needed.
+/// Marker for the main CRT screen's `Tui` entity.
 #[derive(Component)]
 struct MainScreen;
 
@@ -510,7 +419,6 @@ fn setup(
     mut standard_materials: ResMut<Assets<StandardMaterial>>,
     asset_server: Res<AssetServer>,
 ) {
-    // Load font
     let font_data = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/examples/assets/fonts/fusion-pixel-10px-monospaced-ja.ttf"
@@ -518,11 +426,6 @@ fn setup(
     let font = TerminalFont::new(font_data).expect("Failed to load font");
     let fonts = Arc::new(Fonts::new(font, 16));
 
-    // Camera. On native, Order Independent Transparency is enabled (MSAA
-    // disabled for OIT compatibility); on wasm/WebGL2, OIT is skipped - it
-    // needs storage buffers, which WebGL2 does not have. The additive
-    // reflection still renders without it, just without order-independent
-    // sorting of overlapping transparent surfaces.
     let camera = commands
         .spawn((
             Camera3d::default(),
@@ -535,34 +438,22 @@ fn setup(
     commands
         .entity(camera)
         .insert(OrderIndependentTransparencySettings::default());
-    // Camera3d's default Tonemapping (TonyMcMapface) requires the
-    // `tonemapping_luts` bevy feature, which the wasm build disables for
-    // binary size (see Cargo.toml). KhronosPbrNeutral needs no LUT and is
-    // still a modern, mild tonemapper - not just Tonemapping::None.
     #[cfg(target_arch = "wasm32")]
     commands
         .entity(camera)
         .insert(Tonemapping::KhronosPbrNeutral);
 
-    // Note: Materials are created dynamically when needed
-    // (CrtMaterial for Object_2 and ReflectionMaterial for Monitor_Reflection)
-
-    // / Ground Mesh Starts
-    // Create ground material (StandardMaterial that uses vertex colors)
     let ground_material = StandardMaterial {
-        base_color: bevy::color::Color::WHITE, // White base color to show vertex colors accurately
+        base_color: bevy::color::Color::WHITE,
         metallic: 0.0,
-        perceptual_roughness: 0.8, // Rough surface
-        reflectance: 0.1,          // Low reflectance
-        // Note: StandardMaterial automatically multiplies base_color by vertex color
+        perceptual_roughness: 0.8,
+        reflectance: 0.1,
         ..default()
     };
     let ground_material_handle = standard_materials.add(ground_material);
 
-    // Create circular ground mesh with radial vertex colors (Y-up circle)
-    let mut ground_mesh = Mesh::from(Circle::new(3.0)); // 3.0 radius circle
+    let mut ground_mesh = Mesh::from(Circle::new(3.0));
 
-    // Add radial vertex colors (light center -> dark edge)
     if let Some(positions) = ground_mesh
         .attribute(Mesh::ATTRIBUTE_POSITION)
         .and_then(|p| p.as_float3())
@@ -570,13 +461,10 @@ fn setup(
         let mut colors = Vec::new();
 
         for position in positions {
-            // Calculate distance from center (X-Z plane)
             let distance = (position[0] * position[0] + position[2] * position[2]).sqrt();
             let normalized_distance = (distance / 3.0).clamp(0.0, 1.0);
 
-            // Dim environment: gradient from center (0.22) to edge (0.02)
-            // (a bright floor would compete with the CRT screen)
-            let brightness = 0.22 - (normalized_distance * 0.20); // 0.22 -> 0.02
+            let brightness = 0.22 - (normalized_distance * 0.20);
             colors.push([brightness, brightness, brightness, 1.0]);
         }
 
@@ -585,17 +473,13 @@ fn setup(
 
     let ground_mesh_handle = meshes.add(ground_mesh);
 
-    // Spawn circular ground mesh with StandardMaterial
     commands.spawn((
         Mesh3d(ground_mesh_handle),
         MeshMaterial3d(ground_material_handle),
         Transform::from_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2)),
         GroundMesh,
     ));
-    // / Ground Mesh Over
 
-    // Directional light (dim, shadows on; update_directional_light syncs
-    // from AppState every frame, so match its initial values here too)
     commands.spawn((
         DirectionalLight {
             illuminance: 2000.0,
@@ -606,19 +490,11 @@ fn setup(
         MainDirectionalLight,
     ));
 
-    // Dim the surroundings so the CRT screen (unlit + emissive) stands out
     commands.insert_resource(ClearColor(bevy::color::Color::srgb(0.015, 0.015, 0.025)));
 
-    // Load the whole glTF (as an asset, not scene-based)
     let gltf_handle: Handle<Gltf> = asset_server.load("models/retro_crt.glb");
     commands.spawn((GltfAsset(gltf_handle), GltfModel));
 
-    // Overlay terminal: a declarative `TuiRequest`, top-right anchored via
-    // `Val::Px` alone — no px-estimate math, no resize system needed;
-    // bevy_ui re-anchors `right`/`top` automatically. Starts expanded;
-    // render_overlay_terminal folds it down to its title bar on click via
-    // `Tui::request_resize` (the Node itself follows the texture's new
-    // pixel size automatically - no separate Node-size bookkeeping).
     commands.spawn((
         TuiRequest::ui(OVERLAY_COLS, OVERLAY_ROWS, fonts.clone()),
         Node {
@@ -630,17 +506,11 @@ fn setup(
         OverlayScreen,
     ));
 
-    // The main CRT screen: a headless `TuiRequest` - no surface components
-    // of its own; Object_2's mesh attaches to it via `AttachTerminal` once
-    // the glTF loads (claim_object2_screen below), found by querying the
-    // `MainScreen` marker rather than a resource. `initial_draw` shows a
-    // loading splash until the per-frame draw system takes over.
     commands.spawn((
         TuiRequest::headless(32, 24, fonts).with_config(TerminalConfig {
             initial_draw: Some(Box::new(|frame| {
                 let area = frame.area();
 
-                // Clear with colorful background
                 let clear =
                     Block::default().style(Style::default().bg(RatatuiColor::Rgb(10, 10, 30)));
                 frame.render_widget(clear, area);
@@ -665,21 +535,18 @@ fn setup(
     commands.insert_resource(AppState::default());
 }
 
-// Simple, efficient glTF scene spawn (only checks assets not yet spawned)
 fn spawn_gltf_scene_simple(
     mut commands: Commands,
     gltf_query: Query<(Entity, &GltfAsset), (With<GltfModel>, Without<GltfSpawned>)>,
     gltf_assets: Res<Assets<Gltf>>,
 ) {
-    // Nothing to do if there are no unspawned glTF assets
     if gltf_query.is_empty() {
         return;
     }
 
     for (gltf_entity, gltf_asset) in gltf_query.iter() {
-        // Check whether the glTF asset has finished loading (once)
         let Some(gltf) = gltf_assets.get(&gltf_asset.0) else {
-            continue; // not loaded yet
+            continue;
         };
 
         info!(
@@ -687,8 +554,6 @@ fn spawn_gltf_scene_simple(
             gltf.scenes.len()
         );
 
-        // Spawn the default (first) scene, rotated 90° clockwise
-        // Gltf::scenes is Vec<Handle<WorldAsset>> → WorldAssetRoot.
         if let Some(scene) = gltf.scenes.first() {
             commands.spawn((
                 WorldAssetRoot(scene.clone()),
@@ -697,19 +562,12 @@ fn spawn_gltf_scene_simple(
             info!("GLTF scene spawned successfully with 90-degree clockwise rotation");
         }
 
-        // Mark as spawned to prevent re-running
         commands.entity(gltf_entity).insert(GltfSpawned);
     }
 }
 
 /// Claims Object_2 (Monitor Glass) by inserting `AttachTerminal`, pointing
-/// it at the main screen's `Tui`. The library's own `attach_terminal_system`
-/// then does the actual material swap and handles the glTF loader
-/// asynchronously re-inserting its stock `StandardMaterial` over ours on a
-/// later frame (see CLAUDE.md "Common
-/// Gotchas" #8) - this system just needs to (re-)insert `AttachTerminal`
-/// for as long as the entity still carries `StandardMaterial`, which is
-/// harmless to repeat (same component value each time).
+/// it at the main screen's `Tui`.
 fn claim_object2_screen(
     to_claim: Query<(Entity, &Name, &MeshMaterial3d<StandardMaterial>)>,
     standard_materials: Res<Assets<StandardMaterial>>,
@@ -723,15 +581,10 @@ fn claim_object2_screen(
     }
 
     let Ok(main_screen) = main_screen.single() else {
-        return; // main screen Tui not spawned yet - try again next frame
+        return;
     };
 
     for (entity, name, standard_material_handle) in &to_claim {
-        // bevy's glTF loader names primitive entities "<mesh name>.<material
-        // name>" (e.g. "Object_2.Monitor_Glass"). The glass is mesh
-        // "Object_2" × material "Monitor_Glass". (A bare prefix match on
-        // "Object_2" would also hit "Object_20" etc. in other models, so we
-        // match through the ".".)
         if name.as_str() != "Object_2.Monitor_Glass" {
             continue;
         }
@@ -744,18 +597,9 @@ fn claim_object2_screen(
             name.as_str()
         );
 
-        // Captured for the material factory below - the glTF material's own
-        // double_sided/cull_mode should carry over even though everything
-        // else is overridden (see the factory's doc comment).
         let double_sided = standard_material.double_sided;
         let cull_mode = standard_material.cull_mode;
 
-        // Note: this model's (_0) glass UVs span the full [0,1]² range and
-        // are already upright, so no correction is needed (check with
-        // the CRT_CALIBRATE=1 quadrant display). If a different model's
-        // orientation is off, rewrite the mesh UVs directly instead of
-        // using uv_transform, which would desync display from mouse
-        // picking.
         commands.entity(entity).insert(AttachTerminal {
             terminal: main_screen,
             material: AttachMaterial::custom(move |image| CrtMaterial {
@@ -810,9 +654,7 @@ fn claim_object2_screen(
 /// texture for an unlit additive glow - it is NOT an interactive terminal
 /// surface, so it does not go through `AttachTerminal` (which would
 /// incorrectly grant it `TuiSurface`/`TerminalInput` and make it compete
-/// for click hit-testing with the real screen). It still needs its own
-/// persistent re-claim loop for the same async-glTF-loader reason
-/// `AttachTerminal` has one - see `claim_object2_screen`'s doc comment.
+/// for click hit-testing with the real screen).
 fn claim_monitor_reflection(
     to_claim: Query<(Entity, &Name, &MeshMaterial3d<StandardMaterial>)>,
     mut blur_materials: ResMut<Assets<BlurMaterial>>,
@@ -836,26 +678,18 @@ fn claim_monitor_reflection(
 
         let blur_material_handle = blur_materials.add(BlurMaterial {
             uniforms: BlurUniforms {
-                effect_intensity: 1.0, // ON (update system toggles 0/1)
-                time: 0.0,             // Will be updated in update system
-                blur_radius: 3.0,      // Medium blur radius
-                blur_samples: 5.0,     // 5x5 kernel
+                effect_intensity: 1.0,
+                time: 0.0,
+                blur_radius: 3.0,
+                blur_samples: 5.0,
             },
             base_color_texture: Some(main_tui.image_handle().clone()),
         });
 
-        // Vertex colors already come from the model (the GLB's COLOR_0):
-        // black at the corners/edges, white only at each edge's midpoint -
-        // a diamond fade. The glTF loader imports this as ATTRIBUTE_COLOR,
-        // so generating/overwriting it here is unnecessary.
         commands
             .entity(entity)
             .remove::<MeshMaterial3d<StandardMaterial>>()
             .insert(MeshMaterial3d(blur_material_handle))
-            // The additive reflection surface doesn't participate in
-            // shadows. Without this, enabling shadows makes the prepass
-            // pipeline choke on the custom vertex layout (POSITION/COLOR/
-            // UV) with a Validation Error.
             .insert((bevy::light::NotShadowCaster, bevy::light::NotShadowReceiver));
     }
 }
@@ -879,7 +713,6 @@ fn handle_input(
             }
         );
     }
-    // Switch the CRT screen's tabs (STATUS / EFFECTS / TABLE)
     if keys.just_pressed(KeyCode::ArrowRight) {
         app_state.selected_tab = (app_state.selected_tab + 1) % 3;
     }
@@ -895,7 +728,7 @@ fn handle_terminal_events(
     overlay_query: Query<(Entity, &Tui), With<OverlayScreen>>,
 ) {
     let Ok((main_entity, main_tui)) = main_screen_query.single() else {
-        return; // main screen Tui not created yet
+        return;
     };
     let overlay = overlay_query.single().ok();
 
@@ -908,11 +741,6 @@ fn handle_terminal_events(
                         m.column, m.row
                     );
 
-                    // Hit-tested via HitRegions, not parallel Rect
-                    // bookkeeping. Button/TableRow hits can only occur when
-                    // the STATUS/TABLE tab is active anyway, since
-                    // HitRegions is rebuilt fresh every draw and only the
-                    // active tab's render function runs.
                     match main_tui.hit_regions().hit_at::<Hit>((m.column, m.row)) {
                         Some(Hit::Tab(tab)) => {
                             app_state.selected_tab = tab as usize;
@@ -932,8 +760,6 @@ fn handle_terminal_events(
                 }
         } else if let Some((_, overlay_tui)) = overlay.filter(|(entity, _)| *entity == event.target)
         {
-            // Overlay terminal events - hit-tested via HitRegions, not
-            // parallel Rect bookkeeping.
             match &event.input {
                 InputEvent::Mouse(m) if matches!(m.kind, MouseEventKind::Down(_)) => {
                     info!(
@@ -994,14 +820,6 @@ fn handle_terminal_events(
                         _ => {}
                     }
                 }
-                // Only meaningful while a `LightSlider` drag is in progress
-                // (`Hit::LightSlider`'s press sets the flag above) - the
-                // column is applied unconditionally, without re-hit-testing
-                // against row 3, so the drag keeps tracking even if the
-                // cursor strays off the slider's row, matching ordinary GUI
-                // slider behaviour. Matches both `Moved` (mouse) and
-                // `Drag(_)` (mouse held or touch) - the drag can continue
-                // being reported as either depending on button state.
                 InputEvent::Mouse(m)
                     if app_state.light_slider_dragging
                         && matches!(m.kind, MouseEventKind::Moved | MouseEventKind::Drag(_)) =>
@@ -1028,8 +846,6 @@ fn update_crt_uniforms(
     app_state: Res<AppState>,
     time: Res<Time>,
 ) {
-    // Update Object_2 (Monitor Glass) CRT material if it exists.
-    // (`get_mut` returns an `AssetMut` guard, hence `mut`)
     for material_handle in &object2_query {
         if let Some(mut material) = crt_materials.get_mut(&material_handle.0) {
             material.extension.uniforms.effect_intensity =
@@ -1038,7 +854,6 @@ fn update_crt_uniforms(
         }
     }
 
-    // Monitor_Reflection already uses BlurMaterial - its uniforms are updated below
 }
 
 fn update_blur_uniforms(
@@ -1047,8 +862,6 @@ fn update_blur_uniforms(
     app_state: Res<AppState>,
     time: Res<Time>,
 ) {
-    // Update reflection blur material if it exists.
-    // (`get_mut` returns an `AssetMut` guard, hence `mut`)
     for material_handle in &reflection_query {
         if let Some(mut material) = blur_materials.get_mut(&material_handle.0) {
             material.uniforms.effect_intensity = if app_state.effects_enabled { 1.0 } else { 0.0 };
@@ -1069,8 +882,6 @@ fn render_terminal(
     };
     app_state.frame_count += 1;
 
-    // Exponential moving average smooths frame-to-frame jitter so the
-    // overlay's FPS readout doesn't flicker every frame.
     let dt = time.delta_secs();
     if dt > 0.0 {
         let instant_fps = 1.0 / dt;
@@ -1081,13 +892,10 @@ fn render_terminal(
         };
     }
 
-    // Button click animation (resets after 1 second)
     if app_state.button_clicked && app_state.frame_count.is_multiple_of(60) {
         app_state.button_clicked = false;
     }
 
-    // UV calibration: CRT_CALIBRATE=1 shows four quadrants + a counter
-    // (used to measure the screen's UV orientation and visible region)
     if std::env::var("CRT_CALIBRATE").is_ok() {
         let count = app_state.frame_count / 10;
         term.draw(|frame| {
@@ -1134,10 +942,6 @@ fn render_terminal(
         return;
     }
 
-    // Everything below is laid out to fit EXACTLY inside the 32x24 terminal
-    // grid (see TerminalTexture::create in setup()): a 1-cell outer border
-    // leaves a 30x22 interior, split into a Ratatui logo banner, a rule,
-    // a switchable Tabs bar, 17 rows of tab content, and a marquee footer.
     term.draw_with_hits(|frame, hits| {
         let area = frame.area();
 
@@ -1156,13 +960,13 @@ fn render_terminal(
         frame.render_widget(outer, area);
 
         let sections = Layout::vertical([
-            Constraint::Length(2),  // banner: RatatuiLogo::small()
-            Constraint::Length(1),  // separator rule
-            Constraint::Length(1),  // blank (above tabs bar)
-            Constraint::Length(1),  // tabs bar
-            Constraint::Length(1),  // blank (below tabs bar)
-            Constraint::Length(15), // tab content
-            Constraint::Length(1),  // marquee footer
+            Constraint::Length(2),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(15),
+            Constraint::Length(1),
         ])
         .split(interior);
         let (banner_area, rule_area, tabs_area, content_area, marquee_area) = (
@@ -1173,7 +977,6 @@ fn render_terminal(
             sections[6],
         );
 
-        // --- Banner: the official Ratatui logo, in retro rainbow bands ---
         let banner_cols = Layout::horizontal([
             Constraint::Fill(1),
             Constraint::Length(27),
@@ -1199,9 +1002,6 @@ fn render_terminal(
                 width: w,
                 height: logo_rect.height,
             };
-            // A plain color fill; RatatuiLogo's glyphs are drawn with
-            // Style::default() (no fg/bg set), so they inherit whatever
-            // color is already in each cell - giving a banded rainbow.
             frame.render_widget(
                 Block::default().style(Style::default().bg(RatatuiColor::Black).fg(*color)),
                 band,
@@ -1209,15 +1009,12 @@ fn render_terminal(
         }
         frame.render_widget(RatatuiLogo::small(), logo_rect);
 
-        // --- Separator rule ---
         frame.render_widget(
             Paragraph::new("═".repeat(rule_area.width as usize))
                 .style(Style::default().fg(RatatuiColor::DarkGray)),
             rule_area,
         );
 
-        // --- Tabs bar: https://ratatui.rs/examples/widgets/tabs/ ---
-        // Switchable by mouse click (hit-tested below) or Left/Right arrow keys.
         const TAB_DIVIDER: &str = "|";
         const TAB_PAD: &str = " ";
         let tabs = Tabs::new(TAB_TITLES)
@@ -1237,10 +1034,6 @@ fn render_terminal(
             .padding(TAB_PAD, TAB_PAD);
         frame.render_widget(tabs, tabs_area);
 
-        // Click zones sized to each title's actual rendered width (padding
-        // + label text), matching how Tabs itself lays the header out
-        // left-to-right, so hit-testing tracks the real glyph boundaries
-        // rather than an equal three-way split.
         let pad_w = TAB_PAD.width() as u16;
         let divider_w = TAB_DIVIDER.width() as u16;
         let mut x = tabs_area.x;
@@ -1259,14 +1052,12 @@ fn render_terminal(
             x += seg_w + divider_w;
         }
 
-        // --- Tab content ---
         match app_state.selected_tab {
             0 => render_status_tab(frame, content_area, &app_state, hits),
             1 => render_effects_tab(frame, content_area),
             _ => render_table_tab(frame, content_area, &mut app_state, hits),
         }
 
-        // --- Marquee footer: classic BBS "chasing lights" scroller (edge animation) ---
         frame.render_widget(
             marquee_line(app_state.frame_count, marquee_area.width),
             marquee_area,
@@ -1282,15 +1073,15 @@ fn render_status_tab(
     hits: &mut HitRegions,
 ) {
     let rows = Layout::vertical([
-        Constraint::Length(3), // button
-        Constraint::Length(1), // blank
-        Constraint::Length(1), // FX
-        Constraint::Length(1), // SHADOW
-        Constraint::Length(1), // LIGHT
-        Constraint::Length(1), // CAM
-        Constraint::Length(1), // FRAME
-        Constraint::Length(1), // CLICKS
-        Constraint::Min(0),    // filler
+        Constraint::Length(3),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
     ])
     .split(area);
 
@@ -1314,7 +1105,6 @@ fn render_status_tab(
         );
     frame.render_widget(button, rows[0]);
 
-    // Register the hit-test area (inside the border)
     hits.add(
         Hit::Button,
         ratatui::layout::Rect {
@@ -1408,11 +1198,11 @@ fn render_table_tab(
     hits: &mut HitRegions,
 ) {
     let rows_layout = Layout::vertical([
-        Constraint::Length(1), // caption
-        Constraint::Length(1), // hint
-        Constraint::Length(1), // blank
-        Constraint::Length(8), // table: header(1) + margin(1) + 5 rows + footer(1)
-        Constraint::Min(0),    // filler
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(8),
+        Constraint::Min(0),
     ])
     .split(area);
 
@@ -1473,9 +1263,6 @@ fn render_table_tab(
         .highlight_spacing(HighlightSpacing::Never);
     frame.render_stateful_widget(table, table_area, &mut app_state.table_state);
 
-    // Register per-row hit regions, mirroring Table's own internal layout:
-    // header height 1 + header bottom_margin 1, then each data row is
-    // exactly 1 cell tall with no inter-row margin.
     for i in 0..row_count {
         hits.add(
             Hit::TableRow(i as u8),
@@ -1528,10 +1315,6 @@ fn render_overlay_terminal(
         return;
     };
 
-    // Folded down to just the title bar when collapsed - `request_resize`
-    // is a no-op once already at the target size, so calling it every
-    // frame is cheap. The Node's on-screen size follows the texture's new
-    // pixel size automatically (bevy_ui remeasures the image every frame).
     let target_rows = if app_state.panel_collapsed {
         OVERLAY_ROWS_COLLAPSED
     } else {
@@ -1542,8 +1325,6 @@ fn render_overlay_terminal(
     term.draw_with_hits(|frame, hits| {
         let area = frame.area();
 
-        // Title bar is always row 0 spanning the full width, in both the
-        // collapsed and expanded layouts - click it to toggle collapse.
         hits.add(
             Hit::PanelTitleBar,
             ratatui::layout::Rect {
@@ -1567,7 +1348,6 @@ fn render_overlay_terminal(
             return;
         }
 
-        // Simplified status display
         let status_lines = vec![
             Line::from(""),
             Line::from(vec![
@@ -1603,7 +1383,6 @@ fn render_overlay_terminal(
                     Style::default().fg(RatatuiColor::Yellow).bold(),
                 ),
             ]),
-            // Model credit
             Line::from(""),
             Line::from(""),
             Line::from(Span::styled(
@@ -1643,70 +1422,62 @@ fn render_overlay_terminal(
 
         frame.render_widget(content, area);
 
-        // Register checkbox / radio button hit regions right next to
-        // the content that draws them.
         let inner_area = Block::bordered().inner(area);
 
-        // CRT checkbox (row 0, start)
         hits.add(
             Hit::CrtCheckbox,
             ratatui::layout::Rect {
                 x: inner_area.x,
                 y: inner_area.y + 1,
-                width: 8, // width of "[X]CRT "
+                width: 8,
                 height: 1,
             },
         );
 
-        // Shadows checkbox (row 0, middle)
         hits.add(
             Hit::ShadowsCheckbox,
             ratatui::layout::Rect {
-                x: inner_area.x + 8, // after "[X]CRT "
+                x: inner_area.x + 8,
                 y: inner_area.y + 1,
-                width: 10, // width of "[X]Shadow"
+                width: 10,
                 height: 1,
             },
         );
 
-        // Light illuminance slider track (row 3, includes both brackets).
-        // `- 1` backs up from the first bar char (`LIGHT_SLIDER_PREFIX`'s
-        // length, which already counts the '[') onto the '[' itself.
         hits.add(
             Hit::LightSlider,
             ratatui::layout::Rect {
                 x: inner_area.x + LIGHT_SLIDER_PREFIX.len() as u16 - 1,
                 y: inner_area.y + LIGHT_SLIDER_ROW,
-                width: LIGHT_SLIDER_TRACK_COLS + 2, // '[' + track + ']'
+                width: LIGHT_SLIDER_TRACK_COLS + 2,
                 height: 1,
             },
         );
 
-        // Camera mode radio buttons (rows 5-7)
         hits.add(
-            Hit::CameraRadio(0), // MouseFollow
+            Hit::CameraRadio(0),
             ratatui::layout::Rect {
                 x: inner_area.x,
                 y: inner_area.y + 5,
-                width: 18, // width of "(o)Mouse Follow"
+                width: 18,
                 height: 1,
             },
         );
         hits.add(
-            Hit::CameraRadio(1), // Fixed
+            Hit::CameraRadio(1),
             ratatui::layout::Rect {
                 x: inner_area.x,
                 y: inner_area.y + 6,
-                width: 16, // width of "( )Fixed Front"
+                width: 16,
                 height: 1,
             },
         );
         hits.add(
-            Hit::CameraRadio(2), // Orbit
+            Hit::CameraRadio(2),
             ratatui::layout::Rect {
                 x: inner_area.x,
                 y: inner_area.y + 7,
-                width: 16, // width of "( )Auto Orbit"
+                width: 16,
                 height: 1,
             },
         );
@@ -1771,7 +1542,6 @@ fn update_directional_light(
     if let Ok(mut light) = light_query.single_mut() {
         light.illuminance = app_state.light_illuminance;
         light.shadow_maps_enabled = app_state.shadows_enabled;
-                                                               // Debug output (first frame only)
         if app_state.frame_count == 1 {
             info!(
                 "DirectionalLight updated: illuminance={}, shadows={}",

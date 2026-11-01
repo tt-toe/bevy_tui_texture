@@ -13,7 +13,8 @@ https://github.com/user-attachments/assets/64e1e136-7d2d-4e32-9c10-1da2cfb78ccd
 - **Flexible display targets** — Bevy UI nodes, world-unit 3D quads, or attach to an existing mesh (e.g. a glTF screen) via `AttachTerminal`
 - **Interactive input** — keyboard, mouse, and touch (taps emulate left-click) with focus management and per-widget hit testing
 - **Full Unicode** — CJK support, font fallback chains, and procedural box-drawing / block / Braille / powerline glyphs
-- **Nerd Font icons** — icons (and other symbols, e.g. the full-width arrows of Japanese fonts) are fitted to the cell grid by Nerd Fonts' own scaling rules and spread over two cells when followed by a space, as in Ghostty, kitty and WezTerm (`Fonts::set_fit_symbols(false)` turns it off)
+- **Nerd Fonts icons** — icons (and other symbols, e.g. the full-width arrows of Japanese fonts) are fitted to the cell grid by Nerd Fonts' own scaling rules and spread over two cells when followed by a space, as in Ghostty, kitty and WezTerm (`Fonts::set_fit_symbols(false)` turns it off)
+- **Color emoji** (feature `emoji`) — COLRv0, COLRv1, CBDT and sbix fonts, including ZWJ sequences, flags, keycaps and skin tones, drawn in their own colors; bring your own font (`Fonts::add_emoji_fonts`)
 - **Efficient updates** — dirty-cell tracking, partial row redraws, and a glyph atlas shared across terminals using the same fonts
 - **WebAssembly** — runs in the browser on WebGL2
 
@@ -30,7 +31,7 @@ bevy_tui_texture = "0.4"
 
 ### Hello World
 
-Mirrors `examples/helloworld.rs` (also embedded as this crate's Quick Start doctest):
+Mirrors `examples/helloworld.rs`:
 
 ```rust
 use bevy::prelude::*;
@@ -104,8 +105,11 @@ fn render_terminal(mut screens: Query<&mut Tui, With<HelloTerminal>>) {
 | `shader_mesh.rs` | Custom shader effects on a terminal texture |
 | `retro_crt.rs` | glTF model + `ExtendedMaterial` CRT shader + overlay UI + camera modes |
 | `tui_component.rs` | Manual spawning with `TerminalTexture` (no helpers) |
+| `form_demo.rs` | An interactive form built on `TerminalEvent` + `HitRegions` alone |
 | `resize.rs` | `Tui::request_resize` following the window size live |
 | `transparent_world_quad.rs` | HUD-style see-through screen (`transparent_reset_bg` + `AlphaMode::Blend`) |
+| `nerd_font_icons.rs` | Icons fitted to the grid (left) vs. squeezed into one cell (right). Needs a Nerd Fonts font (`NERD_FONT=...`, or an installed one) |
+| `emoji.rs` | Color emoji: sequences, presentation, backgrounds, combining marks. **Requires `--features emoji`** and a color emoji font (`EMOJI_FONT=...`, or an installed Noto/Apple Color Emoji) |
 | `benchmark.rs` | Full-frame rendering throughput |
 | `benchmark_partial.rs` | `BENCH_MODE=static\|partial` — unchanged-frame and partial-row redraw costs |
 | `wasm_demo.rs` | The full retro CRT scene running in a browser (WebGL2) |
@@ -113,6 +117,11 @@ fn render_terminal(mut screens: Query<&mut Tui, With<HelloTerminal>>) {
 ```bash
 cargo run --example helloworld
 cargo run --example retro_crt
+
+NERD_FONT=/path/to/SymbolsNerdFontMono-Regular.ttf cargo run --example nerd_font_icons
+
+# The emoji feature is required
+EMOJI_FONT=/path/to/NotoColorEmoji.ttf cargo run --example emoji --features emoji
 
 # WASM demo (browser-ready site in examples/web/ - see
 # examples/web/README.md for deploy + local preview instructions)
@@ -145,7 +154,7 @@ features = ["3d", "keyboard_input", "mouse_input"]   # e.g. a 3D-only app
 - **`keyboard_input`** (default) — keyboard event handling
 - **`mouse_input`** (default) — mouse events for 2D UI and 3D mesh terminals; touch taps ride the same path (a tap emulates a left-button click at the touch position)
 - **`bold_italic_fonts`** — real bold/italic font slots; without it, bold/italic are faked from the regular font
-- **`emoji`** — emoji and extended Unicode support (WIP)
+- **`emoji`** — color emoji: `Fonts::add_emoji_fonts` takes a color font (COLRv0, COLRv1, CBDT or sbix; not OT-SVG), and emoji, ZWJ sequences, flags, keycaps and skin tones are drawn in their own colors in two cells. No font ships with the crate. The color glyphs get a second atlas and a third pipeline, created when the first one is drawn. Without the feature, register a *monochrome* emoji font (e.g. Noto Emoji) with `add_fonts`: a color font there gives a solid silhouette (COLR) or a blank cell (PNG glyphs). See `examples/emoji.rs`
 - **`crossterm-compat`** (native-only) — lossy conversions between `input::InputEvent` and `crossterm::event::Event`, for interop with ratatui-ecosystem widget crates or a bevy_ratatui adapter; not available on wasm32 (crossterm doesn't build there)
 
 `TuiKind` variants gate individually: `Ui` needs `2d`, `WorldQuad` needs `3d`, `Headless` is always available.
@@ -153,7 +162,7 @@ features = ["3d", "keyboard_input", "mouse_input"]   # e.g. a 3D-only app
 ## Performance
 
 - Dirty-cell tracking: byte-identical redraws cost nothing, and redraws touching only a few rows upload only those rows
-- One instanced draw per terminal: each glyph is a single 20-byte instance, and background + glyph are resolved in one fragment pass (no separate background pass, no index buffer)
+- One instanced draw per terminal: each glyph is a single 20-byte instance, and background + glyph are resolved in one fragment pass (no separate background pass, no index buffer); combining marks and color emoji add one draw each, only when present
 - Text is shaped per cell and cached per symbol — the shaper runs once per distinct character, so text never seen before costs the same as repeated text
 - Glyph atlas shared across terminals using the same fonts — each glyph is rasterized and uploaded once
 - Persistent, grow-only GPU buffers; all terminal draws ride the frame's single batched submit alongside the camera passes
@@ -169,14 +178,16 @@ CPU cost of a dirty frame on a 120×40 terminal (the `cpu_hot_path`
 benchmark above; Apple M1, microseconds per frame, including ratatui's
 own buffer diff of about 70):
 
-| workload                          | 0.3.5 | 0.4.0 | 0.4.1 |
+| workload                          | 0.3.5 | 0.4.0 | 0.4.2 |
 |-----------------------------------|------:|------:|------:|
-| every cell: scrolling text+colors |  1350 |   290 |   275 |
+| every cell: scrolling text+colors |  1350 |   290 |   280 |
 | every cell: colors only           |  1190 |   265 |   280 |
-| every cell: block glyph gradient  |  1985 |   385 |   385 |
-| every cell: never-seen text       |  1485 |  1080 |   280 |
+| every cell: block glyph gradient  |  1985 |   385 |   430 |
+| every cell: never-seen text       |  1485 |  1080 |   325 |
 | one row changes                   |   100 |    75 |    75 |
 | nothing changes                   |    74 |    69 |    68 |
+
+The 0.4.2 column uses thin LTO; the numbers vary with the LTO setting.
 
 `examples/benchmark` (full-frame redraw, uncapped, same machine): about
 250 fps → about 390 fps.
@@ -185,7 +196,7 @@ own buffer diff of about 70):
 
 - Rust 1.97.1+ (2024 edition), Bevy 0.20, Ratatui 0.30, a GPU with WGPU support
 - Platforms: Windows, macOS, Linux, and Web (WebGL2)
-- Fonts must be TrueType (`.ttf`)
+- Fonts must be TrueType (`.ttf`; a `.ttc` uses its first face)
 
 **MSRV policy**: the declared `rust-version` tracks whichever dependency
 needs the newest compiler — currently bevy 0.20 itself, not anything this
@@ -210,7 +221,9 @@ The example/test fonts under `examples/assets/fonts/` are SIL OFL
 only): `Mplus1Code-Regular.ttf`
 (`examples/assets/fonts/LICENSE/mplus1code.txt`) and
 `fusion-pixel-10px-monospaced-ja.ttf` (`examples/assets/fonts/OFL.txt` +
-`examples/assets/fonts/LICENSE/*.txt` for its bundled source fonts).
+`examples/assets/fonts/LICENSE/*.txt` for its bundled source fonts). The
+emoji test fixtures in `src/backend/testdata/` are subsets of Noto Color
+Emoji, also OFL 1.1 (see `NOTICE`). They are used only by this crate's tests.
 
 ## Contributing
 

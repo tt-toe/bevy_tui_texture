@@ -1,20 +1,4 @@
 //! Event-driven terminal input via Bevy's ECS.
-//!
-//! Bevy input systems → `TerminalEvent` messages → User systems → Terminal updates
-//!
-//! The envelope (`TerminalEvent`, entity-targeted) is Bevy-native; the
-//! payload (`InputEvent`) mirrors `crossterm::event::Event` so the wider
-//! ratatui ecosystem's input vocabulary (tui-textarea, bevy_ratatui, etc.)
-//! maps onto it directly. `InputEvent`/`KeyEvent`/`KeyCode`/`MouseEvent`
-//! are self-defined mirrors, not a crossterm dependency, so wasm builds
-//! stay intact; see the `crossterm-compat` feature (native-only) for real
-//! conversions to and from `crossterm::event::Event`.
-//!
-//! This module is deliberately just transport: no form/widget framework
-//! lives here, or ever will. `crate::setup::HitRegions` (a `u64`-keyed
-//! click-region registry, generic over any `TryFrom<u64>` id type) is as
-//! far as it goes - see `examples/form_demo.rs` for a complete interactive
-//! form built on nothing but that plus this module's `TerminalEvent`.
 
 use bevy::input::ButtonState;
 use bevy::input::keyboard::{Key, KeyboardInput};
@@ -31,29 +15,13 @@ use bevy::prelude::*;
 #[cfg(feature = "mouse_input")]
 use tracing::debug;
 
-// Ray casting for 3D mouse input
 #[cfg(all(feature = "mouse_input", feature = "3d"))]
 pub mod ray;
 
-// Lossy conversions to/from crossterm::event::Event (native-only).
 #[cfg(all(feature = "crossterm-compat", not(target_arch = "wasm32")))]
 pub mod crossterm_compat;
 
-// ============================================================================
-// Events
-// ============================================================================
-
 /// Message emitted for terminal input.
-///
-/// These messages are emitted by input capture systems and read by user systems
-/// to handle terminal input. Messages are entity-targeted, enabling selective
-/// routing to specific terminal instances.
-///
-/// Compiles unconditionally (no feature gate): this is the crate's
-/// bring-your-own-input injection point, so it must exist even when
-/// `keyboard_input`/`mouse_input` are both disabled - a caller can write
-/// `TerminalEvent`s from any source (an adapter for another input
-/// backend, a test harness, a network channel) via `MessageWriter`.
 #[derive(Message, Clone, Debug, PartialEq, Eq)]
 pub struct TerminalEvent {
     /// The Tui entity that should receive this message.
@@ -61,26 +29,18 @@ pub struct TerminalEvent {
     pub input: InputEvent,
 }
 
-/// Mirror of `crossterm::event::Event`. Self-defined because crossterm does
-/// not build on wasm32-unknown-unknown; see the `crossterm-compat` feature
-/// for lossy conversions to/from the real crossterm type on native.
+/// Mirror of `crossterm::event::Event`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InputEvent {
     Key(KeyEvent),
     Mouse(MouseEvent),
     /// Never produced by the built-in capture systems (winit has no paste
-    /// event). Exists for crossterm-shape parity so BYO writers (e.g. a
-    /// bevy_ratatui adapter, tests, network input) can deliver it.
+    /// event).
     Paste(String),
     FocusGained,
     FocusLost,
     /// Emitted on window resize for every terminal (same trigger as
-    /// today). Deliberately NOT crossterm's `Resize(cols, rows)`: texture
-    /// terminals never auto-resize, so a cell-count field here would
-    /// report the old, unchanged grid and mislead crossterm-habituated
-    /// readers. The pixel size is what `Tui::request_resize` recipes
-    /// actually need (see `examples/resize.rs`); grid changes are always
-    /// caller-initiated, so the caller already knows them.
+    /// today).
     Resize {
         pixels: UVec2,
     },
@@ -94,20 +54,14 @@ pub struct KeyEvent {
 }
 
 /// Mirror of `crossterm::event::KeyCode` (the subset a GPU-windowed app can
-/// produce), plus an escape hatch for everything else. Not `KeyCode` from
-/// `bevy::prelude` - see the module-level import comment.
+/// produce), plus an escape hatch for everything else.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyCode {
     Char(char),
     Enter,
     Tab,
     /// Shift+Tab, following crossterm's convention (`modifiers.shift`
-    /// stays true as well). Known, accepted quirk: derived from the
-    /// *live* shift state at each key transition, so releasing Shift
-    /// before releasing Tab yields a `Press` of `BackTab` but a
-    /// `Release` of `Tab`. Do not try to fix this with per-key state
-    /// tracking - crossterm has the same ambiguity, and the standard
-    /// consumer pattern (ignore `Release` events) never observes it.
+    /// stays true as well).
     BackTab,
     Backspace,
     Delete,
@@ -123,8 +77,7 @@ pub enum KeyCode {
     PageDown,
     F(u8),
     /// Anything not representable above - carries the physical key so no
-    /// information is lost. NOT part of the crossterm mirror; converts to
-    /// `None` in `crossterm-compat`.
+    /// information is lost.
     Unidentified(BevyKeyCode),
 }
 
@@ -172,26 +125,14 @@ pub struct KeyModifiers {
     pub meta: bool,
 }
 
-// ============================================================================
-// Resources
-// ============================================================================
-
 /// Tracks which terminal currently has input focus.
-///
-/// Only one terminal can have keyboard focus at a time.
-/// Keyboard events are routed only to the focused terminal.
-///
-/// Focus can be changed by:
-/// - Clicking on a terminal (automatic)
-/// - Pressing Tab key (cycles through terminals with `TerminalInput`)
-/// - Manually setting `focus.focused = Some(entity)`
 #[derive(Resource, Default, Debug)]
 pub struct TerminalFocus {
     /// Entity of the currently focused terminal, or None if no terminal has focus
     pub focused: Option<Entity>,
 }
 
-/// Global config for terminal input. Inserted by `TerminalPlugin`.
+/// Global config for terminal input.
 #[derive(Resource, Clone, Debug)]
 pub struct TerminalInputConfig {
     /// Enable keyboard input capture
@@ -216,22 +157,13 @@ impl Default for TerminalInputConfig {
 }
 
 /// Cached cursor position in window coordinates.
-///
-/// Updated by `update_cursor_position_system` and used by `mouse_input_system`
-/// for hit-testing. On touch devices (where no mouse cursor exists) this
-/// holds the first active touch's position instead - see
-/// [`update_cursor_position_system`].
 #[derive(Resource, Default, Debug)]
 pub struct CursorPosition {
     /// Current cursor position, or None if cursor is outside window
     pub position: Option<Vec2>,
 }
 
-// ============================================================================
-// Components
-// ============================================================================
-
-/// Enable input routing for a terminal. Without this component, terminals are display-only.
+/// Enable input routing for a terminal.
 #[derive(Component, Debug, Clone)]
 pub struct TerminalInput {
     /// Whether this terminal can receive keyboard input
@@ -249,14 +181,7 @@ impl Default for TerminalInput {
     }
 }
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
-/// Reads the four modifier keys from bevy's `ButtonInput`. The single
-/// modifier implementation in the crate - both `keyboard_input_system` and
-/// every `mouse_input_system` variant call this rather than each computing
-/// their own.
+/// Reads the four modifier keys from bevy's `ButtonInput`.
 fn read_modifiers(keyboard: &ButtonInput<BevyKeyCode>) -> KeyModifiers {
     KeyModifiers {
         ctrl: keyboard.pressed(BevyKeyCode::ControlLeft)
@@ -269,12 +194,7 @@ fn read_modifiers(keyboard: &ButtonInput<BevyKeyCode>) -> KeyModifiers {
 }
 
 /// Maps bevy's logical key (already layout/Shift-resolved by winit) to the
-/// crossterm-shaped `KeyCode`. Pure and unit-testable without an `App`.
-/// `shift` decides `Tab` vs `BackTab` (see `KeyCode::BackTab`'s doc comment
-/// for the accepted press/release quirk this implies). Returns `None` only
-/// when `Key::Character` carries no characters - a winit edge case, not
-/// expected in practice - in which case the caller should skip the whole
-/// `KeyboardInput` message.
+/// crossterm-shaped `KeyCode`.
 fn keycode_from_logical(key: &Key, shift: bool, physical: BevyKeyCode) -> Option<KeyCode> {
     Some(match key {
         Key::Character(s) => KeyCode::Char(s.chars().next()?),
@@ -310,48 +230,18 @@ fn keycode_from_logical(key: &Key, shift: bool, physical: BevyKeyCode) -> Option
     })
 }
 
-// ============================================================================
-// Event-target remapping
-// ============================================================================
-
 /// Remap a hit-tested / focused entity to the [`Tui`](crate::setup::Tui)
 /// entity it displays, via [`TuiSurface`](crate::setup::TuiSurface).
-///
-/// For library-spawned terminals (`tui == surface`) and for any entity
-/// without a `TuiSurface` component at all, this is the identity -
-/// `TerminalEvent::target` is unchanged. Only attached terminals (see
-/// `AttachTerminal`), where the surface entity (carrying
-/// `TerminalInput`/`TerminalDimensions`, where hit-testing happens) differs
-/// from the `Tui` entity, actually remap.
 fn remap_to_tui(entity: Entity, surfaces: &Query<&crate::setup::TuiSurface>) -> Entity {
     surfaces.get(entity).map(|s| s.tui).unwrap_or(entity)
 }
 
-// ============================================================================
-// Input Systems
-// ============================================================================
-
 /// Update cursor position from window.
-///
-/// This system reads the cursor position from the primary window and updates
-/// the `CursorPosition` resource for use by other input systems.
-///
-/// Falls back to the first active touch's position when no mouse cursor is
-/// available: on touch devices (mobile browsers in particular) winit reports
-/// taps as touch events only and never moves a mouse cursor, so without
-/// this fallback a tap would never hit-test at all. Touch positions arrive
-/// in the same logical-pixel, top-left-origin window space as
-/// `Window::cursor_position()` (bevy_winit converts with `to_logical`).
-/// The frame a touch ends, `first_pressed_position` is already `None`, but
-/// `mouse_input_system` still needs a position to emit `MouseEventKind::Up`
-/// at - hence the second fallback to the just-released touch's last
-/// position.
 pub fn update_cursor_position_system(
     mut cursor_pos: ResMut<CursorPosition>,
     windows: Query<&Window>,
     touches: Res<Touches>,
 ) {
-    // Get primary window
     if let Ok(window) = windows.single() {
         cursor_pos.position = window
             .cursor_position()
@@ -361,9 +251,6 @@ pub fn update_cursor_position_system(
 }
 
 /// Keyboard input capture system.
-///
-/// Captures keyboard input and emits `TerminalEvent`s for the focused terminal.
-/// Only processes input if a terminal has focus and has keyboard input enabled.
 pub fn keyboard_input_system(
     mut key_events: MessageReader<KeyboardInput>,
     keyboard: Res<ButtonInput<BevyKeyCode>>,
@@ -372,12 +259,10 @@ pub fn keyboard_input_system(
     surfaces: Query<&crate::setup::TuiSurface>,
     mut events: MessageWriter<TerminalEvent>,
 ) {
-    // Check if any terminal has focus
     let Some(focused_entity) = focus.focused else {
         return;
     };
 
-    // Check if focused terminal accepts keyboard input
     let Ok(input) = terminals.get(focused_entity) else {
         return;
     };
@@ -386,8 +271,6 @@ pub fn keyboard_input_system(
         return;
     }
 
-    // `focus.focused` stores the surface entity (where TerminalInput lives);
-    // remap to the Tui entity only for the emitted event's target.
     let target = remap_to_tui(focused_entity, &surfaces);
     let modifiers = read_modifiers(&keyboard);
 
@@ -414,13 +297,7 @@ pub fn keyboard_input_system(
     }
 }
 
-// ============================================================================
-// Mouse Input - Unified System Helpers
-// ============================================================================
-
-/// Terminal type detected from components. Only meaningful when both mesh
-/// (3d) and UI (2d) terminals can coexist - the single-feature builds below
-/// know their terminal kind up front and skip detection entirely.
+/// Terminal type detected from components.
 #[cfg(all(feature = "mouse_input", feature = "2d", feature = "3d"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TerminalType {
@@ -460,7 +337,7 @@ enum SortKey {
 impl PartialOrd for SortKey {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         match (self, other) {
-            (SortKey::ZIndex(a), SortKey::ZIndex(b)) => b.partial_cmp(a), // Higher Z on top
+            (SortKey::ZIndex(a), SortKey::ZIndex(b)) => b.partial_cmp(a),
             (
                 SortKey::Distance {
                     camera_priority: ca,
@@ -470,25 +347,10 @@ impl PartialOrd for SortKey {
                     camera_priority: cb,
                     distance: db,
                 },
-            ) => {
-                // Terminals seen by a higher-order (overlay) camera win;
-                // within the same camera, closer hits win.
-                match ca.cmp(cb) {
-                    std::cmp::Ordering::Equal => da.partial_cmp(db),
-                    ord => Some(ord),
-                }
-            }
-            // A 2D UI terminal and a 3D mesh terminal can both register a
-            // hit for the same cursor position: the mesh ray-cast tests
-            // world-space geometry regardless of what bevy_ui has drawn on
-            // top of it, so a UI panel overlapping a 3D terminal in screen
-            // space (e.g. a HUD panel sitting above where a world model
-            // happens to project to) produces hit_candidates for both.
-            // Leaving the two unordered would let the winner depend on
-            // query iteration order (archetype/spawn-order dependent, NOT
-            // screen-depth dependent). bevy_ui is rendered as a
-            // screen-space overlay on top of every 3D camera regardless of
-            // `Camera::order`, so a UI hit always wins when both fire.
+            ) => match ca.cmp(cb) {
+                std::cmp::Ordering::Equal => da.partial_cmp(db),
+                ord => Some(ord),
+            },
             (SortKey::ZIndex(_), SortKey::Distance { .. }) => Some(std::cmp::Ordering::Less),
             (SortKey::Distance { .. }, SortKey::ZIndex(_)) => Some(std::cmp::Ordering::Greater),
         }
@@ -496,16 +358,7 @@ impl PartialOrd for SortKey {
 }
 
 /// Bundles the unified system's three change-detection probe queries
-/// into a single `SystemParam`. Bevy's generated
-/// `SystemParam` tuple impl tops out at 16 elements; the unified variant's
-/// own parameter list already sits at that ceiling once `keyboard` and
-/// `wheel` are added for scroll/modifier support, so these three
-/// low-frequency queries are folded into one slot instead of three.
-///
-/// `pub`, not `pub(crate)`: it appears in `mouse_input_system`'s (public)
-/// parameter list, so it must be at least as visible as that function -
-/// callers never construct it themselves (bevy injects it), so this is
-/// purely to satisfy the visibility checker.
+/// into a single `SystemParam`.
 #[cfg(all(feature = "mouse_input", feature = "2d", feature = "3d"))]
 #[derive(bevy::ecs::system::SystemParam)]
 pub struct MouseChangeProbes<'w, 's> {
@@ -545,8 +398,6 @@ impl MouseChangeProbes<'_, '_> {
 }
 
 /// Detect terminal type from components.
-///
-/// Priority: 3D mesh > 2D UI (for hybrid entities)
 #[cfg(all(feature = "mouse_input", feature = "2d", feature = "3d"))]
 fn detect_terminal_type(
     mesh2d: Option<&Mesh2d>,
@@ -565,16 +416,7 @@ fn detect_terminal_type(
 }
 
 /// Convert a pixel position local to a terminal's rendered area (origin at
-/// the terminal's top-left, `+Y` down) to a clamped grid cell. Pure
-/// function, no bevy types - used by 2D UI hit-testing
-/// (`bounding_box_hit_test`).
-///
-/// Clamps in both directions: negative input (shouldn't happen at the
-/// current call site, which already bounds-checks before calling this, but
-/// this function makes no such assumption) clamps to column/row 0; input at
-/// or beyond the terminal's pixel size clamps to the last column/row
-/// (`cols - 1`/`rows - 1`), never `cols`/`rows` themselves - those would be
-/// one past the last valid grid index.
+/// the terminal's top-left, `+Y` down) to a clamped grid cell.
 #[cfg(all(feature = "mouse_input", feature = "2d"))]
 fn pixel_to_cell(
     local_x: f32,
@@ -591,15 +433,7 @@ fn pixel_to_cell(
     (col, row)
 }
 
-/// Convert a mesh UV coordinate to a clamped grid cell. Pure function, no
-/// bevy types - used by 3D ray-mesh hit-testing (`ray_cast_hit_test_inner`).
-///
-/// UV is nominally `0.0..=1.0`, but ray-mesh intersection can return values
-/// fractionally outside that range at triangle edges due to floating-point
-/// error - clamped the same way as [`pixel_to_cell`], including the "never
-/// return `cols`/`rows` themselves" rule (a naive `(uv * cols).clamp(0.0,
-/// cols)` allows exactly that at `uv == 1.0`, one past the last valid grid
-/// index).
+/// Convert a mesh UV coordinate to a clamped grid cell.
 #[cfg(all(feature = "mouse_input", feature = "3d"))]
 fn uv_to_cell(uv_x: f32, uv_y: f32, cols: u16, rows: u16) -> (u16, u16) {
     let max_col = cols.saturating_sub(1) as f32;
@@ -610,8 +444,6 @@ fn uv_to_cell(uv_x: f32, uv_y: f32, cols: u16, rows: u16) -> (u16, u16) {
 }
 
 /// Perform 2D UI bounding box hit test.
-///
-/// Converts cursor position to terminal grid coordinates using UI layout bounds.
 #[cfg(all(feature = "mouse_input", feature = "2d"))]
 fn bounding_box_hit_test(
     cursor_pos: bevy::math::Vec2,
@@ -620,11 +452,8 @@ fn bounding_box_hit_test(
     computed: Option<&bevy::ui::ComputedNode>,
     dimensions: Option<&crate::bevy_plugin::TerminalDimensions>,
 ) -> Option<HitTestResult> {
-    // Get terminal size and scale factor
-    // ComputedNode.size is in physical pixels, we need to convert to logical
     let (width_px, height_px, inverse_scale) = if let Some(comp) = computed {
         let node_size = comp.unrounded_size();
-        // Convert from physical to logical pixels using inverse_scale_factor
         (
             node_size.x * comp.inverse_scale_factor,
             node_size.y * comp.inverse_scale_factor,
@@ -634,7 +463,7 @@ fn bounding_box_hit_test(
         let n = node?;
         match (n.width, n.height) {
             (bevy::ui::Val::Px(w), bevy::ui::Val::Px(h)) => (w, h, 1.0),
-            _ => return None, // Not in pixels
+            _ => return None,
         }
     };
 
@@ -666,7 +495,6 @@ fn bounding_box_hit_test(
         );
         (center.x - width_px / 2.0, center.y - height_px / 2.0)
     } else if let Some(n) = node {
-        // Fallback only correct for explicitly left/top-anchored nodes.
         let left_px = match n.left {
             bevy::ui::Val::Px(v) => v,
             _ => 0.0,
@@ -691,15 +519,13 @@ fn bounding_box_hit_test(
     let node_max_x = node_min_x + width_px;
     let node_max_y = node_min_y + height_px;
 
-    // Check if cursor is within terminal bounds
     let x_in = cursor_pos.x >= node_min_x && cursor_pos.x <= node_max_x;
     let y_in = cursor_pos.y >= node_min_y && cursor_pos.y <= node_max_y;
 
     if !x_in || !y_in {
-        return None; // Miss
+        return None;
     }
 
-    // Get terminal dimensions and font metrics
     let (cols, rows, char_width, char_height) = if let Some(dims) = dimensions {
         (
             dims.cols as f32,
@@ -708,13 +534,11 @@ fn bounding_box_hit_test(
             dims.char_height_px as f32,
         )
     } else {
-        // Fallback to defaults
         let cols = 80.0;
         let rows = 24.0;
         (cols, rows, width_px / cols, height_px / rows)
     };
 
-    // Convert screen coordinates to terminal-local coordinates
     let local_x = cursor_pos.x - node_min_x;
     let local_y = cursor_pos.y - node_min_y;
 
@@ -732,7 +556,6 @@ fn bounding_box_hit_test(
         char_height
     );
 
-    // Convert to terminal grid coordinates
     let (col, row) = pixel_to_cell(
         local_x,
         local_y,
@@ -751,20 +574,6 @@ fn bounding_box_hit_test(
 /// mesh entity's bounding box? Rejects most terminals with a few float ops
 /// before any mesh vertex data (positions/indices/UVs) is touched by the
 /// precise test in `ray_cast_hit_test_inner`.
-///
-/// Fails OPEN (`true`, i.e. "might hit, don't prune") whenever it lacks the
-/// information to answer confidently - no `Aabb` component, or a
-/// degenerate (e.g. zero-scale) transform - since pruning must never
-/// introduce a false negative that silently drops a real hit.
-///
-/// `Aabb` is stored in the mesh's own LOCAL/model space (see its doc
-/// comment in `bevy_camera::primitives`), so this transforms the
-/// WORLD-space ray into that same local space via the inverse of
-/// `mesh_transform`'s affine matrix - mirroring exactly how
-/// `ray_mesh_intersection` itself handles `mesh_transform` (it inverts the
-/// same affine and transforms the ray, not the mesh vertices), so scale,
-/// rotation, and translation are all accounted for consistently between
-/// the coarse and precise stages.
 #[cfg(all(feature = "mouse_input", feature = "3d"))]
 fn ray_intersects_aabb(
     world_ray: &crate::input::ray::Ray,
@@ -791,9 +600,6 @@ fn ray_intersects_aabb(
 }
 
 /// Perform 3D ray-mesh hit test.
-///
-/// Converts cursor position to terminal grid coordinates using ray casting and UV mapping.
-/// Works with both Mesh2d and Mesh3d by accepting the inner Handle<Mesh>.
 #[cfg(all(feature = "mouse_input", feature = "3d"))]
 fn ray_cast_hit_test_inner(
     world_ray: &crate::input::ray::Ray,
@@ -860,7 +666,6 @@ fn ray_cast_hit_test_inner(
         (80, 24)
     };
 
-    // UV to terminal grid mapping (90° CCW rotated mesh)
     let (col, row) = uv_to_cell(uv.x, uv.y, cols, rows);
 
     debug!(
@@ -872,8 +677,7 @@ fn ray_cast_hit_test_inner(
 }
 
 /// Selects `Moved` vs `Drag(button)` from which mouse buttons (and touches,
-/// pre-folded into `left` by the caller) are currently held. Left wins if
-/// multiple buttons are held at once - arbitrary but stable.
+/// pre-folded into `left` by the caller) are currently held.
 #[cfg(feature = "mouse_input")]
 fn move_kind(left: bool, right: bool, middle: bool) -> MouseEventKind {
     if left {
@@ -888,11 +692,7 @@ fn move_kind(left: bool, right: bool, middle: bool) -> MouseEventKind {
 }
 
 /// Selects a `MouseEventKind::Scroll*` from a `MouseWheel` message's raw
-/// `(x, y)` delta - sign only, no accumulation. `y` takes priority over
-/// `x` (matches how a plain vertical-wheel mouse reports). `None` when
-/// both deltas are exactly zero (shouldn't normally happen for a real
-/// `MouseWheel` message, but callers must not assume every message
-/// produces an event).
+/// `(x, y)` delta - sign only, no accumulation.
 #[cfg(feature = "mouse_input")]
 fn scroll_kind(x: f32, y: f32) -> Option<MouseEventKind> {
     if y > 0.0 {
@@ -920,11 +720,6 @@ fn emit_mouse_move(
     surfaces: &Query<&crate::setup::TuiSurface>,
     events: &mut MessageWriter<TerminalEvent>,
 ) {
-    // An active touch counts as a held left button - consistent with the
-    // tap-emulates-left-click convention in `emit_button_events` below, and
-    // reuses the same "is a touch currently held" check
-    // `update_cursor_position_system` already relies on (bevy's `Touches`
-    // has no `any_pressed()`).
     let left = buttons.pressed(MouseButton::Left) || touches.first_pressed_position().is_some();
     let kind = move_kind(
         left,
@@ -1027,7 +822,7 @@ fn emit_button_events(
 }
 
 /// Emits one `Scroll*` event per `MouseWheel` message at the given hit
-/// cell. Shared by all three `mouse_input_system` variants.
+/// cell.
 #[cfg(feature = "mouse_input")]
 fn emit_scroll_events(
     target: Entity,
@@ -1054,24 +849,6 @@ fn emit_scroll_events(
 }
 
 /// Unified mouse input system with automatic 2D/3D detection.
-///
-/// This system handles mouse input for both 2D UI terminals and 3D mesh terminals
-/// by auto-detecting the terminal type from components and dispatching to the
-/// appropriate hit-testing logic.
-///
-/// Terminals can be:
-/// - 2D UI: Has `Node` or `ComputedNode` component (uses bounding box hit-testing)
-/// - 3D Mesh: Has `Mesh2d` or `Mesh3d` component (uses ray-mesh intersection)
-///
-/// For hybrid entities with both mesh and node components, 3D takes priority.
-///
-/// The system:
-/// 1. Iterates all terminals with `TerminalInput`
-/// 2. Auto-detects terminal type from components
-/// 3. Dispatches to appropriate hit-test function
-/// 4. Collects hits with sort keys (Z-index for 2D, distance for 3D)
-/// 5. Selects the topmost/closest terminal
-/// 6. Emits mouse events and handles focus
 #[cfg(all(feature = "mouse_input", feature = "2d", feature = "3d"))]
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn mouse_input_system(
@@ -1135,14 +912,6 @@ pub fn mouse_input_system(
     *last_cursor_pos = Some(cursor_pos);
     let modifiers = read_modifiers(&keyboard);
 
-    // Build one ray per active camera whose viewport contains the cursor,
-    // topmost-rendered camera first (highest `Camera::order`). Multi-camera
-    // setups (world + UI overlay) are common; a terminal is picked through
-    // the frontmost camera that sees it.
-    //
-    // `Camera::viewport_to_world` uses the camera's real projection matrix,
-    // so every projection kind (perspective, orthographic with any
-    // `ScalingMode`, custom) is handled correctly.
     let mut cameras: Vec<(&Camera, &GlobalTransform)> = camera_query
         .iter()
         .filter(|(camera, _)| camera.is_active)
@@ -1187,31 +956,20 @@ pub fn mouse_input_system(
 
         match terminal_type {
             TerminalType::Mesh3D => {
-                // Get the inner Handle<Mesh> from either Mesh3d or Mesh2d
                 let mesh_handle = mesh3d.map(|m| &m.0).or_else(|| mesh2d.map(|m| &m.0));
                 let Some(transform) = transform else {
-                    continue; // no GlobalTransform - can't ray-cast
+                    continue;
                 };
 
-                // Stage 1 (coarse->fine): visibility -
-                // bevy's own visibility system already computed this for
-                // the frame, so an invisible terminal is skipped before
-                // any per-camera work. Fail open (no component = not
-                // pruned) rather than assume visible/invisible.
                 if view_visibility.is_some_and(|v| !v.get()) {
                     continue;
                 }
 
-                // Test cameras front-to-back; the first camera whose ray hits
-                // this terminal determines its hit (and camera priority).
                 for (camera_priority, ray) in world_rays.iter().enumerate() {
-                    // Stage 2: AABB bounding check - cheap rejection
-                    // before touching any mesh vertex data.
                     if !ray_intersects_aabb(ray, transform, aabb) {
                         continue;
                     }
 
-                    // Stage 3: precise triangle-level intersection.
                     if let Some((hit_result, distance)) = mesh_handle.and_then(|handle| {
                         ray_cast_hit_test_inner(ray, transform, handle, &meshes, dimensions)
                     }) {
@@ -1235,10 +993,7 @@ pub fn mouse_input_system(
                     hit_candidates.push((entity, hit_result, SortKey::ZIndex(z)));
                 }
             }
-            TerminalType::Unknown => {
-                // Terminal has TerminalInput but no recognized display component
-                // This shouldn't happen in normal usage, so we skip it
-            }
+            TerminalType::Unknown => {}
         }
     }
 
@@ -1247,7 +1002,6 @@ pub fn mouse_input_system(
         return;
     }
 
-    // Debug: Log all hits before sorting
     if hit_candidates.len() > 1 {
         debug!(
             "Multiple terminals hit at cursor ({:.1}, {:.1}):",
@@ -1261,11 +1015,8 @@ pub fn mouse_input_system(
         }
     }
 
-    // Sort by the custom PartialOrd which puts higher Z-index first (for 2D)
-    // and closer distance first (for 3D)
     hit_candidates.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
 
-    // Debug: Log selection after sorting
     if hit_candidates.len() > 1 {
         debug!(
             "After sorting, selected: Entity {:?} with sort_key={:?}",
@@ -1274,10 +1025,6 @@ pub fn mouse_input_system(
     }
 
     if let Some((entity, hit_result, _sort_key)) = hit_candidates.first() {
-        // Dedupe MouseMove: only emit when the
-        // hovered (entity, col, row) actually changed since the last
-        // recompute, so hovering inside one cell stops re-emitting on
-        // every gate-triggered recompute.
         let hovered = (*entity, hit_result.col, hit_result.row);
         if *last_hovered != Some(hovered) {
             emit_mouse_move(
@@ -1466,9 +1213,6 @@ pub fn mouse_input_system(
     )>,
     surfaces: Query<&crate::setup::TuiSurface>,
     mut events: MessageWriter<TerminalEvent>,
-    // Change-detection gate - see the unified system's
-    // doc comment for the full rationale; no UI-layout probe needed here
-    // since there is no 2D UI terminal kind in this build.
     camera_change_probe: Query<
         (),
         (
@@ -1538,22 +1282,18 @@ pub fn mouse_input_system(
         }
         let mesh_handle = mesh3d.map(|m| &m.0).or_else(|| mesh2d.map(|m| &m.0));
         let Some(transform) = transform else {
-            continue; // no GlobalTransform - can't ray-cast
+            continue;
         };
 
-        // Stage 1 (coarse->fine): visibility. Fail
-        // open (no component = not pruned).
         if view_visibility.is_some_and(|v| !v.get()) {
             continue;
         }
 
         for (camera_priority, ray) in world_rays.iter().enumerate() {
-            // Stage 2: AABB bounding check.
             if !ray_intersects_aabb(ray, transform, aabb) {
                 continue;
             }
 
-            // Stage 3: precise triangle-level intersection.
             if let Some((hit_result, distance)) = mesh_handle.and_then(|handle| {
                 ray_cast_hit_test_inner(ray, transform, handle, &meshes, dimensions)
             }) {
@@ -1616,8 +1356,6 @@ pub fn mouse_input_system(
 }
 
 /// Window resize event system.
-///
-/// Listens for window resize events and forwards them to all terminals.
 pub fn window_resize_system(
     mut resize_events: MessageReader<bevy::window::WindowResized>,
     terminals: Query<Entity, With<crate::setup::Tui>>,
@@ -1627,7 +1365,6 @@ pub fn window_resize_system(
     for resize_event in resize_events.read() {
         let pixels = UVec2::new(resize_event.width as u32, resize_event.height as u32);
 
-        // Emit resize event for all terminals
         for entity in terminals.iter() {
             events.write(TerminalEvent {
                 target: remap_to_tui(entity, &surfaces),
@@ -1638,9 +1375,6 @@ pub fn window_resize_system(
 }
 
 /// Terminal focus cycling system.
-///
-/// Handles Tab key to cycle focus between terminals with `TerminalInput` component.
-/// Emits FocusGained/FocusLost events when focus changes.
 pub fn terminal_focus_system(
     keyboard: Res<ButtonInput<BevyKeyCode>>,
     mut focus: ResMut<TerminalFocus>,
@@ -1648,12 +1382,10 @@ pub fn terminal_focus_system(
     surfaces: Query<&crate::setup::TuiSurface>,
     mut events: MessageWriter<TerminalEvent>,
 ) {
-    // Check if Tab was just pressed
     if !keyboard.just_pressed(BevyKeyCode::Tab) {
         return;
     }
 
-    // Collect terminals with keyboard input enabled
     let mut terminal_entities: Vec<Entity> = terminals
         .iter()
         .filter(|(_, input)| input.keyboard)
@@ -1664,27 +1396,22 @@ pub fn terminal_focus_system(
         return;
     }
 
-    // Sort for consistent ordering
     terminal_entities.sort();
 
-    // Find current focus index
     let current_index = focus.focused.and_then(|focused| {
         terminal_entities
             .iter()
             .position(|&entity| entity == focused)
     });
 
-    // Calculate next index (wrap around)
     let next_index = match current_index {
         Some(idx) => (idx + 1) % terminal_entities.len(),
-        None => 0, // No focus, start at first terminal
+        None => 0,
     };
 
     let next_entity = terminal_entities[next_index];
 
-    // Update focus if changed
     if focus.focused != Some(next_entity) {
-        // Emit FocusLost for old focus
         if let Some(old_focus) = focus.focused {
             events.write(TerminalEvent {
                 target: remap_to_tui(old_focus, &surfaces),
@@ -1692,20 +1419,14 @@ pub fn terminal_focus_system(
             });
         }
 
-        // Update focus
         focus.focused = Some(next_entity);
 
-        // Emit FocusGained
         events.write(TerminalEvent {
             target: remap_to_tui(next_entity, &surfaces),
             input: InputEvent::FocusGained,
         });
     }
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -1861,11 +1582,6 @@ mod tests {
         }
     }
 
-    // ========================================================================
-    // Coordinate mapping: pixel_to_cell (2D UI) / uv_to_cell (3D mesh).
-    // Pure math, no bevy types - exercised directly.
-    // ========================================================================
-
     #[cfg(all(feature = "mouse_input", feature = "2d"))]
     mod pixel_to_cell_tests {
         use super::super::pixel_to_cell;
@@ -1877,21 +1593,13 @@ mod tests {
 
         #[test]
         fn exactly_on_a_cell_boundary_rounds_down_into_the_next_cell() {
-            // x=8.0 is exactly the boundary between column 0 and column 1 -
-            // ratatui/terminal convention: the boundary pixel belongs to the
-            // cell it starts (column 1), not the one it ends (column 0).
             assert_eq!(pixel_to_cell(8.0, 16.0, 8.0, 16.0, 80, 24), (1, 1));
-            // Just before the boundary still belongs to the previous cell.
             assert_eq!(pixel_to_cell(7.9, 15.9, 8.0, 16.0, 80, 24), (0, 0));
         }
 
         #[test]
         fn last_column_and_row_clamp_correctly() {
-            // Exactly at the terminal's pixel edge (80 cols * 8px = 640,
-            // 24 rows * 16px = 384) must clamp to the LAST valid index
-            // (79, 23), not 80/24 (one past the grid).
             assert_eq!(pixel_to_cell(640.0, 384.0, 8.0, 16.0, 80, 24), (79, 23));
-            // Comfortably inside the last cell must resolve the same way.
             assert_eq!(pixel_to_cell(635.0, 380.0, 8.0, 16.0, 80, 24), (79, 23));
         }
 
@@ -1926,16 +1634,11 @@ mod tests {
 
         #[test]
         fn uv_one_clamps_to_the_last_cell_not_one_past_it() {
-            // What this guards against: a naive `(uv * cols).clamp(0.0,
-            // cols)` allows exactly `cols` at `uv == 1.0`, one past the last
-            // valid grid index (0..cols-1).
             assert_eq!(uv_to_cell(1.0, 1.0, 80, 24), (79, 23));
         }
 
         #[test]
         fn slightly_past_one_still_clamps_to_the_last_cell() {
-            // Ray-mesh intersection can return UV fractionally outside
-            // 0.0..=1.0 at triangle edges due to floating-point error.
             assert_eq!(uv_to_cell(1.0001, 1.0001, 80, 24), (79, 23));
         }
 

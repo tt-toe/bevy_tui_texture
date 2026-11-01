@@ -1,8 +1,3 @@
-// Box Drawing Characters (U+2500–U+257F)
-//
-// Implements programmatic rendering for 128 box-drawing glyphs.
-// Based on Rio Terminal's implementation in batch.rs
-
 use super::primitives::*;
 use tiny_skia::Pixmap;
 
@@ -17,15 +12,12 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
     let color = default_color();
 
     match c {
-        // ═══ Basic Lines ═══
-        '─' => draw_horizontal_line(&mut pixmap, center_y, stroke, color), // U+2500
-        '━' => draw_horizontal_line(&mut pixmap, center_y, heavy_stroke, color), // U+2501 Heavy
-        '│' => draw_vertical_line(&mut pixmap, center_x, stroke, color),   // U+2502
-        '┃' => draw_vertical_line(&mut pixmap, center_x, heavy_stroke, color), // U+2503 Heavy
+        '─' => draw_horizontal_line(&mut pixmap, center_y, stroke, color),
+        '━' => draw_horizontal_line(&mut pixmap, center_y, heavy_stroke, color),
+        '│' => draw_vertical_line(&mut pixmap, center_x, stroke, color),
+        '┃' => draw_vertical_line(&mut pixmap, center_x, heavy_stroke, color),
 
-        // ═══ Dashed Lines ═══
         '┄' => {
-            // U+2504 Light triple dash horizontal
             let dash_count = 3;
             let gap = stroke;
             let dash_width = (w - (dash_count - 1) as f32 * gap) / dash_count as f32;
@@ -42,7 +34,6 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
             }
         }
         '┅' => {
-            // U+2505 Heavy triple dash horizontal
             let dash_count = 3;
             let gap = stroke;
             let dash_width = (w - (dash_count - 1) as f32 * gap) / dash_count as f32;
@@ -59,7 +50,6 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
             }
         }
         '┆' => {
-            // U+2506 Light triple dash vertical
             let dash_count = 3;
             let gap = stroke;
             let dash_height = (h - (dash_count - 1) as f32 * gap) / dash_count as f32;
@@ -76,7 +66,6 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
             }
         }
         '┇' => {
-            // U+2507 Heavy triple dash vertical
             let dash_count = 3;
             let gap = stroke;
             let dash_height = (h - (dash_count - 1) as f32 * gap) / dash_count as f32;
@@ -93,7 +82,6 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
             }
         }
         '┈' => {
-            // U+2508 Light quadruple dash horizontal
             let dash_count = 4;
             let gap = stroke;
             let dash_width = (w - (dash_count - 1) as f32 * gap) / dash_count as f32;
@@ -110,7 +98,6 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
             }
         }
         '┉' => {
-            // U+2509 Heavy quadruple dash horizontal
             let dash_count = 4;
             let gap = stroke;
             let dash_width = (w - (dash_count - 1) as f32 * gap) / dash_count as f32;
@@ -127,7 +114,6 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
             }
         }
         '┊' => {
-            // U+250A Light quadruple dash vertical
             let dash_count = 4;
             let gap = stroke;
             let dash_height = (h - (dash_count - 1) as f32 * gap) / dash_count as f32;
@@ -144,7 +130,6 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
             }
         }
         '┋' => {
-            // U+250B Heavy quadruple dash vertical
             let dash_count = 4;
             let gap = stroke;
             let dash_height = (h - (dash_count - 1) as f32 * gap) / dash_count as f32;
@@ -161,9 +146,7 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
             }
         }
 
-        // ═══ Corners (Light) ═══
         '┌' => {
-            // U+250C Down and right
             draw_rect(
                 &mut pixmap,
                 center_x - stroke / 2.0,
@@ -182,7 +165,6 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
             );
         }
         '┐' => {
-            // U+2510 Down and left
             draw_rect(
                 &mut pixmap,
                 0.0,
@@ -201,7 +183,6 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
             );
         }
         '└' => {
-            // U+2514 Up and right
             draw_rect(
                 &mut pixmap,
                 center_x - stroke / 2.0,
@@ -220,7 +201,6 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
             );
         }
         '┘' => {
-            // U+2518 Up and left
             draw_rect(
                 &mut pixmap,
                 0.0,
@@ -239,9 +219,7 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
             );
         }
 
-        // ═══ Corners (Heavy) ═══
         '┏' => {
-            // U+250F Heavy down and right
             draw_rect(
                 &mut pixmap,
                 center_x - heavy_stroke / 2.0,
@@ -260,7 +238,6 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
             );
         }
         '┓' => {
-            // U+2513 Heavy down and left
             draw_rect(
                 &mut pixmap,
                 0.0,
@@ -279,7 +256,6 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
             );
         }
         '┗' => {
-            // U+2517 Heavy up and right
             draw_rect(
                 &mut pixmap,
                 center_x - heavy_stroke / 2.0,
@@ -298,7 +274,6 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
             );
         }
         '┛' => {
-            // U+251B Heavy up and left
             draw_rect(
                 &mut pixmap,
                 0.0,
@@ -317,9 +292,7 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
             );
         }
 
-        // ═══ T-junctions (Light) ═══
         '├' => {
-            // U+251C Vertical and right
             draw_vertical_line(&mut pixmap, center_x, stroke, color);
             draw_rect(
                 &mut pixmap,
@@ -331,7 +304,6 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
             );
         }
         '┤' => {
-            // U+2524 Vertical and left
             draw_vertical_line(&mut pixmap, center_x, stroke, color);
             draw_rect(
                 &mut pixmap,
@@ -343,7 +315,6 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
             );
         }
         '┬' => {
-            // U+252C Horizontal and down
             draw_horizontal_line(&mut pixmap, center_y, stroke, color);
             draw_rect(
                 &mut pixmap,
@@ -355,7 +326,6 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
             );
         }
         '┴' => {
-            // U+2534 Horizontal and up
             draw_horizontal_line(&mut pixmap, center_y, stroke, color);
             draw_rect(
                 &mut pixmap,
@@ -367,35 +337,27 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
             );
         }
 
-        // ═══ Cross ═══
         '┼' => {
-            // U+253C Vertical and horizontal
             draw_horizontal_line(&mut pixmap, center_y, stroke, color);
             draw_vertical_line(&mut pixmap, center_x, stroke, color);
         }
 
-        // ═══ Double Lines ═══
         '═' => {
-            // U+2550 Double horizontal - use thinner strokes for each line
             let thin_stroke = (stroke * 0.6).max(1.0);
             let gap = stroke * 0.8;
             draw_horizontal_line(&mut pixmap, center_y - gap, thin_stroke, color);
             draw_horizontal_line(&mut pixmap, center_y + gap, thin_stroke, color);
         }
         '║' => {
-            // U+2551 Double vertical - use thinner strokes for each line
             let thin_stroke = (stroke * 0.6).max(1.0);
             let gap = stroke * 0.8;
             draw_vertical_line(&mut pixmap, center_x - gap, thin_stroke, color);
             draw_vertical_line(&mut pixmap, center_x + gap, thin_stroke, color);
         }
 
-        // ═══ Double Line Corners ═══
         '╔' => {
-            // U+2554 Double down and right
             let thin_stroke = (stroke * 0.6).max(1.0);
             let gap = stroke * 0.8;
-            // Outer horizontal line (top)
             draw_rect(
                 &mut pixmap,
                 center_x - gap,
@@ -404,7 +366,6 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
                 thin_stroke,
                 color,
             );
-            // Outer vertical line (left)
             draw_rect(
                 &mut pixmap,
                 center_x - gap - thin_stroke / 2.0,
@@ -413,7 +374,6 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
                 h / 2.0 + gap,
                 color,
             );
-            // Inner horizontal line (bottom) - extend to corner
             draw_rect(
                 &mut pixmap,
                 center_x + gap - thin_stroke / 2.0,
@@ -422,7 +382,6 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
                 thin_stroke,
                 color,
             );
-            // Inner vertical line (right) - extend to corner
             draw_rect(
                 &mut pixmap,
                 center_x + gap - thin_stroke / 2.0,
@@ -433,10 +392,8 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
             );
         }
         '╗' => {
-            // U+2557 Double down and left
             let thin_stroke = (stroke * 0.6).max(1.0);
             let gap = stroke * 0.8;
-            // Outer horizontal line (top)
             draw_rect(
                 &mut pixmap,
                 0.0,
@@ -445,7 +402,6 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
                 thin_stroke,
                 color,
             );
-            // Outer vertical line (right)
             draw_rect(
                 &mut pixmap,
                 center_x + gap - thin_stroke / 2.0,
@@ -454,7 +410,6 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
                 h / 2.0 + gap,
                 color,
             );
-            // Inner horizontal line (bottom) - extend to corner
             draw_rect(
                 &mut pixmap,
                 0.0,
@@ -463,7 +418,6 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
                 thin_stroke,
                 color,
             );
-            // Inner vertical line (left) - extend to corner
             draw_rect(
                 &mut pixmap,
                 center_x - gap - thin_stroke / 2.0,
@@ -474,10 +428,8 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
             );
         }
         '╚' => {
-            // U+255A Double up and right
             let thin_stroke = (stroke * 0.6).max(1.0);
             let gap = stroke * 0.8;
-            // Outer horizontal line (bottom)
             draw_rect(
                 &mut pixmap,
                 center_x - gap,
@@ -486,7 +438,6 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
                 thin_stroke,
                 color,
             );
-            // Outer vertical line (left)
             draw_rect(
                 &mut pixmap,
                 center_x - gap - thin_stroke / 2.0,
@@ -495,7 +446,6 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
                 center_y + gap,
                 color,
             );
-            // Inner horizontal line (top) - extend to corner
             draw_rect(
                 &mut pixmap,
                 center_x + gap - thin_stroke / 2.0,
@@ -504,7 +454,6 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
                 thin_stroke,
                 color,
             );
-            // Inner vertical line (right) - extend to corner
             draw_rect(
                 &mut pixmap,
                 center_x + gap - thin_stroke / 2.0,
@@ -515,10 +464,8 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
             );
         }
         '╝' => {
-            // U+255D Double up and left
             let thin_stroke = (stroke * 0.6).max(1.0);
             let gap = stroke * 0.8;
-            // Outer horizontal line (bottom)
             draw_rect(
                 &mut pixmap,
                 0.0,
@@ -527,7 +474,6 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
                 thin_stroke,
                 color,
             );
-            // Outer vertical line (right)
             draw_rect(
                 &mut pixmap,
                 center_x + gap - thin_stroke / 2.0,
@@ -536,7 +482,6 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
                 center_y + gap,
                 color,
             );
-            // Inner horizontal line (top) - extend to corner
             draw_rect(
                 &mut pixmap,
                 0.0,
@@ -545,7 +490,6 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
                 thin_stroke,
                 color,
             );
-            // Inner vertical line (left) - extend to corner
             draw_rect(
                 &mut pixmap,
                 center_x - gap - thin_stroke / 2.0,
@@ -556,15 +500,11 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
             );
         }
 
-        // ═══ Double/Single Line Combinations ═══
         '╠' => {
-            // U+2560 Double vertical and single right
             let thin_stroke = (stroke * 0.6).max(1.0);
             let gap = stroke * 0.8;
-            // Draw double vertical lines
             draw_vertical_line(&mut pixmap, center_x - gap, thin_stroke, color);
             draw_vertical_line(&mut pixmap, center_x + gap, thin_stroke, color);
-            // Draw double horizontal lines to the right (to connect to both vertical lines)
             draw_rect(
                 &mut pixmap,
                 center_x - gap,
@@ -583,13 +523,10 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
             );
         }
         '╣' => {
-            // U+2563 Double vertical and single left
             let thin_stroke = (stroke * 0.6).max(1.0);
             let gap = stroke * 0.8;
-            // Draw double vertical lines
             draw_vertical_line(&mut pixmap, center_x - gap, thin_stroke, color);
             draw_vertical_line(&mut pixmap, center_x + gap, thin_stroke, color);
-            // Draw double horizontal lines to the left (to connect to both vertical lines)
             draw_rect(
                 &mut pixmap,
                 0.0,
@@ -608,13 +545,10 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
             );
         }
         '╦' => {
-            // U+2566 Double down and single horizontal
             let thin_stroke = (stroke * 0.6).max(1.0);
             let gap = stroke * 0.8;
-            // Draw double horizontal lines
             draw_horizontal_line(&mut pixmap, center_y - gap, thin_stroke, color);
             draw_horizontal_line(&mut pixmap, center_y + gap, thin_stroke, color);
-            // Draw double vertical lines downward (to connect to the horizontal lines)
             draw_rect(
                 &mut pixmap,
                 center_x - gap - thin_stroke / 2.0,
@@ -633,13 +567,10 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
             );
         }
         '╩' => {
-            // U+2569 Double up and single horizontal
             let thin_stroke = (stroke * 0.6).max(1.0);
             let gap = stroke * 0.8;
-            // Draw double horizontal lines
             draw_horizontal_line(&mut pixmap, center_y - gap, thin_stroke, color);
             draw_horizontal_line(&mut pixmap, center_y + gap, thin_stroke, color);
-            // Draw double vertical lines upward (to connect to the horizontal lines)
             draw_rect(
                 &mut pixmap,
                 center_x - gap - thin_stroke / 2.0,
@@ -658,25 +589,18 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
             );
         }
         '╬' => {
-            // U+256C Double vertical and single horizontal
             let thin_stroke = (stroke * 0.6).max(1.0);
             let gap = stroke * 0.8;
-            // Draw double vertical lines
             draw_vertical_line(&mut pixmap, center_x - gap, thin_stroke, color);
             draw_vertical_line(&mut pixmap, center_x + gap, thin_stroke, color);
-            // Draw double horizontal lines (to connect to both vertical lines)
             draw_horizontal_line(&mut pixmap, center_y - gap, thin_stroke, color);
             draw_horizontal_line(&mut pixmap, center_y + gap, thin_stroke, color);
         }
 
-        // ═══ Additional Double Horizontal Combinations ═══
         '╞' => {
-            // U+255E Vertical single and right double
             let thin_stroke = (stroke * 0.6).max(1.0);
             let gap = stroke * 0.8;
-            // Draw single vertical line
             draw_vertical_line(&mut pixmap, center_x, stroke, color);
-            // Draw double horizontal lines to the right
             draw_rect(
                 &mut pixmap,
                 center_x,
@@ -695,12 +619,9 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
             );
         }
         '╡' => {
-            // U+2561 Vertical single and left double
             let thin_stroke = (stroke * 0.6).max(1.0);
             let gap = stroke * 0.8;
-            // Draw single vertical line
             draw_vertical_line(&mut pixmap, center_x, stroke, color);
-            // Draw double horizontal lines to the left
             draw_rect(
                 &mut pixmap,
                 0.0,
@@ -719,13 +640,10 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
             );
         }
         '╤' => {
-            // U+2564 Down single and horizontal double
             let thin_stroke = (stroke * 0.6).max(1.0);
             let gap = stroke * 0.8;
-            // Draw double horizontal lines
             draw_horizontal_line(&mut pixmap, center_y - gap, thin_stroke, color);
             draw_horizontal_line(&mut pixmap, center_y + gap, thin_stroke, color);
-            // Draw single vertical line downward (connecting between the double horizontal lines)
             draw_rect(
                 &mut pixmap,
                 center_x - stroke / 2.0,
@@ -736,13 +654,10 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
             );
         }
         '╧' => {
-            // U+2567 Up single and horizontal double
             let thin_stroke = (stroke * 0.6).max(1.0);
             let gap = stroke * 0.8;
-            // Draw double horizontal lines
             draw_horizontal_line(&mut pixmap, center_y - gap, thin_stroke, color);
             draw_horizontal_line(&mut pixmap, center_y + gap, thin_stroke, color);
-            // Draw single vertical line upward (connecting between the double horizontal lines)
             draw_rect(
                 &mut pixmap,
                 center_x - stroke / 2.0,
@@ -753,19 +668,14 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
             );
         }
         '╪' => {
-            // U+256A Vertical single and horizontal double
             let thin_stroke = (stroke * 0.6).max(1.0);
             let gap = stroke * 0.8;
-            // Draw single vertical line
             draw_vertical_line(&mut pixmap, center_x, stroke, color);
-            // Draw double horizontal lines
             draw_horizontal_line(&mut pixmap, center_y - gap, thin_stroke, color);
             draw_horizontal_line(&mut pixmap, center_y + gap, thin_stroke, color);
         }
 
-        // ═══ Arc Corners ═══
         '╭' => {
-            // U+256D Arc down and right - larger radius for more pronounced curve
             let radius = w / 2.5;
             draw_rect(
                 &mut pixmap,
@@ -795,7 +705,6 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
             );
         }
         '╮' => {
-            // U+256E Arc down and left - larger radius for more pronounced curve
             let radius = w / 2.5;
             draw_rect(
                 &mut pixmap,
@@ -825,7 +734,6 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
             );
         }
         '╯' => {
-            // U+256F Arc up and left - larger radius for more pronounced curve
             let radius = w / 2.5;
             draw_rect(
                 &mut pixmap,
@@ -855,7 +763,6 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
             );
         }
         '╰' => {
-            // U+2570 Arc up and right - larger radius for more pronounced curve
             let radius = w / 2.5;
             draw_rect(
                 &mut pixmap,
@@ -885,27 +792,18 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
             );
         }
 
-        // ═══ Diagonal Lines ═══
         '╱' => {
-            // U+2571 Diagonal rising (bottom-left to top-right)
             draw_line(&mut pixmap, 0.0, h, w, 0.0, stroke, color);
         }
         '╲' => {
-            // U+2572 Diagonal falling (top-left to bottom-right)
             draw_line(&mut pixmap, 0.0, 0.0, w, h, stroke, color);
         }
         '╳' => {
-            // U+2573 Diagonal cross
             draw_line(&mut pixmap, 0.0, h, w, 0.0, stroke, color);
             draw_line(&mut pixmap, 0.0, 0.0, w, h, stroke, color);
         }
 
-        // TODO: Implement remaining glyphs (U+250C-U+257F)
-        // - More double line combinations
-        // - Heavy line variants
-        // - Mixed heavy/light combinations
-        // See Rio's batch.rs for complete implementation
-        _ => return None, // Unsupported glyph (will be added incrementally)
+        _ => return None,
     }
 
     Some(pixmap)

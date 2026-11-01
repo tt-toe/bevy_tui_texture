@@ -1,9 +1,3 @@
-// Benchmark Example - Terminal Drawing Performance Test
-//
-// Tests rendering performance with:
-// - Mode 1: Full-screen scrolling color gradation
-// - Mode 2: Random overlapping colored boxes
-
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::prelude::*;
 use bevy::window::{PresentMode, WindowResolution};
@@ -25,15 +19,14 @@ fn main() {
             primary_window: Some(Window {
                 title: "Terminal Benchmark - No FPS Limit".to_string(),
                 resolution: WindowResolution::new(1024, 768),
-                present_mode: PresentMode::AutoNoVsync, // No FPS limit
+                present_mode: PresentMode::AutoNoVsync,
                 ..default()
             }),
             ..default()
         }))
         .add_plugins(FrameTimeDiagnosticsPlugin::default())
-        .add_plugins(TerminalPlugin::display_only()) // No input systems!
+        .add_plugins(TerminalPlugin::display_only())
         .add_systems(Startup, setup)
-        // NO INPUT AT ALL - pure rendering benchmark
         .add_systems(Update, render_benchmark.in_set(TerminalSystemSet::Render))
         .run();
 }
@@ -45,7 +38,7 @@ struct BenchmarkTerminal;
 
 #[derive(Resource, Default)]
 struct BenchmarkState {
-    mode: u8, // 0 = gradient, 1 = random boxes
+    mode: u8,
     scroll_offset: f32,
     frame_count: u32,
     last_report_secs: f32,
@@ -62,7 +55,7 @@ fn setup(mut commands: Commands) {
     commands.spawn((
         TuiRequest::ui(COLS, ROWS, fonts).with_config(TerminalConfig {
             keyboard: false,
-            mouse: false, // NO INPUT - pure rendering benchmark
+            mouse: false,
             ..default()
         }),
         Node {
@@ -92,7 +85,6 @@ fn render_benchmark(
     state.frame_count += 1;
     state.scroll_offset += time.delta_secs() * 20.0;
 
-    // Auto-switch modes every 5 seconds (no input needed)
     state.mode = ((time.elapsed_secs() / 5.0) as u8) % 2;
 
     let fps = diagnostics
@@ -100,9 +92,6 @@ fn render_benchmark(
         .and_then(|d| d.smoothed())
         .unwrap_or(0.0);
 
-    // Print numeric FPS/frame-time samples to stdout every ~2s so
-    // before/after architecture comparisons have exact logged numbers to
-    // diff, not just an on-screen readout to eyeball.
     let elapsed = time.elapsed_secs();
     if elapsed - state.last_report_secs >= 2.0 {
         state.last_report_secs = elapsed;
@@ -113,13 +102,11 @@ fn render_benchmark(
         );
     }
 
-    // Get time in milliseconds for better random seed
     let time_ms = (time.elapsed_secs() * 1000.0) as u32;
 
     term.draw(|frame| {
             let area = frame.area();
 
-            // Mode display
             let mode_name = match state.mode {
                 0 => "Mode 1: Scrolling Gradation",
                 1 => "Mode 2: Random Boxes",
@@ -142,7 +129,6 @@ fn render_benchmark(
 
             frame.render_widget(header, chunks[0]);
 
-            // Render content based on mode
             match state.mode {
                 0 => render_gradient(frame, chunks[1], state.scroll_offset),
                 1 => render_random_boxes(frame, chunks[1], time_ms + state.frame_count),
@@ -159,7 +145,6 @@ fn render_gradient(frame: &mut ratatui::Frame, area: RatatuiRect, offset: f32) {
         let mut line_spans = Vec::new();
 
         for x in 0..width {
-            // Calculate color based on position + scroll offset
             let hue = ((x as f32 + y as f32 * 3.0 + offset) % 360.0) / 360.0;
             let (r, g, b) = hsv_to_rgb(hue, 1.0, 1.0);
 
@@ -188,7 +173,6 @@ fn render_gradient(frame: &mut ratatui::Frame, area: RatatuiRect, offset: f32) {
 }
 
 fn render_random_boxes(frame: &mut ratatui::Frame, area: RatatuiRect, seed: u32) {
-    // Draw 50 random boxes per frame
     for i in 0..50 {
         let x = pseudo_random(seed.wrapping_add(i * 4)) % area.width;
         let y = pseudo_random(seed.wrapping_add(i * 4 + 1)) % area.height;
@@ -211,15 +195,12 @@ fn render_random_boxes(frame: &mut ratatui::Frame, area: RatatuiRect, seed: u32)
     }
 }
 
-// Uses Permuted Congruential Generator for better quality and speed
 fn pseudo_random(seed: u32) -> u16 {
-    // PCG XSH RR 32/16 variant
     let state = seed.wrapping_mul(747796405u32).wrapping_add(2891336453u32);
     let word = ((state >> ((state >> 28) + 4)) ^ state).wrapping_mul(277803737u32);
     ((word >> 22) ^ word) as u16
 }
 
-// Convert HSV to RGB
 fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
     let c = v * s;
     let h_prime = h * 6.0;

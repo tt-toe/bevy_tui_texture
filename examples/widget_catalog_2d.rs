@@ -1,44 +1,4 @@
-//! # Widget Catalog - Comprehensive 2D Example
-//!
 //! **Interactive showcase of ratatui widgets** demonstrating full input handling capabilities.
-//!
-//! ## What This Example Shows
-//!
-//! - **Tab Navigation** - Click tabs or use number keys (1-4) to switch pages
-//! - **Interactive Buttons** - Click handlers with visual feedback
-//! - **Scrollable Lists** - Keyboard and mouse selection
-//! - **Charts** - Bar charts and sparklines with live data
-//! - **Gauges** - Interactive progress indicators
-//! - **Full Input System** - Combined keyboard + mouse input handling
-//!
-//! ## Running
-//!
-//! ```bash
-//! cargo run --example widget_catalog_2d
-//! ```
-//!
-//! ## Controls
-//!
-//! ### Keyboard
-//! - **1-4** - Switch between tabs (Controls, Lists, Charts, Gauges)
-//! - **Up/Down Arrows** - Navigate lists
-//! - **Space** - Toggle list selection
-//! - **ESC** - Quit application
-//!
-//! ### Mouse
-//! - **Click Tabs** - Switch pages
-//! - **Click Buttons** - Trigger actions
-//! - **Click List Items** - Select items
-//! - **Click Gauges** - Adjust values
-//!
-//! ## Architecture Highlights
-//!
-//! - Uses `TuiRequest::ui` - the terminal is a `Tui` Component on its
-//!   own entity, queried directly (no wrapping Resource, zero
-//!   render-resource parameters in the draw system)
-//! - Uses `TerminalEvent` system for unified input handling
-//! - Shows coordinate mapping from pixels to terminal cells
-//! - Illustrates proper system ordering with `TerminalSystemSet`
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -94,7 +54,6 @@ struct WidgetCatalogState {
     counter: usize,
     mouse_position: Option<(u16, u16)>,
 
-    // Store layout rectangles for accurate hit testing
     button_rects: Vec<ratatui::layout::Rect>,
     h_button_rects: Vec<ratatui::layout::Rect>,
     list_inner_rect: Option<ratatui::layout::Rect>,
@@ -110,13 +69,12 @@ fn setup_terminal(mut commands: Commands) {
     ));
     let font = TerminalFont::new(font_data).expect("Failed to load font");
     let mut fonts = Fonts::new(font.clone(), 16);
-    fonts.add_regular_fonts([font]);  // Add to regular collection for fake bold support
+    fonts.add_regular_fonts([font]);
     let fonts = Arc::new(fonts);
 
     const COLS: u16 = 100;
     const ROWS: u16 = 30;
 
-    // Spawn camera
     commands.spawn(Camera2d);
 
     let terminal_entity = commands
@@ -127,12 +85,10 @@ fn setup_terminal(mut commands: Commands) {
         ))
         .id();
 
-    // Set focus on this terminal
     commands.insert_resource(TerminalFocus {
         focused: Some(terminal_entity),
     });
 
-    // Create state with initial values
     commands.insert_resource(WidgetCatalogState {
         selected_tab: 0,
         list_state: ListState::default().with_selected(Some(0)),
@@ -156,7 +112,6 @@ fn handle_terminal_events(
     mut state: ResMut<WidgetCatalogState>,
     query: Query<Entity, With<CatalogTerminal>>,
 ) {
-    // Get the terminal entity - only process events for this terminal
     let terminal_entity = match query.single() {
         Ok(entity) => entity,
         Err(_) => return,
@@ -177,7 +132,6 @@ fn handle_terminal_events(
                     col, row, event.target
                 );
 
-                // Tab detection (still needs manual calculation as tabs are not stored)
                 let area = ratatui::layout::Rect {
                     x: 0,
                     y: 0,
@@ -195,24 +149,19 @@ fn handle_terminal_events(
                     .split(area);
 
                 if row >= chunks[1].y && row < chunks[1].y + chunks[1].height {
-                    // Calculate tab positions using unicode_width for correct display width
-                    // User measured: "Buttons" [2-8], "Lists" [12-16], "Charts" [20-25], "Interactive" [29-39]
-                    // Pattern: start at col 2, each tab is label width, then " . " (3 chars) separator
-
                     let tab_labels = ["Buttons", "Lists", "Charts", "Interactive", "Glyphs"];
-                    let mut col_pos = 2; // Start after border
+                    let mut col_pos = 2;
 
                     for (i, label) in tab_labels.iter().enumerate() {
-                        let label_width = label.width(); // Use unicode_width for correct display width
+                        let label_width = label.width();
                         let start = col_pos;
-                        let end = col_pos + label_width - 1; // Inclusive end
+                        let end = col_pos + label_width - 1;
 
                         if col >= start as u16 && col <= end as u16 {
                             state.selected_tab = i;
                             break;
                         }
 
-                        // Move to next tab: label + " . " (space + divider + space)
                         col_pos = col_pos + label_width + 3;
                     }
                 }
@@ -224,7 +173,6 @@ fn handle_terminal_events(
                         state.h_button_rects.len()
                     );
 
-                    // Vertical buttons - use stored rectangles
                     for (i, rect) in state.button_rects.iter().enumerate() {
                         info!(
                             "  V-Button[{}]: rect=(x:{}, y:{}, w:{}, h:{}) contains({},{})={}",
@@ -249,7 +197,6 @@ fn handle_terminal_events(
                         }
                     }
 
-                    // Horizontal buttons - use stored rectangles
                     for (i, rect) in state.h_button_rects.iter().enumerate() {
                         if rect.contains(pos) {
                             state.selected_button = Some(i + 3);
@@ -259,23 +206,20 @@ fn handle_terminal_events(
                     }
                 }
 
-                if state.selected_tab == 1 {
-                    // List - use stored rectangle
-                    if let Some(inner) = state.list_inner_rect
-                        && inner.contains(pos) {
-                            let index = (row - inner.y) as usize;
-                            state.list_state.select(Some(index.min(9)));
-                        }
+                if state.selected_tab == 1
+                    && let Some(inner) = state.list_inner_rect
+                    && inner.contains(pos)
+                {
+                    let index = (row - inner.y) as usize;
+                    state.list_state.select(Some(index.min(9)));
                 }
 
-                if state.selected_tab == 3 {
-                    // Gauge - use stored rectangle
-                    if let Some(inner) = state.gauge_inner_rect
-                        && inner.contains(pos) {
-                            let percentage =
-                                ((col - inner.x) as f32 / inner.width as f32 * 100.0) as u16;
-                            state.gauge_value = percentage.min(100);
-                        }
+                if state.selected_tab == 3
+                    && let Some(inner) = state.gauge_inner_rect
+                    && inner.contains(pos)
+                {
+                    let percentage = ((col - inner.x) as f32 / inner.width as f32 * 100.0) as u16;
+                    state.gauge_value = percentage.min(100);
                 }
             }
             InputEvent::Key(k) if k.kind != KeyEventKind::Release => {
@@ -318,7 +262,6 @@ fn render_terminal(
     let Ok(mut term) = screens.single_mut() else {
         return;
     };
-    // Update sparkline data with random values
     state.sparkline_timer.tick(time.delta());
     if state.sparkline_timer.just_finished() {
         let new_value = rand::random_range(1..=15);
@@ -328,10 +271,6 @@ fn render_terminal(
         }
     }
 
-    // Split into a plain `&mut` so `sparkline_data`/`list_state` below can
-    // be borrowed disjointly (one immutably, one mutably) instead of cloned -
-    // `ResMut::deref`/`deref_mut` can't be called twice at once, but a single
-    // `&mut WidgetCatalogState` splits into independent field borrows fine.
     let state = &mut *state;
     let selected_tab = state.selected_tab;
     let selected_button = state.selected_button;
@@ -339,7 +278,6 @@ fn render_terminal(
     let counter = state.counter;
     let mouse_position = state.mouse_position;
 
-    // Variables to capture layout rectangles
     let mut button_rects = Vec::new();
     let mut h_button_rects = Vec::new();
     let mut list_inner_rect = None;
@@ -366,7 +304,6 @@ fn render_terminal(
                 ])
                 .split(area);
 
-            // Debug: Column ruler
             let ruler = (0..100)
                 .map(|i| {
                     if i % 10 == 0 {
@@ -432,7 +369,6 @@ fn render_terminal(
             frame.render_widget(status, status_area);
         });
 
-    // Store captured layout rectangles for hit testing
     state.button_rects = button_rects;
     state.h_button_rects = h_button_rects;
     state.list_inner_rect = list_inner_rect;
@@ -480,7 +416,6 @@ fn draw_buttons_tab(
         frame.render_widget(button, chunks[i]);
     }
 
-    // Add horizontal buttons for testing
     let horizontal_area = chunks[3];
     let h_chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -536,7 +471,6 @@ fn draw_buttons_tab(
 
     frame.render_widget(info, chunks[4]);
 
-    // Return the button rectangles for hit testing (`Rect` is `Copy`)
     let button_rects = chunks.iter().take(3).copied().collect();
     let h_button_rects = h_chunks.to_vec();
 
@@ -567,7 +501,6 @@ fn draw_lists_tab(
 
     frame.render_stateful_widget(list, area, list_state);
 
-    // Return inner area for hit testing
     ratatui::layout::Rect {
         x: area.x + 1,
         y: area.y + 1,
@@ -667,7 +600,6 @@ fn draw_interactive_tab(
 
     frame.render_widget(instructions, chunks[2]);
 
-    // Return gauge inner area for hit testing
     ratatui::layout::Rect {
         x: chunks[0].x + 1,
         y: chunks[0].y + 1,
@@ -680,17 +612,16 @@ fn draw_glyphs_tab(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // Styled Text
-            Constraint::Length(3), // Box Drawing
-            Constraint::Length(3), // Block Elements
-            Constraint::Length(5), // Braille
-            Constraint::Length(3), // Powerline
-            Constraint::Min(0),    // Info
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(5),
+            Constraint::Length(3),
+            Constraint::Min(0),
         ])
         .margin(1)
         .split(area);
 
-    // Styled Text (requires bold_italic_fonts feature)
     let styled_lines = vec![Line::from(vec![
         Span::raw("Regular "),
         Span::styled("Bold", Style::default().bold()),
@@ -705,7 +636,6 @@ fn draw_glyphs_tab(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
         .block(Block::bordered().title("Styled Text (enable with --features bold_italic_fonts,emoji)"));
     frame.render_widget(styled_para, chunks[0]);
 
-    // Box Drawing
     let box_lines = vec![Line::from(vec![
         Span::raw("Box: "),
         Span::styled(
@@ -716,7 +646,6 @@ fn draw_glyphs_tab(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
     let box_para = Paragraph::new(box_lines).block(Block::bordered().title("Box Drawing"));
     frame.render_widget(box_para, chunks[1]);
 
-    // Block Elements
     let block_lines = vec![Line::from(vec![
         Span::raw("Block: "),
         Span::styled(
@@ -727,7 +656,6 @@ fn draw_glyphs_tab(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
     let block_para = Paragraph::new(block_lines).block(Block::bordered().title("Block Elements"));
     frame.render_widget(block_para, chunks[2]);
 
-    // Braille
     let braille_lines = vec![
         Line::from(vec![Span::styled(
             "⠀⠁⠂⠃⠄⠅⠆⠇ ⠈⠉⠊⠋⠌⠍⠎⠏ ⠐⠑⠒⠓⠔⠕⠖⠗",
@@ -746,7 +674,6 @@ fn draw_glyphs_tab(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
         Paragraph::new(braille_lines).block(Block::bordered().title("Braille Patterns"));
     frame.render_widget(braille_para, chunks[3]);
 
-    // Powerline
     let powerline_lines = vec![Line::from(vec![
         Span::raw("Powerline: "),
         Span::styled(
@@ -758,7 +685,6 @@ fn draw_glyphs_tab(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
         Paragraph::new(powerline_lines).block(Block::bordered().title("Powerline Symbols"));
     frame.render_widget(powerline_para, chunks[4]);
 
-    // Info
     let info = Paragraph::new(vec![
         Line::from(""),
         Line::from("All glyphs above are programmatically rendered")

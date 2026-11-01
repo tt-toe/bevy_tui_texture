@@ -1,13 +1,4 @@
 //! Lossy conversions between [`InputEvent`] and `crossterm::event::Event`.
-//!
-//! Native-only (`crossterm-compat` feature, off by default) - crossterm
-//! does not build on wasm32-unknown-unknown. Both directions return `None`
-//! for anything unrepresentable in the other vocabulary - not an error,
-//! just "this event has no equivalent there". `Resize` never converts
-//! either way: this crate's `Resize` carries a pixel size (texture
-//! terminals don't auto-resize, so a cell count would be stale - see
-//! `InputEvent::Resize`'s doc comment), while crossterm's carries the new
-//! cell size; the units simply don't correspond.
 
 use super::{
     InputEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
@@ -63,8 +54,6 @@ fn key_to_crossterm(k: &KeyEvent) -> Option<ct::KeyEvent> {
         KeyCode::PageUp => ct::KeyCode::PageUp,
         KeyCode::PageDown => ct::KeyCode::PageDown,
         KeyCode::F(n) => ct::KeyCode::F(n),
-        // Carries a bevy physical key with no crossterm equivalent - see
-        // `KeyCode::Unidentified`'s doc comment.
         KeyCode::Unidentified(_) => return None,
     };
     Some(ct::KeyEvent::new_with_kind(
@@ -93,10 +82,6 @@ fn key_from_crossterm(k: &ct::KeyEvent) -> Option<KeyEvent> {
         ct::KeyCode::PageUp => KeyCode::PageUp,
         ct::KeyCode::PageDown => KeyCode::PageDown,
         ct::KeyCode::F(n) => KeyCode::F(n),
-        // Null/CapsLock/ScrollLock/NumLock/PrintScreen/Pause/Menu/
-        // KeypadBegin/Media/Modifier: no bevy physical key to carry, so
-        // (unlike the reverse direction) there is no `Unidentified`
-        // payload to fill - just unrepresentable.
         _ => return None,
     };
     Some(KeyEvent {

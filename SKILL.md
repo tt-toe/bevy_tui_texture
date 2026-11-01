@@ -130,8 +130,41 @@ Fonts:
 - CJK/fallback: `fonts.add_regular_fonts([...])` etc.; the
   `bold_italic_fonts` feature enables real bold/italic font slots
   (`add_bold_fonts`/`add_italic_fonts`/`add_bold_italic_fonts`), otherwise
-  bold/italic are faked from regular. The `emoji` feature enables
-  emoji-aware glyph handling.
+  bold/italic are faked from regular.
+
+Nerd Fonts icons work with no feature flag: register a Nerd Fonts font (a patched
+"Nerd Font Mono" as primary, or the symbols font via `add_regular_fonts`). A
+symbol (Private Use Area, or an ambiguous-width char its font draws wider than
+a cell) is fitted by Nerd Fonts' own scaling rules. **Follow an icon with a
+space to get the full-size two-cell icon**: `"\u{f07b} src"`. The space keeps
+its own cell and background; a symbol right after another symbol stays in one
+cell, so runs keep their alignment (the rule Ghostty uses).
+`Fonts::set_fit_symbols(false)` turns this off, before the `Fonts` is shared.
+See `examples/nerd_font_icons.rs`.
+
+Color emoji need the opt-in `emoji` feature and a font you supply (none ships
+with the crate):
+
+```rust
+let mut fonts = Fonts::new(Font::new(text_font_bytes).unwrap(), 16);
+// COLRv0, COLRv1, CBDT or sbix; not OT-SVG. Before the `Fonts` is shared.
+fonts.add_emoji_fonts([Font::from_vec(emoji_font_bytes).unwrap()]);
+let fonts = Arc::new(fonts);
+```
+
+- Draw emoji as ordinary text: ZWJ sequences, flags, keycaps and skin tones
+  take the two cells ratatui reserves. `U+FE0E` selects the text form.
+- `TuiFontSource::Asset` builds a single-font `Fonts`, so it cannot carry an
+  emoji font. Pass a built `Arc<Fonts>` instead, on Wasm from `include_bytes!`
+  or bytes you fetched.
+- Without the feature, register a *monochrome* emoji font with `add_fonts`: a
+  color font there gives a solid silhouette (COLR) or a blank cell (PNG).
+- Fonts added here never change the cell size. Combining marks on an emoji come
+  from a text font, so that font must have them.
+- A multi-char symbol set directly on a cell is as wide as the whole string,
+  clamped to two cells.
+
+See `examples/emoji.rs` (`--features emoji`).
 
 ## Input, focus, and hit testing
 
@@ -257,12 +290,17 @@ a complete interactive form built on nothing but `TerminalEvent` +
   Entry slots are `2·min_width_px × height_px`, so capacity scales with
   font size. Shared across every terminal using the same `Fonts` — sharing
   a font across terminals rasterizes and uploads each glyph only once.
+- With `emoji`, color glyphs get a second atlas (premultiplied `Rgba8Unorm`,
+  1024 slots from the cell size, up to 2048×2048 ≈ 16 MiB) and a third
+  pipeline, both created when the first color glyph is drawn: nothing is
+  allocated or compiled until then, including on WebGL2.
 - Atlas textures are explicitly zero-initialized at creation — no WebGL
   "lazy initialization" warnings from partial glyph uploads.
 - All terminal textures are `Rgba8Unorm`; the render is one instanced
   draw (one 20-byte instance per glyph, background and glyph resolved in
   the fragment shader) directly into the destination
-  `GpuImage::texture_view`.
+  `GpuImage::texture_view`. Color glyphs and combining marks add one draw
+  each over the same instance buffer, only when present.
 - Text is shaped per cell and cached per symbol, so never-seen text costs
   the same as repeated text. `Fonts::set_shaping(Shaping::Row)` (uncached,
   slower) shapes whole runs instead, for scripts that join across cells.
@@ -288,14 +326,14 @@ a complete interactive form built on nothing but `TerminalEvent` +
   `<MESH>.<MATERIAL>` (e.g. `Object_2.Monitor_Glass`), not after the node;
   exact-match, never prefix-match (`Object_2` also hits `Object_20`).
 - **Feature gates**: `2d`/`3d`/`keyboard_input`/`mouse_input` (all
-  default), plus opt-in `bold_italic_fonts` and `emoji`. `TuiKind::Ui` needs `2d`, `WorldQuad`
+  default), plus opt-in `bold_italic_fonts`, `emoji` and `crossterm-compat`. `TuiKind::Ui` needs `2d`, `WorldQuad`
   needs `3d`, `Headless` is always available.
 
 ## Verification (what CI runs — .github/workflows/ci.yml)
 
 ```bash
 cargo test --all-features                       # inline #[cfg(test)] modules;
-                                                # GPU-free except 1 skip-capable
+                                                # GPU tests skip without an adapter
 cargo clippy --all-features --all-targets -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 cargo check --lib --no-default-features         # + --features 2d / 3d variants
@@ -304,8 +342,7 @@ cargo run --example helloworld                  # ALWAYS cargo run, never the ba
                                                 # binary (assets resolve via CARGO_MANIFEST_DIR)
 ```
 
-WASM build pipeline (browser demo → `examples/web/`): see the header of
-`examples/wasm_demo.rs` (cargo build --profile wasm-release →
+WASM build pipeline (browser demo → `examples/web/`): see `examples/web/README.md` (cargo build --profile wasm-release →
 wasm-bindgen → wasm-opt; bump `ASSET_VERSION` in `examples/web/index.html`
 on every redeploy — the JS glue and wasm are a matched pair and stale
 browser caches mixing versions fail with `LinkError`). Assets (models,
@@ -315,5 +352,5 @@ runtime, so local preview must serve from `examples/` (not
 `examples/web/` itself), see `examples/web/README.md`.
 
 Deeper reference: `examples/` (one per feature — `resize.rs`, `transparent_world_quad.rs`,
-`world_terminal.rs` for async fonts, `retro_crt.rs` for glTF attach + drag
-slider, `wasm_demo.rs` for the browser shim + boot diagnostics).
+`world_terminal.rs` for async fonts, `nerd_font_icons.rs` for icons, `emoji.rs`
+for color emoji, `retro_crt.rs` for glTF attach + drag slider, `wasm_demo.rs` for the browser shim + boot diagnostics).

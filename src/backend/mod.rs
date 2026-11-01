@@ -1,44 +1,4 @@
 //! WGPU-based ratatui backend implementation.
-//!
-//! This module provides a custom ratatui backend that renders terminal UIs to GPU textures
-//! using WGPU. It's designed specifically for Bevy integration with zero-copy rendering
-//! and efficient glyph caching.
-//!
-//! ## Architecture
-//!
-//! The backend consists of several key components:
-//!
-//! - **[`bevy_backend::BevyTerminalBackend`]** - Main backend implementation for ratatui
-//! - **Text Atlas** - GPU texture cache for rendered glyphs (2048x2048px,
-//!   the WebGL2-safe max texture dimension, square to maximize capacity)
-//! - **Render Pipelines** - One instanced cell pipeline, plus an overlay pipeline for combining marks
-//! - **Programmatic Glyphs** - Special handling for box-drawing, braille, and block elements
-//!
-//! ## Rendering Pipeline
-//!
-//! Every glyph is one GPU *instance* (`CellInstance`, 20 bytes): its
-//! destination rectangle, its atlas slot, and its foreground + background
-//! colors. A single instanced draw call shades each cell pixel exactly once
-//! (`mix(bg, fg, coverage)`, `BlendState::REPLACE`), so there is no separate
-//! background pass, no index buffer, and no per-fragment color unpacking.
-//! Extra glyphs landing in an already-covered cell (combining marks) go
-//! through a second, alpha-blended draw over the same instance buffer.
-//!
-//! ## Glyph Caching
-//!
-//! Glyphs are rasterized on-demand and cached in a GPU texture atlas:
-//!
-//! - First use of a glyph triggers rasterization using `rustybuzz` and `raqote`
-//! - Cached glyphs are reused across frames with minimal overhead
-//! - Atlas eviction policy ensures efficient memory usage
-//! - Special programmatic glyphs (box-drawing, braille) are pre-populated
-//!
-//! ## Performance Optimizations
-//!
-//! - **Dirty Tracking** - Only re-render changed terminal cells
-//! - **Batch Rendering** - Minimize draw calls by batching similar operations
-//! - **Smart Cache Updates** - Defer GPU uploads until render time
-//! - **Unicode Shaping** - Full Unicode support with complex text layout
 
 pub mod bevy_backend;
 pub(crate) mod glyph_constraint;
@@ -46,24 +6,9 @@ pub(crate) mod programmatic_glyphs;
 pub(crate) mod rasterize;
 
 /// Width of the glyph cache texture in pixels.
-///
-/// Square, and pinned to exactly `wgpu::Limits::downlevel_webgl2_defaults()`'s
-/// `max_texture_dimension_2d` (2048) - the guaranteed-safe ceiling for
-/// `wgpu::Device::create_texture` on WebGL2/GLES3/D3D11-class hardware. This
-/// is the same conservative limit set `retro_crt.rs` opts into via
-/// `WgpuSettingsPriority::WebGL2` for its wasm32 build. Unlike the
-/// per-terminal destination `Image` (`cols * char_width_px` x
-/// `rows * char_height_px` - its aspect ratio is dictated by the caller's
-/// grid and must not be distorted), the atlas has no meaningful "correct"
-/// aspect ratio: it is just a bin-packed cache, so making it square
-/// maximizes glyph capacity for a given max-dimension budget instead of
-/// leaving area on the table the way a non-square-but-under-the-cap size
-/// would. Same value on every platform: staying under the WebGL2 ceiling by
-/// construction means the atlas never has a wasm-only failure mode to begin
-/// with.
 pub(crate) const CACHE_WIDTH: u32 = 2048;
 
-/// Height of the glyph cache texture in pixels. See [`CACHE_WIDTH`].
+/// Height of the glyph cache texture in pixels.
 pub(crate) const CACHE_HEIGHT: u32 = 2048;
 
 use std::num::NonZeroU32;
@@ -101,12 +46,6 @@ pub enum Viewport {
 }
 
 /// One glyph (or one synthesized row-clear rectangle), as a GPU instance.
-///
-/// The vertex shader expands it into a 4-vertex triangle strip from
-/// `@builtin(vertex_index)` alone, so no vertex positions, UV corners or
-/// indices are ever generated on the CPU - a glyph costs 20 bytes.
-/// Everything is integer pixels: terminal content sits on the cell grid and
-/// atlas slots on whole texels.
 #[repr(C)]
 #[derive(bytemuck::Pod, bytemuck::Zeroable, Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CellInstance {
@@ -115,8 +54,7 @@ pub(crate) struct CellInstance {
     /// Top-left texel of the glyph's atlas slot (the slot is sampled 1:1,
     /// `rect`'s width/height in size).
     pub(crate) uv: [u16; 2],
-    /// Foreground color, RGBA. Alpha 0 turns the glyph off entirely, which
-    /// is how a row-clear rectangle is expressed.
+    /// Foreground color, RGBA.
     pub(crate) fg: [u8; 4],
     /// Background color, RGBA - written as-is wherever the glyph has no
     /// coverage (alpha 0 is how `transparent_reset_bg` shows through).
@@ -150,9 +88,6 @@ fn build_compositor(
         source: ShaderSource::Wgsl(include_str!("shaders/composite.wgsl").into()),
     });
 
-    // Bind group 0 (screen + atlas size) is per-terminal: screen size
-    // differs between terminals sharing this pipeline/atlas, so each
-    // `TerminalGpuState` builds its own bind group against this layout.
     let globals_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
         label: Some("Terminal Globals Layout"),
         entries: &[BindGroupLayoutEntry {
@@ -282,17 +217,7 @@ fn c2c(color: ratatui::style::Color, reset: Rgb) -> Rgb {
 
 /// CPU-computed draw payload extracted from a dirty `Tui` each frame: the
 /// cell instances ratatui's diffed buffer produced this draw, plus which
-/// font's shared atlas/pipelines to render them against. Built by
-/// `BevyTerminalBackend::take_draw_payload` (main world), consumed by
-/// `TerminalGpuState::render` (render world). Fields are crate-private -
-/// callers outside `backend` only move this type around, they never need
-/// to inspect it.
-///
-/// Carries no glyph rasterizations: those queue in the shared per-font CPU
-/// state (`Fonts::with_shared_cpu_state`) and are drained once per font per
-/// frame via `BevyTerminalBackend::take_shared_glyph_uploads` - not once
-/// per terminal, since several terminals can share one font and thus one
-/// atlas.
+/// font's shared atlas/pipelines to render them against.
 pub(crate) struct TerminalDrawPayload {
     /// Pixel dimensions of the *drawable* area (viewport insets already
     /// applied), not necessarily the full `cols * char_width_px` grid size.
@@ -308,26 +233,30 @@ pub(crate) struct TerminalDrawPayload {
     /// Partial redraw: `true` means this payload covers only the rows
     /// `take_draw_payload` found dirty (each preceded by a row-clear
     /// instance) and the render pass must `LoadOp::Load` to preserve every
-    /// other row. `false` means it covers every row and the pass uses
-    /// `LoadOp::Clear` - required whenever the destination texture's
-    /// content can't be trusted (`BevyTerminalBackend::full_redraw_needed`).
+    /// other row.
     load_previous: bool,
     /// `instances[..cell_count]` are drawn by the cell pipeline (REPLACE),
-    /// the rest by the overlay pipeline (alpha-blended on top). One `Vec`
-    /// so the render world uploads it with a single `write_buffer`.
+    /// the rest by the overlay pipeline (alpha-blended on top) - bar the
+    /// color range, see `color_count`.
     instances: Vec<CellInstance>,
     cell_count: u32,
+    /// `instances[cell_count..cell_count + color_count]` are drawn by the
+    /// color pipeline (emoji) in between: `[cells][colors][overlays]`.
+    #[cfg(feature = "emoji")]
+    color_count: u32,
 }
 
 impl TerminalDrawPayload {
     /// Drop the geometry (computed at the OLD grid size) - used by
     /// `Tui::apply_pending_resize`, where rendering it against the freshly
-    /// resized destination texture would show garbled content. Also forces
-    /// a full clear: the destination is about to be recreated, so there is
-    /// nothing valid for a `LoadOp::Load` to preserve.
+    /// resized destination texture would show garbled content.
     pub(crate) fn discard_stale_geometry(&mut self) {
         self.instances.clear();
         self.cell_count = 0;
+        #[cfg(feature = "emoji")]
+        {
+            self.color_count = 0;
+        }
         self.load_previous = false;
     }
 
@@ -350,10 +279,21 @@ impl TerminalDrawPayload {
         &self.instances[..self.cell_count as usize]
     }
 
+    /// Instances drawn by the color pipeline (emoji).
+    #[cfg(all(test, feature = "emoji"))]
+    pub(crate) fn colors(&self) -> &[CellInstance] {
+        let start = self.cell_count as usize;
+        &self.instances[start..start + self.color_count as usize]
+    }
+
     /// Instances drawn by the overlay pipeline (extra glyphs per cell).
     #[cfg(test)]
     pub(crate) fn overlays(&self) -> &[CellInstance] {
-        &self.instances[self.cell_count as usize..]
+        #[cfg(feature = "emoji")]
+        let start = (self.cell_count + self.color_count) as usize;
+        #[cfg(not(feature = "emoji"))]
+        let start = self.cell_count as usize;
+        &self.instances[start..]
     }
 }
 
@@ -385,20 +325,30 @@ const INITIAL_INSTANCE_CAPACITY: u64 = 256;
 
 /// Render-world GPU resources shared by every terminal using the same
 /// `Fonts`: the glyph atlas texture and the compositor pipelines (which
-/// bind that atlas, so they live and die with it). Keyed by font identity
-/// ([`crate::fonts::Fonts::identity`]) in the render-world store
-/// (`bevy_plugin.rs`), not by destination image. `target_format` mirrors
-/// whatever format terminal destination `GpuImage`s are created with
-/// (always `Rgba8Unorm` today - see `TerminalTexture::create`).
+/// bind that atlas, so they live and die with it).
 pub(crate) struct SharedFontGpuState {
     text_cache: Texture,
     compositor: CompositorPipelines,
+    /// Color glyph atlas and pipeline - created when the first color glyph
+    /// upload arrives, so nothing is built (or compiled, on WebGL2) until an
+    /// emoji is drawn.
+    #[cfg(feature = "emoji")]
+    color: Option<ColorGpu>,
+    #[cfg(feature = "emoji")]
+    target_format: TextureFormat,
+}
+
+/// The color glyph atlas (premultiplied `Rgba8Unorm`, read by texel
+/// coordinate - no sampler) and the third pipeline, which draws from it.
+#[cfg(feature = "emoji")]
+struct ColorGpu {
+    texture: Texture,
+    pipeline: RenderPipeline,
+    bind_group: BindGroup,
 }
 
 impl SharedFontGpuState {
     pub(crate) fn new(device: &Device, queue: &Queue, target_format: TextureFormat) -> Self {
-        // Glyphs are coverage masks tinted by the cell's foreground color,
-        // so one 8-bit channel is all the atlas ever needs.
         let text_cache = device.create_texture(&TextureDescriptor {
             label: Some("Text Cache"),
             size: Extent3d {
@@ -442,6 +392,115 @@ impl SharedFontGpuState {
         Self {
             text_cache,
             compositor,
+            #[cfg(feature = "emoji")]
+            color: None,
+            #[cfg(feature = "emoji")]
+            target_format,
+        }
+    }
+
+    #[cfg(feature = "emoji")]
+    fn build_color(&self, device: &Device, queue: &Queue, (width, height): (u32, u32)) -> ColorGpu {
+        let texture = device.create_texture(&TextureDescriptor {
+            label: Some("Color Glyph Cache"),
+            size: Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba8Unorm,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            texture.as_image_copy(),
+            &vec![0u8; (width * height * 4) as usize],
+            TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        let view = texture.create_view(&TextureViewDescriptor::default());
+
+        let atlas_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("Color Atlas Layout"),
+            entries: &[BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: false },
+                    view_dimension: TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            }],
+        });
+        let bind_group = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Color Atlas Bindings"),
+            layout: &atlas_layout,
+            entries: &[BindGroupEntry {
+                binding: 0,
+                resource: BindingResource::TextureView(&view),
+            }],
+        });
+
+        let shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("Terminal Color Shader"),
+            source: ShaderSource::Wgsl(include_str!("shaders/composite_color.wgsl").into()),
+        });
+        let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Terminal Color Layout"),
+            bind_group_layouts: &[
+                Some(&self.compositor.cells.get_bind_group_layout(0)),
+                Some(&atlas_layout),
+            ],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("Terminal Color Pipeline"),
+            layout: Some(&layout),
+            vertex: VertexState {
+                module: &shader,
+                entry_point: Some("vs_color"),
+                buffers: &[Some(VertexBufferLayout {
+                    array_stride: std::mem::size_of::<CellInstance>() as BufferAddress,
+                    step_mode: VertexStepMode::Instance,
+                    attributes: &CELL_INSTANCE_ATTRIBUTES,
+                })],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(FragmentState {
+                module: &shader,
+                entry_point: Some("fs_color"),
+                targets: &[Some(ColorTargetState {
+                    format: self.target_format,
+                    blend: Some(BlendState::REPLACE),
+                    write_mask: ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleStrip,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        ColorGpu {
+            texture,
+            pipeline,
+            bind_group,
         }
     }
 
@@ -479,13 +538,53 @@ impl SharedFontGpuState {
             );
         }
     }
+
+    /// [`Self::upload_glyphs`] for the color atlas (`size` is its texture
+    /// size, from the CPU side), creating the texture and pipeline on the
+    /// first call.
+    #[cfg(feature = "emoji")]
+    pub(crate) fn upload_color_glyphs(
+        &mut self,
+        device: &Device,
+        queue: &Queue,
+        size: (u32, u32),
+        uploads: &[(crate::utils::text_atlas::CacheRect, Vec<u8>)],
+    ) {
+        if self.color.is_none() {
+            self.color = Some(self.build_color(device, queue, size));
+        }
+        let Some(color) = &self.color else { return };
+        for (cached, image) in uploads {
+            queue.write_texture(
+                TexelCopyTextureInfo {
+                    texture: &color.texture,
+                    mip_level: 0,
+                    origin: Origin3d {
+                        x: cached.x,
+                        y: cached.y,
+                        z: 0,
+                    },
+                    aspect: TextureAspect::All,
+                },
+                image,
+                TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(cached.width * 4),
+                    rows_per_image: Some(cached.height),
+                },
+                Extent3d {
+                    width: cached.width,
+                    height: cached.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+    }
 }
 
 /// Render-world GPU resources for one terminal: the globals uniform and the
 /// instance buffer - everything genuinely per-terminal rather than shared
-/// by font (see [`SharedFontGpuState`]). Lazily created on a terminal's
-/// first render (see `bevy_plugin.rs`'s render-world store), keyed by
-/// destination image.
+/// by font (see [`SharedFontGpuState`]).
 pub(crate) struct TerminalGpuState {
     globals_buffer: Buffer,
     globals_bind_group: BindGroup,
@@ -535,13 +634,7 @@ impl TerminalGpuState {
     }
 
     /// Records this terminal's draw into `target`, against `shared`'s
-    /// atlas/pipelines. Glyph uploads are NOT handled here -
-    /// `SharedFontGpuState::upload_glyphs` must run before rendering any
-    /// terminal sharing that font (see `render_tui_textures`).
-    ///
-    /// `draw.load_previous` selects `LoadOp::Load` (a partial payload: its
-    /// dirty rows carry their own row-clear instance, every other pixel is
-    /// preserved) or `LoadOp::Clear` (a full payload).
+    /// atlas/pipelines.
     pub(crate) fn render(
         &mut self,
         device: &Device,
@@ -551,8 +644,6 @@ impl TerminalGpuState {
         target: &TextureView,
         draw: &TerminalDrawPayload,
     ) {
-        // Only meaningful when `load_previous` is false (a `LoadOp::Load`
-        // pass ignores the clear color).
         let [r, g, b, a] = draw.clear_color;
         let load = if draw.load_previous {
             LoadOp::Load
@@ -578,8 +669,6 @@ impl TerminalGpuState {
                 self.globals = globals;
             }
 
-            // A buffer larger than this frame's data is fine as-is: the
-            // draws below only read instances `0..total`.
             if total > self.instance_capacity {
                 self.instance_capacity = total.next_power_of_two();
                 self.instance_buffer = Self::create_instance_buffer(device, self.instance_capacity);
@@ -604,8 +693,6 @@ impl TerminalGpuState {
             })],
             ..Default::default()
         });
-        // No instances: a `LoadOp::Clear` pass just clears, a `LoadOp::Load`
-        // pass is a no-op - either way there is nothing to draw.
         if total == 0 {
             return;
         }
@@ -619,11 +706,26 @@ impl TerminalGpuState {
             pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
             pass.draw(0..4, 0..cells);
         }
-        let overlays = total as u32 - cells;
+        #[cfg(feature = "emoji")]
+        let colors = draw.color_count;
+        #[cfg(not(feature = "emoji"))]
+        let colors = 0u32;
+        #[cfg(feature = "emoji")]
+        if colors > 0
+            && let Some(color) = &shared.color
+        {
+            let offset = cells as u64 * std::mem::size_of::<CellInstance>() as u64;
+            pass.set_pipeline(&color.pipeline);
+            pass.set_bind_group(1, &color.bind_group, &[]);
+            pass.set_vertex_buffer(0, self.instance_buffer.slice(offset..));
+            pass.draw(0..4, 0..colors);
+            pass.set_bind_group(1, &shared.compositor.atlas_bindings, &[]);
+        }
+        let overlays = total as u32 - cells - colors;
         if overlays > 0 {
             // Bound from the overlays' own offset rather than drawn with a
             // non-zero first instance, which WebGL2 has no native notion of.
-            let offset = cells as u64 * std::mem::size_of::<CellInstance>() as u64;
+            let offset = (cells + colors) as u64 * std::mem::size_of::<CellInstance>() as u64;
             pass.set_pipeline(&shared.compositor.overlays);
             pass.set_vertex_buffer(0, self.instance_buffer.slice(offset..));
             pass.draw(0..4, 0..overlays);

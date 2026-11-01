@@ -1,49 +1,4 @@
-//! # Multiple Terminals - Advanced Layout Example
-//!
 //! **Demonstrates managing multiple independent terminals** with different roles and interactions.
-//!
-//! ## What This Example Shows
-//!
-//! - **Multiple Terminal Setup** - Creating and managing 5 separate terminals
-//! - **Tiled Layout** - Positioning terminals in a grid with gaps
-//! - **Z-Ordering** - Overlapping terminals with proper layering
-//! - **Isolated State** - Each terminal maintains independent state
-//! - **Event Routing** - Entity-targeted events to specific terminals
-//! - **Mixed Interaction Modes** - Interactive vs display-only terminals
-//!
-//! ## Running
-//!
-//! ```bash
-//! cargo run --example multiple_terminals
-//! ```
-//!
-//! ## Terminal Layout
-//!
-//! ```
-//! ┌─────────────┬─────────────┐
-//! │ Interactive │     Log     │
-//! │   Terminal  │   Terminal  │
-//! ├─────────────┼─────────────┤
-//! │   Status    │  Overlap 1  │
-//! │   Terminal  │  Overlap 2  │ (Layered)
-//! └─────────────┴─────────────┘
-//! ```
-//!
-//! ## Controls
-//!
-//! - **Click Terminals** - Focus and interact with different terminals
-//! - **Click List Items** - Select items in interactive terminal
-//! - **Click Log** - Add log entries
-//! - **Click Status** - Increment counter
-//! - **ESC** - Quit application
-//!
-//! ## Architecture Highlights
-//!
-//! - Uses `TuiRequest::ui` for each terminal - each terminal is a
-//!   `Tui` Component on its own entity, no wrapping Resource
-//! - Demonstrates entity-based terminal identification via marker components
-//! - Shows how to route `TerminalEvent` to specific terminals
-//! - Each terminal's draw system takes zero render-resource parameters
 
 use bevy::prelude::*;
 use bevy::window::WindowResolution;
@@ -86,7 +41,6 @@ fn main() {
         .run();
 }
 
-// App state for interactive terminal
 #[derive(Resource, Default)]
 struct AppState {
     counter: usize,
@@ -94,7 +48,6 @@ struct AppState {
     selected_item: usize,
 }
 
-// Marker components for each terminal type
 #[derive(Component)]
 struct InteractiveTerminal;
 
@@ -113,7 +66,6 @@ struct OverlapFrontTerminal;
 fn setup_terminals(mut commands: Commands) {
     info!("Setting up multiple terminals with the declarative TuiRequest API...");
 
-    // Load font (shared across all terminals)
     let font_data = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/examples/assets/fonts/fusion-pixel-10px-monospaced-ja.ttf"
@@ -121,14 +73,11 @@ fn setup_terminals(mut commands: Commands) {
     let font = TerminalFont::new(font_data).expect("Failed to load font");
     let fonts = Arc::new(Fonts::new(font, 16));
 
-    // Get font metrics for positioning
     let char_width_px = fonts.min_width_px();
     let char_height_px = fonts.height_px();
 
-    // Define gap size between terminals
     const GAP: f32 = 20.0;
 
-    // Define col/row num between terminals
     const INTERACTIVE_COL: u16 = 40;
     const INTERACTIVE_ROW: u16 = 27;
     const LOG_COL: u16 = 50;
@@ -136,7 +85,6 @@ fn setup_terminals(mut commands: Commands) {
     const STATUS_COL: u16 = 80;
     const STATUS_ROW: u16 = 7;
 
-    // Calculate positions for tile layout
     let interactive_width = INTERACTIVE_COL * char_width_px as u16;
     let interactive_height = INTERACTIVE_ROW * char_height_px as u16;
     let log_height = LOG_ROW * char_height_px as u16;
@@ -147,11 +95,8 @@ fn setup_terminals(mut commands: Commands) {
     let overlap_back_pos = (log_pos.0, log_pos.1 + log_height as f32 + GAP);
     let overlap_front_pos = (overlap_back_pos.0 + 50.0, overlap_back_pos.1 + 50.0);
 
-    // Create camera FIRST
     commands.spawn(Camera2d);
 
-    // A `TerminalConfig` for the display-only terminals below (mouse only,
-    // no keyboard, no programmatic glyphs).
     let display_config = || TerminalConfig {
         programmatic_glyphs: false,
         keyboard: false,
@@ -159,7 +104,6 @@ fn setup_terminals(mut commands: Commands) {
         ..default()
     };
 
-    // Create interactive terminal (top-left) with full input
     commands.spawn((
         TuiRequest::ui(INTERACTIVE_COL, INTERACTIVE_ROW, fonts.clone()),
         Node {
@@ -171,7 +115,6 @@ fn setup_terminals(mut commands: Commands) {
         InteractiveTerminal,
     ));
 
-    // Create log terminal (top-right) with mouse input only
     commands.spawn((
         TuiRequest::ui(LOG_COL, LOG_ROW, fonts.clone()).with_config(display_config()),
         Node {
@@ -183,7 +126,6 @@ fn setup_terminals(mut commands: Commands) {
         LogTerminal,
     ));
 
-    // Create status terminal (bottom-left) with mouse input
     commands.spawn((
         TuiRequest::ui(STATUS_COL, STATUS_ROW, fonts.clone()).with_config(display_config()),
         Node {
@@ -195,7 +137,6 @@ fn setup_terminals(mut commands: Commands) {
         StatusTerminal,
     ));
 
-    // Create overlapping back terminal (lower z-index)
     commands.spawn((
         TuiRequest::ui(40, 12, fonts.clone()).with_config(display_config()),
         Node {
@@ -208,7 +149,6 @@ fn setup_terminals(mut commands: Commands) {
         OverlapBackTerminal,
     ));
 
-    // Create overlapping front terminal (higher z-index)
     commands.spawn((
         TuiRequest::ui(40, 12, fonts.clone()).with_config(display_config()),
         Node {
@@ -221,7 +161,6 @@ fn setup_terminals(mut commands: Commands) {
         OverlapFrontTerminal,
     ));
 
-    // Initialize app state
     let mut app_state = AppState::default();
     app_state
         .log_messages
@@ -250,7 +189,6 @@ fn handle_events(
     let overlap_front_entity = overlap_front_query.single().ok();
 
     for event in events.read() {
-        // Handle interactive terminal events
         if Some(event.target) == interactive_entity {
             match &event.input {
                 InputEvent::Mouse(m) if matches!(m.kind, MouseEventKind::Down(_)) => {
@@ -262,7 +200,6 @@ fn handle_events(
                         col, row
                     ));
 
-                    // Check if clicking on list items (list is at rows 4-14 approximately)
                     if (4..=14).contains(&row) {
                         let item_index = (row - 4) as usize;
                         if item_index < 5 {
@@ -305,7 +242,6 @@ fn handle_events(
             }
         }
 
-        // Handle log terminal events
         if Some(event.target) == log_entity
             && let InputEvent::Mouse(m) = &event.input
             && matches!(m.kind, MouseEventKind::Down(_)) {
@@ -318,7 +254,6 @@ fn handle_events(
                 ));
             }
 
-        // Handle status terminal events (clicking gauge to adjust)
         if Some(event.target) == status_entity
             && let InputEvent::Mouse(m) = &event.input
             && matches!(m.kind, MouseEventKind::Down(_)) {
@@ -329,11 +264,9 @@ fn handle_events(
                     "[Status] Clicked at col={} - Adjusting gauge!",
                     col
                 ));
-                // Simple gauge interaction - click anywhere to increment counter
                 app_state.counter = (app_state.counter + 10).min(100);
             }
 
-        // Handle overlap back terminal events
         if Some(event.target) == overlap_back_entity
             && let InputEvent::Mouse(m) = &event.input
             && matches!(m.kind, MouseEventKind::Down(_)) {
@@ -345,7 +278,6 @@ fn handle_events(
                     .push(format!("[BACK Z=0] col={}, row={}", col, row));
             }
 
-        // Handle overlap front terminal events
         if Some(event.target) == overlap_front_entity
             && let InputEvent::Mouse(m) = &event.input
             && matches!(m.kind, MouseEventKind::Down(_)) {
@@ -357,7 +289,6 @@ fn handle_events(
                     .push(format!("[FRONT Z=10] col={}, row={}", col, row));
             }
 
-        // Keep log size manageable
         if app_state.log_messages.len() > 8 {
             app_state.log_messages.remove(0);
         }
@@ -388,13 +319,11 @@ fn update_interactive(
             ])
             .split(area);
 
-        // Title
         let title = Paragraph::new("Interactive Terminal")
             .style(Style::default().fg(RatatuiColor::Yellow).bold())
             .block(Block::bordered());
         frame.render_widget(title, chunks[0]);
 
-        // Selectable list
         let items: Vec<ListItem> = (0..5)
             .map(|i| ListItem::new(format!("Item {} - Click or use arrows", i)))
             .collect();
@@ -412,7 +341,6 @@ fn update_interactive(
 
         frame.render_stateful_widget(list, chunks[1], &mut list_state);
 
-        // Instructions
         let help = Paragraph::new(vec![Line::from("↑/↓: Move  Enter: Select  C: Counter")])
             .style(Style::default().fg(RatatuiColor::DarkGray))
             .block(Block::bordered());

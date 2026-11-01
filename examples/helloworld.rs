@@ -59,7 +59,6 @@ fn render_terminal(mut screens: Query<&mut Tui, With<HelloTerminal>>) {
     };
     term.draw(|frame| {
         let area = frame.area();
-        // Simple "Hello, World!" paragraph
         let text = Paragraph::new("Hello, World!")
             .style(Style::default().fg(RatatuiColor::Green).bold())
             .alignment(Alignment::Center)

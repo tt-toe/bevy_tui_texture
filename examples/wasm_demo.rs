@@ -1,25 +1,3 @@
-// WASM Browser Demo - a thin wasm-bindgen shim around the retro CRT scene.
-//
-// Reuses examples/retro_crt.rs's code directly (`#[path = "retro_crt.rs"]
-// mod retro_crt;` below) instead of duplicating it - the scene, its wasm32/
-// WebGL2-specific branches (canvas config, OIT skipped, tonemapping without
-// LUTs), and `pub fn main()` all live in that one file. This file only adds
-// what's specific to being loaded as a browser module:
-// - `#[wasm_bindgen(start)]` entry + `console_error_panic_hook`,
-// - a WebGL2 availability probe (see docs/index.html for the matching JS
-//   probe, which runs first and avoids fetching the wasm at all if it fails),
-// - boot-progress reporting to the page's loading overlay (`boot_status`
-//   below) - registered on top of `retro_crt::build_app()` before `run()`.
-//
-// Build the browser-ready site into examples/web/ (see examples/web/README.md
-// for local preview instructions):
-//   cargo build --example wasm_demo --target wasm32-unknown-unknown --profile wasm-release
-//   wasm-bindgen --target web --no-typescript --out-dir examples/web \
-//     target/wasm32-unknown-unknown/wasm-release/examples/wasm_demo.wasm
-//   wasm-opt -Oz --strip-debug --strip-producers --enable-nontrapping-float-to-int \
-//     --enable-bulk-memory --enable-sign-ext --enable-mutable-globals \
-//     --enable-simd --enable-reference-types \
-//     -o examples/web/wasm_demo_bg.wasm examples/web/wasm_demo_bg.wasm
 
 #[path = "retro_crt.rs"]
 mod retro_crt;
@@ -27,7 +5,6 @@ mod retro_crt;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
-// WASM entry point - invoked by the JS glue's `init()` (see docs/index.html).
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen(start)]
 pub fn wasm_main() {
@@ -78,10 +55,6 @@ pub fn wasm_main() {
 
     suppress_canvas_escape_key();
     clamp_canvas_to_safe_texture_size();
-    // The asset root, as a URL path relative to the hosting page - see
-    // `build_app`'s doc comment. examples/web/index.html is served one
-    // directory below examples/assets/ (httpd rooted at `examples/`; see
-    // examples/web/README.md), hence "../assets".
     let mut app = retro_crt::build_app("../assets");
     clamp_initial_window_resolution(&mut app);
     boot_status::register(&mut app);
@@ -89,19 +62,13 @@ pub fn wasm_main() {
 }
 
 /// Current wasm linear-memory size in MB (`memory_size` counts 64KiB
-/// pages). This is the number iOS Safari's per-tab memory cap judges:
-/// wasm memory only ever grows, so a climbing figure in the loading
-/// heartbeat that ends in an "unreachable" RuntimeError is the signature
-/// of an out-of-memory abort.
+/// pages).
 #[cfg(target_arch = "wasm32")]
 fn wasm_heap_mb() -> usize {
     core::arch::wasm32::memory_size(0) * 64 / 1024
 }
 
-/// Forwards a milestone to `window.__demoStatus`. If the hook is absent
-/// (a host serving the module without the overlay), silently no-ops.
-/// File-scope (not inside `boot_status`) because the panic hook in
-/// `wasm_main` forwards panic messages through it too.
+/// Forwards a milestone to `window.__demoStatus`.
 #[cfg(target_arch = "wasm32")]
 fn demo_status(msg: &str) {
     use wasm_bindgen::{JsCast, JsValue};
@@ -118,16 +85,6 @@ fn demo_status(msg: &str) {
 }
 
 /// Boot-progress reporting to the page's loading overlay.
-/// examples/web/index.html keeps the overlay up long past wasm-bindgen's
-/// `init()` - the winit control-flow exception only means the event loop is
-/// REGISTERED; renderer init, the synchronous WebGL2 shader compiles, and
-/// all asset loads come after, on a still-black canvas - and waits for the
-/// milestone strings sent from here via `window.__demoStatus(msg)`. The
-/// special string `"ready"` makes it remove the overlay.
-///
-/// Lives here rather than in retro_crt.rs because it is pure browser
-/// plumbing: the scene only exposes `build_app()` (so `register` can add
-/// these systems before `run()`) and the `CrtMaterial` type.
 #[cfg(target_arch = "wasm32")]
 mod boot_status {
     use bevy::prelude::*;
@@ -144,10 +101,7 @@ mod boot_status {
     /// Once-per-second progress tick for a stage that is WAITING on
     /// something: `Some("<label> … 12s / heap 340 MB")` when the whole-second
     /// count advances (and at least a few seconds have passed - a fast boot
-    /// never sees it), `None` otherwise. A climbing counter proves the main
-    /// loop is alive (just slow); a frozen one means the tab stalled. The
-    /// heap figure is for diagnosing out-of-memory aborts - see
-    /// [`wasm_heap_mb`](super::wasm_heap_mb).
+    /// never sees it), `None` otherwise.
     fn heartbeat(label: &str, elapsed_secs: &mut f32, time: &Time) -> Option<String> {
         let before = *elapsed_secs as u32;
         *elapsed_secs += time.delta_secs();
@@ -157,29 +111,7 @@ mod boot_status {
         })
     }
 
-    /// Drives the loading overlay's staged status text. Timing note: on wasm
-    /// the main schedule and the render (where WebGL2 compiles shaders
-    /// synchronously, freezing the tab) run inside the same rAF callback, so
-    /// a message sent from an `Update` only paints AFTER that frame's
-    /// compile stall - each stage's text describes what comes NEXT, and the
-    /// text visible DURING a stall is whatever was set the frame before.
-    ///
-    /// - Stage 0: first `Update` ever - the base-pipeline compile stall is
-    ///   this same frame's render; announce the asset loading that follows.
-    /// - Stage 1: the glTF scene got spawned (`WorldAssetRoot` appeared).
-    /// - Stage 2: the CRT material landed on the monitor mesh. Landing does
-    ///   NOT mean the mesh renders yet: bevy skips a mesh whose specialized
-    ///   pipeline isn't compiled, and `CrtMaterial`'s pipeline can't even
-    ///   start compiling until `crt_extended.wesl` finishes loading over
-    ///   HTTP.
-    /// - Stage 3: hold for a fixed `GRACE_PERIOD_SECONDS` after the material
-    ///   landed, then send "ready" - index.html removes the overlay.
-    ///
-    ///   A fixed delay rather than waiting for the render world's
-    ///   `PipelineCache` to report nothing pending: that count covers
-    ///   every pipeline, not just the CRT screen's, and in this scene
-    ///   (auto-orbit camera, moving shadows) something else is
-    ///   re-specialized every frame, so it never reliably reaches zero.
+    /// Drives the loading overlay's staged status text.
     fn report_boot_status(
         scene_spawned: Query<(), Added<WorldAssetRoot>>,
         crt_material_added: Query<(), Added<MeshMaterial3d<CrtMaterial>>>,
@@ -210,10 +142,6 @@ mod boot_status {
                     && let bevy::asset::LoadState::Failed(err) =
                         asset_server.load_state(&gltf.0)
                 {
-                    // A failed .glb fetch/parse otherwise stalls the overlay
-                    // on "loading 3D model" forever with the reason visible
-                    // only in the console - unreachable on mobile Safari
-                    // without a tethered desktop inspector.
                     demo_status(&format!("failed to load 3D model: {err}"));
                     *stage = u8::MAX;
                 } else if let Some(msg) =
@@ -357,9 +285,6 @@ fn clamp_initial_window_resolution(app: &mut bevy::app::App) {
     let Ok(mut bevy_window) = primary.single_mut(world) else {
         return;
     };
-    // The resolution's scale factor is still 1.0 here (winit hasn't created
-    // the window yet), so "physical" == the logical CSS size bevy_winit
-    // will request from winit.
     let width = bevy_window.resolution.physical_width().min(max_logical_px);
     let height = bevy_window.resolution.physical_height().min(max_logical_px);
     bevy_window.resolution.set_physical_resolution(width, height);

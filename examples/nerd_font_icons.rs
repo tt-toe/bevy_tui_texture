@@ -1,23 +1,4 @@
-//! Nerd Font icons fitted to the cell grid.
-//!
-//! Two terminals show the same screen - a file tree, a status line and a
-//! few edge cases - with symbol fitting on (left, the default) and off
-//! (right, `Fonts::set_fit_symbols(false)`). On the left an icon followed
-//! by a space spreads over both cells at its designed aspect ratio; on the
-//! right it is squeezed into one cell.
-//!
-//! No Nerd Font ships with this crate, so the icons come from a font loaded
-//! at startup:
-//! - `NERD_FONT=/path/to/SymbolsNerdFontMono-Regular.ttf` (any Nerd Font
-//!   `.ttf`), or else
-//! - an installed "Symbols Nerd Font Mono" / "Symbols Nerd Font".
-//!
-//! Prefer the Mono symbols font as a fallback: the non-Mono one has no `m`,
-//! and its narrower `.notdef` advance shrinks every cell.
-//! fusion-pixel (shipped) is the last fallback, for the full-width arrows
-//! and stars on the last lines, which are fitted the same way.
-//!
-//! Run with: `NERD_FONT=... cargo run --example nerd_font_icons`
+//! Nerd Fonts icons fitted to the cell grid.
 
 use bevy::prelude::*;
 use bevy_tui_texture::Font as TerminalFont;
@@ -46,7 +27,7 @@ fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
-                title: "Nerd Font icons - fitted (left) vs. squeezed (right)".to_string(),
+                title: "Nerd Fonts icons - fitted (left) vs. squeezed (right)".to_string(),
                 resolution: (1100, 560).into(),
                 ..default()
             }),
@@ -74,7 +55,6 @@ fn load_icon_font() -> Option<(String, Vec<u8>)> {
                 .select_best_match(&[FamilyName::Title(family.into())], &Properties::new())
                 .ok()?;
             let font = handle.load().ok()?;
-            // `select_best_match` falls back to any font; keep only a match.
             (font.family_name() == family)
                 .then(|| Some((family.to_string(), font.copy_font_data()?.to_vec())))
                 .flatten()
@@ -85,14 +65,12 @@ fn setup(mut commands: Commands) {
     let icon_font = load_icon_font();
     if icon_font.is_none() {
         warn!(
-            "No Nerd Font found: set NERD_FONT=/path/to/SymbolsNerdFontMono-Regular.ttf \
+            "No Nerd Fonts font found: set NERD_FONT=/path/to/SymbolsNerdFontMono-Regular.ttf \
              or install Symbols Nerd Font. Icons will show as missing glyphs."
         );
     }
 
     let fonts = |fit_symbols: bool| {
-        // Tried in order: M+ for text, the icon font, fusion-pixel last
-        // (the last-resort slot).
         let mut fonts = Fonts::new(
             TerminalFont::new(include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
@@ -114,7 +92,6 @@ fn setup(mut commands: Commands) {
         Arc::new(fonts)
     };
 
-    // Two `Fonts` (fitting on / off), so two separate glyph atlases.
     let (fitted, squeezed) = (fonts(true), fonts(false));
     commands.insert_resource(IconFontName(icon_font.map(|(name, _)| name)));
     commands.spawn(Camera2d);
@@ -158,7 +135,7 @@ fn render_terminals(mut screens: Query<(&mut Tui, &IconTerminal)>, icon_font: Re
         let title = format!(" set_fit_symbols({fit_symbols}) ");
         let source = match &icon_font.0 {
             Some(name) => name.rsplit('/').next().unwrap_or(name).to_string(),
-            None => "no Nerd Font found - set NERD_FONT".to_string(),
+            None => "no Nerd Fonts font found - set NERD_FONT".to_string(),
         };
         term.draw(|frame| {
             let block = Block::bordered()

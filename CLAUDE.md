@@ -12,6 +12,13 @@ CPU readback anywhere in the hot path.
 match bevy's pin — bump together; both are re-exported so downstream code
 can name matching types).
 
+## Comments
+
+Keep source comments to the necessary minimum: a one-sentence doc comment on
+public items, and a line comment only for what the code cannot say (safety,
+ordering constraints, traps). Never put sample code in a comment; examples
+belong in `examples/` and the README.
+
 ## Build & Verify
 
 ```bash
@@ -35,11 +42,14 @@ cargo run --example resize              # Tui::request_resize following the wind
 cargo run --example transparent_world_quad  # see-through HUD screen
 NERD_FONT=/path/to/SymbolsNerdFontMono-Regular.ttf \
   cargo run --example nerd_font_icons   # icons fitted (left) vs. squeezed (right)
+EMOJI_FONT=/path/to/NotoColorEmoji.ttf \
+  cargo run --example emoji --features emoji   # color emoji
+cargo run --example tui_component       # manual TerminalTexture spawning
 cargo run --example benchmark           # full-frame throughput
 cargo run --example benchmark_partial   # BENCH_MODE=static|partial redraw costs
 
 # Tests: inline #[cfg(test)] modules next to the code (no tests/ dir).
-# Pure CPU except one GPU-backed test that skips without an adapter.
+# Pure CPU except the GPU-backed tests, which skip without an adapter.
 cargo test
 
 # What CI runs (.github/workflows/ci.yml):
@@ -64,7 +74,8 @@ feature (the lib's own bevy is default-features=false and logs nothing).
 - `bold_italic_fonts` (opt-in) — real bold/italic font slots
   (`Fonts::add_bold_fonts`/`add_italic_fonts`/`add_bold_italic_fonts`);
   otherwise bold/italic are faked from the regular font
-- `emoji` (opt-in, WIP) — emoji-aware glyph handling (pulls in `unicode-properties`)
+- `emoji` (opt-in) — color emoji (see "Color glyphs" below; pulls in
+  `unicode-properties`). Without it, register a monochrome emoji font instead
 - `crossterm-compat` (opt-in, native-only) — `InputEvent::to_crossterm`/
   `from_crossterm` (src/input/crossterm_compat.rs), lossy conversions
   to/from `crossterm::event::Event` for interop with ratatui-ecosystem
@@ -151,7 +162,7 @@ by a second, alpha-blended pipeline over the tail of the same instance
 buffer (`TerminalDrawPayload::cell_count` splits the two ranges). A
 row-clear rectangle is a cell instance with `fg` alpha 0.
 
-A *symbol* (Nerd Font icon / Private Use Area, or an ambiguous-width char
+A *symbol* (Nerd Fonts icon / Private Use Area, or an ambiguous-width char
 its font draws wider than a cell) is drawn by `draw_symbol`
 (src/backend/bevy_backend.rs, deliberately `#[inline(never)]` so the text
 path compiles as before): it may take the blank cell after it
@@ -161,6 +172,17 @@ or - when their backgrounds differ - one per cell, the blank sampling the
 slot's right half; the blank is marked `Cover::SymbolTail` so its own glyph
 is skipped. Whether a cell is a symbol (`CellClass`) is memoized with its
 font choice; `FontRun::symbols` keeps text runs from asking per cell.
+
+### Color glyphs (feature `emoji`)
+
+A cell with emoji presentation (`emoji_presentation`, src/fonts.rs) uses a font
+from `Fonts::add_emoji_fonts`. `draw_color_glyph` (src/backend/bevy_backend.rs,
+`#[inline(never)]` like `draw_symbol`) puts a COLR or PNG/BGRA glyph in a second,
+RGBA atlas (`SharedFontCpuState::color`); any other glyph is drawn as text.
+Instance order is `[cells][colors][overlays]`. The third pipeline
+(`shaders/composite_color.wgsl`) and its atlas are created only when the first
+color glyph is uploaded, so the build without the feature pays nothing.
+Combining marks on an emoji come from a text font, as overlays in the R8 atlas.
 
 ### Render-world GPU state & eviction
 
@@ -227,6 +249,9 @@ busy machine; `/usr/bin/time -l` reports retired instructions, but those
 shift by a few percent with unrelated inlining changes (including in the
 benchmark's own paint closures), so confirm with a time profile
 (`xcrun xctrace record --template 'Time Profiler'`) before chasing them.
+Compare like with like: thin and fat LTO differ by more than most changes
+(`static` is about 68 µs on thin and 115 µs on fat, `full_text` about 280 and
+215).
 
 ### Other modules
 
@@ -295,7 +320,7 @@ User systems MUST be placed in `TerminalSystemSet` (`Input` →
 
 Input events: the payload (`InputEvent`) mirrors `crossterm::event::Event`
 (`Key`/`Mouse`/`Paste`/`FocusGained`/`FocusLost`/`Resize`), not a
-crate-specific enum — see src/input/mod.rs's module doc comment for why.
+crate-specific enum, so ratatui-ecosystem input vocabulary maps onto it directly.
 `KeyCode` is this crate's crossterm-shaped mirror
 (`bevy_tui_texture::input::KeyCode`), not `bevy::prelude::KeyCode` (the
 physical key) — the prelude deliberately omits it to avoid a glob-import
@@ -326,8 +351,7 @@ fn handle_events(mut events: MessageReader<TerminalEvent>) {
 
 `examples/form_demo.rs` builds a complete interactive form on nothing but
 this contract plus `HitRegions` — the reference for how little app code
-that costs (no form/widget framework ships in this crate; see
-`src/input/mod.rs`'s module doc comment for the rationale).
+that costs (no form/widget framework ships in this crate).
 
 Fonts: TrueType only. `Font::new(&'static [u8])` for `include_bytes!`,
 `Font::from_vec(Vec<u8>)` for runtime-loaded data (Arc-backed, never
@@ -410,10 +434,14 @@ Fonts: TrueType only. `Font::new(&'static [u8])` for `include_bytes!`,
 
 - **Glyph atlas**: 2048×2048 `R8Unorm` (`CACHE_WIDTH`/`CACHE_HEIGHT` in
   src/backend/mod.rs) — glyphs are coverage masks tinted by the cell's
-  foreground color, so one channel suffices (color bitmap glyphs render
-  as their alpha silhouette). Square and pinned to the WebGL2-guaranteed
+  foreground color, so one channel suffices (a color font's COLR glyph
+  outside the `emoji` path renders as a solid silhouette, a PNG glyph as a
+  blank cell). Square and pinned to the WebGL2-guaranteed
   `max_texture_dimension_2d`, identical on native and wasm, so it has no
   wasm-only failure mode. Shared per `Fonts::identity()`.
+- **Color atlas** (feature `emoji`): `Rgba8Unorm`, premultiplied, 1024 slots
+  from the cell size, capped at 2048 px per side; created with the first
+  color glyph.
 - **Terminal textures**: `cols·char_w × rows·char_h`, `Rgba8Unorm`.
   Staying under the target GPU's `max_texture_dimension_2d` for huge
   grid/font combinations is the caller's responsibility.

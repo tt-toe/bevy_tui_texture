@@ -61,6 +61,10 @@ cargo run --example widget_catalog_3d
 cargo run --example shader_mesh
 cargo run --example retro_crt
 
+# Fonts you supply (see README.md's "Examples" section)
+NERD_FONT=/path/to/SymbolsNerdFontMono-Regular.ttf cargo run --example nerd_font_icons
+EMOJI_FONT=/path/to/NotoColorEmoji.ttf cargo run --example emoji --features emoji
+
 # Performance testing
 cargo run --release --example benchmark
 cargo run --release --example benchmark_partial
@@ -77,34 +81,12 @@ See README.md's "Examples" section for the full list, one per feature area.
 - Use `cargo clippy` to catch common mistakes
 - Maximum line length: 100 characters (soft limit)
 
-### Documentation
+### Comments
 
-- All public APIs must have documentation comments (`///`)
-- Module-level documentation should explain purpose and architecture
-- Examples should be included for non-trivial functions
+- Keep comments to the necessary minimum: one sentence on public items, and a
+  line comment only for what the code cannot say (safety, ordering, traps)
+- Never put sample code in a comment; examples belong in `examples/` and README.md
 - Update README.md if adding new features
-
-Example (matching the actual style used in `src/setup.rs`):
-
-```rust
-/// Requests a resize to `cols` × `rows`. A no-op if the terminal is
-/// already that size. No GPU work at the call site - the destination
-/// `Image` is recreated in place, and the sibling `TerminalDimensions`
-/// component (and, for a `TuiKind::WorldQuad`, the mesh's aspect ratio)
-/// update automatically on the next `gpu_flush_system` pass.
-///
-/// # Example
-///
-/// ```no_run
-/// # use bevy_tui_texture::prelude::*;
-/// # fn resize(mut tui: bevy::prelude::Mut<Tui>) {
-/// tui.request_resize(80, 25);
-/// # }
-/// ```
-pub fn request_resize(&mut self, cols: u16, rows: u16) {
-    // ...
-}
-```
 
 ## Testing
 
@@ -216,16 +198,21 @@ bevy_tui_texture/
 │   ├── backend/
 │   │   ├── mod.rs          # Backend module entry, GPU pipelines, texture atlas plumbing
 │   │   ├── bevy_backend.rs # BevyTerminalBackend (the ratatui::backend::Backend impl)
-│   │   ├── rasterize.rs    # Glyph rasterization (rustybuzz + raqote)
+│   │   ├── rasterize.rs    # Glyph rasterization (rustybuzz + raqote), color glyphs
+│   │   ├── glyph_constraint/ # Fitting symbols to the grid (nerd_font.rs is generated)
+│   │   ├── shaders/        # composite.wgsl, composite_color.wgsl (feature `emoji`)
+│   │   ├── testdata/       # Noto Color Emoji subsets for the emoji tests
 │   │   └── programmatic_glyphs/ # Box-drawing, braille, block elements, powerline
 │   ├── input/
 │   │   ├── mod.rs          # Input event handling, focus, hit-testing dispatch
-│   │   └── ray.rs          # 3D mouse raycasting (feature `3d`)
+│   │   ├── ray.rs          # 3D mouse raycasting (feature `3d`)
+│   │   └── crossterm_compat.rs # InputEvent <-> crossterm (feature `crossterm-compat`)
 │   └── utils/
 │       ├── mod.rs          # Shared small utilities (outline geometry, ...)
 │       ├── text_atlas.rs   # Glyph atlas slot index (epoch-stamped, clock eviction)
 │       ├── shape_cache.rs  # Per-cell shape cache + font-choice cache
 │       └── plan_cache.rs   # rustybuzz shape-plan cache
+├── tools/                  # nerd_font_constraints.py generates glyph_constraint/nerd_font.rs
 └── examples/               # Example applications, one per feature area (see README.md)
     ├── assets/             # Fonts, glTF model, shaders (shared by native + wasm)
     └── web/                # WASM demo site (index.html, generated wasm/js)
@@ -237,7 +224,7 @@ bevy_tui_texture/
 
 - `tui.draw(...)` is designed to be called every frame regardless of
   whether content changed - a byte-identical redraw is a free no-op
-  (see CLAUDE.md's "Terminal Rendering" section), so don't build
+  (see CLAUDE.md's "Rendering pipeline" section), so don't build
   change-detection around it yourself
 - Share one `Fonts` (`Arc<Fonts>`) across every terminal that uses the
   same font - they then also share one glyph atlas and rasterize each
@@ -247,8 +234,7 @@ bevy_tui_texture/
 
 ### Profiling
 
-Two benchmark examples target different workload shapes - see each
-one's module doc comment for details:
+Two benchmark examples target different workload shapes:
 
 ```bash
 # Full-frame throughput (every cell redrawn every frame)

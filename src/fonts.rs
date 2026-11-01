@@ -1,42 +1,4 @@
 //! Font loading and management with Unicode support.
-//!
-//! This module provides font handling for terminal text rendering, including:
-//!
-//! - **TrueType Font Loading** - Load TTF fonts from embedded or external data
-//! - **Font Fallback** - Automatic fallback for missing glyphs across multiple fonts
-//! - **Style Support** - Regular, bold, italic, and bold-italic font variants
-//! - **Unicode Shaping** - Full Unicode support using `rustybuzz` for complex text layout
-//! - **CJK Support** - Proper rendering of Chinese, Japanese, and Korean characters
-//!
-//! ## Basic Usage
-//!
-//! ```no_run
-//! use bevy_tui_texture::Font;
-//! use bevy_tui_texture::Fonts;
-//! use std::sync::Arc;
-//!
-//! // Load font from embedded bytes
-//! let font_data = include_bytes!("../examples/assets/fonts/Mplus1Code-Regular.ttf");
-//! let font = Font::new(font_data).expect("Failed to load font");
-//!
-//! // Create font collection with 16px height
-//! let fonts = Arc::new(Fonts::new(font, 16));
-//! ```
-//!
-//! ## Font Fallback
-//!
-//! The `Fonts` collection supports multiple fonts with automatic fallback:
-//!
-//! ```no_run
-//! # use bevy_tui_texture::{Font, Fonts};
-//! # let primary_font_data: &[u8] = &[];
-//! # let cjk_font_data: &[u8] = &[];
-//! let primary = Font::new(primary_font_data).unwrap();
-//! let cjk = Font::new(cjk_font_data).unwrap();
-//!
-//! let mut fonts = Fonts::new(primary, 16);
-//! fonts.add_regular_fonts([cjk]);  // Fallback for CJK characters
-//! ```
 
 use std::hash::BuildHasher;
 use std::hash::Hasher;
@@ -52,34 +14,13 @@ use rustybuzz::Face;
 use tracing::warn;
 
 /// A TrueType font that can be used for text rendering.
-///
-/// Fonts are loaded either from static byte slices (typically embedded via
-/// `include_bytes!`, see [`Font::new`]) or from owned bytes read at runtime
-/// (see [`Font::from_vec`]) and are identified by a unique hash for caching
-/// purposes.
-///
-/// # Example
-///
-/// ```no_run
-/// use bevy_tui_texture::Font;
-///
-/// // Embedded font data
-/// let font_data = include_bytes!("../examples/assets/fonts/Mplus1Code-Regular.ttf");
-/// let font = Font::new(font_data).expect("Failed to load font");
-///
-/// // Runtime-loaded font data (no leaking required)
-/// let bytes = std::fs::read("examples/assets/fonts/Mplus1Code-Regular.ttf").unwrap();
-/// let font = Font::from_vec(bytes).expect("Failed to load font");
-/// ```
 #[derive(Clone)]
 pub struct Font {
-    // NOTE: declared before `_data` so the Face drops first.
     font: Face<'static>,
     advance: f32,
     id: u64,
     /// Keeps runtime-loaded font bytes alive for the lifetime of the `Face`
-    /// (`None` for `&'static` data). `Clone` clones the `Arc`, so every copy
-    /// of the `Face` keeps the backing allocation alive.
+    /// (`None` for `&'static` data).
     _data: Option<std::sync::Arc<[u8]>>,
 }
 
@@ -90,10 +31,6 @@ impl Font {
     }
 
     /// Load a font from owned bytes (e.g. `std::fs::read` at runtime).
-    ///
-    /// Unlike [`Font::new`], this does not require `'static` data — the bytes
-    /// are kept alive internally for as long as the font (or any clone of it)
-    /// exists. No leaking required.
     pub fn from_vec(data: Vec<u8>) -> Option<Self> {
         let data: std::sync::Arc<[u8]> = data.into();
         // SAFETY: `slice` points into the Arc's heap allocation, which
@@ -143,17 +80,12 @@ impl Font {
 
 /// Font bytes loadable via the `AssetServer` - `Font::from_vec` +
 /// `std::fs::read` doesn't work on Wasm, so this is the Wasm-safe path.
-/// Carries only the raw TTF bytes; convert to `Arc<Fonts>` synchronously
-/// once loaded via [`Fonts::from_asset`] - there is deliberately no
-/// "waiting for font" spawn state, so a terminal's spawn APIs keep taking
-/// `Arc<Fonts>` directly.
 #[derive(Asset, TypePath)]
 pub struct TerminalFontAsset {
     bytes: Vec<u8>,
 }
 
-/// Loads `.ttf` files as [`TerminalFontAsset`]. Registered automatically by
-/// `TerminalPlugin`.
+/// Loads `.ttf` files as [`TerminalFontAsset`].
 #[derive(Default, TypePath)]
 pub(crate) struct TerminalFontAssetLoader;
 
@@ -180,17 +112,7 @@ impl AssetLoader for TerminalFontAssetLoader {
 
 /// Shared CPU-side glyph cache state: the `Atlas` slot allocator, the
 /// rustybuzz `PlanCache`, and queued-but-not-yet-uploaded glyph
-/// rasterizations. Owned by `Fonts` (behind a lazily-initialized `Mutex`,
-/// see [`Fonts::with_shared_cpu_state`]) rather than by each terminal's
-/// `BevyTerminalBackend`, so every terminal sharing the same `Arc<Fonts>`
-/// rasterizes and uploads each glyph exactly once instead of once per
-/// terminal. Living inside `Fonts` - reachable from
-/// `self.fonts` alone - rather than an external resource is what lets
-/// `BevyTerminalBackend`'s `ratatui::backend::Backend::flush` implementation
-/// reach it: that trait method's signature (`fn flush(&mut self)`) is fixed
-/// by ratatui and cannot take an extra Bevy system parameter, and shaping
-/// happens there - inside user-called `Tui::draw()` - not inside a
-/// library-owned system.
+/// rasterizations.
 pub(crate) struct SharedFontCpuState {
     pub(crate) cached: crate::utils::text_atlas::Atlas,
     pub(crate) plan_cache: crate::utils::plan_cache::PlanCache,
@@ -199,21 +121,56 @@ pub(crate) struct SharedFontCpuState {
     pub(crate) font_choices: crate::utils::shape_cache::FontChoiceCache,
     /// Shaped single cells - see [`crate::utils::shape_cache::CellShapeCache`].
     pub(crate) cell_shapes: crate::utils::shape_cache::CellShapeCache,
+    /// Slot index of the color glyph atlas (premultiplied RGBA, its own GPU
+    /// texture, created on the first color glyph) - see
+    /// [`crate::backend::bevy_backend`]'s `draw_color_glyph`.
+    #[cfg(feature = "emoji")]
+    pub(crate) color: crate::utils::text_atlas::Atlas,
+    /// The color atlas texture's size in pixels.
+    #[cfg(feature = "emoji")]
+    pub(crate) color_size: (u32, u32),
+    /// Queued color glyph rasterizations (premultiplied RGBA8), one-shot
+    /// like `pending_cache_updates`.
+    #[cfg(feature = "emoji")]
+    pub(crate) pending_color_updates: Vec<(crate::utils::text_atlas::CacheRect, Vec<u8>)>,
 }
 
 impl SharedFontCpuState {
+    /// Changes whenever either atlas reassigns a slot - a cached row's
+    /// instances are only valid while this is unchanged.
+    pub(crate) fn atlas_generation(&self) -> u64 {
+        #[cfg(feature = "emoji")]
+        return self.cached.generation() + self.color.generation();
+        #[cfg(not(feature = "emoji"))]
+        self.cached.generation()
+    }
+
     fn new(fonts: &Fonts) -> Self {
         use crate::backend::{CACHE_HEIGHT, CACHE_WIDTH};
+        // Room for 1024 slots (a full 80x25 screen of distinct emoji), capped
+        // at the WebGL2 texture limit. Only the GPU texture is lazy: an empty
+        // `Atlas` holds almost nothing.
+        #[cfg(feature = "emoji")]
+        let (color_size, color) = {
+            let (slot_w, slot_h) = (fonts.min_width_px() * 2, fonts.height_px());
+            let size = ((32 * slot_w).min(2048), (32 * slot_h).min(2048));
+            (
+                size,
+                crate::utils::text_atlas::Atlas::new(fonts, size.0, size.1),
+            )
+        };
         Self {
             cached: crate::utils::text_atlas::Atlas::new(fonts, CACHE_WIDTH, CACHE_HEIGHT),
-            // Keyed by (font, script, direction), and one row can span
-            // several fonts and scripts, since each font run is shaped
-            // separately - room for a few scripts per font keeps the LRU
-            // from rebuilding plans every row.
             plan_cache: crate::utils::plan_cache::PlanCache::new(fonts.count().max(2) * 4),
             pending_cache_updates: Vec::new(),
             font_choices: crate::utils::shape_cache::FontChoiceCache::new(),
             cell_shapes: Default::default(),
+            #[cfg(feature = "emoji")]
+            color,
+            #[cfg(feature = "emoji")]
+            color_size,
+            #[cfg(feature = "emoji")]
+            pending_color_updates: Vec::new(),
         }
     }
 }
@@ -224,21 +181,15 @@ impl SharedFontCpuState {
 pub enum Shaping {
     /// Each cell is shaped on its own and cached by its symbol, so shaping
     /// runs once per distinct symbol and a row costs the same whether or
-    /// not its text was seen before. Nothing is shaped across cell
-    /// boundaries: no ligatures, and no joining forms for scripts that
-    /// connect letters in separate cells.
+    /// not its text was seen before.
     #[default]
     Cell,
     /// Each stretch of a row that uses one font is shaped as a single run,
-    /// so the font's contextual substitutions apply across cells. Nothing
-    /// is cached: every row that changed is shaped again, which costs
-    /// several times more than [`Shaping::Cell`]. A substitution that
-    /// merges several cells into one glyph (a programming ligature) is
-    /// still drawn one cell wide, i.e. clipped.
+    /// so the font's contextual substitutions apply across cells.
     Row,
 }
 
-/// A collection of fonts to use for rendering. Supports font fallback.
+/// A collection of fonts to use for rendering.
 pub struct Fonts {
     char_width: u32,
     char_height: u32,
@@ -252,20 +203,16 @@ pub struct Fonts {
     italic: Vec<Font>,
     bold_italic: Vec<Font>,
 
-    /// See [`SharedFontCpuState`]. `None` until first use -
-    /// `SharedFontCpuState::new` needs `&Fonts`, which doesn't exist yet
-    /// mid-construction in `Fonts::new`.
+    /// Color emoji fallback - see [`Fonts::add_emoji_fonts`].
+    #[cfg(feature = "emoji")]
+    emoji: Vec<Font>,
+
+    /// See [`SharedFontCpuState`].
     shared_cpu_state: Mutex<Option<SharedFontCpuState>>,
 }
 
 impl Fonts {
-    /// Create a new, empty set of fonts. The provided font will be used as a
-    /// last-resort fallback if no other fonts can render a particular
-    /// character. Rendering will attempt to fake bold/italic styles using this
-    /// font where appropriate.
-    ///
-    /// The provided size_px will be the rendered height in pixels of all fonts
-    /// in this collection.
+    /// Create a new, empty set of fonts.
     pub fn new(font: Font, size_px: u32) -> Self {
         Self {
             char_width: font.char_width(size_px),
@@ -277,12 +224,13 @@ impl Fonts {
             bold: vec![],
             italic: vec![],
             bold_italic: vec![],
+            #[cfg(feature = "emoji")]
+            emoji: vec![],
             shared_cpu_state: Mutex::new(None),
         }
     }
 
-    /// Chooses how text is shaped (default [`Shaping::Cell`]). Set it while
-    /// building the collection, before it is shared with a terminal.
+    /// Chooses how text is shaped (default [`Shaping::Cell`]).
     pub fn set_shaping(&mut self, shaping: Shaping) {
         self.shaping = shaping;
     }
@@ -292,22 +240,7 @@ impl Fonts {
         self.shaping
     }
 
-    /// Whether symbols are fitted to the cell grid (default `true`). Set it
-    /// while building the collection, before it is shared with a terminal.
-    ///
-    /// A symbol is a Nerd Font icon (or anything else in a Private Use
-    /// Area) or an ambiguous-width character its font draws wider than a
-    /// cell, such as the arrows and stars of Japanese fonts. When enabled,
-    /// each is scaled and aligned into its cells by the rules Nerd Fonts'
-    /// font-patcher uses for that codepoint (aspect ratio kept, shrunk to
-    /// fit otherwise), and may take two cells when the cell after it is
-    /// blank - the convention of Ghostty, kitty and WezTerm: in
-    /// `"\u{f07b} src"`, the folder icon is drawn full size over its own
-    /// cell and the space. A symbol right after another symbol stays in one
-    /// cell, so a run of them keeps its alignment.
-    ///
-    /// When disabled, symbols are drawn like text: one cell, squeezed
-    /// horizontally when their font draws them wider.
+    /// Whether symbols are fitted to the cell grid (default `true`).
     pub fn set_fit_symbols(&mut self, enabled: bool) {
         self.fit_symbols = enabled;
     }
@@ -318,9 +251,7 @@ impl Fonts {
         self.fit_symbols
     }
 
-    /// The cell grid symbol constraints resolve against. The one-cell icon
-    /// height follows font-patcher: `(2 * cap height + line height) / 3`
-    /// of the primary font.
+    /// The cell grid symbol constraints resolve against.
     pub(crate) fn cell_metrics(&self) -> crate::backend::glyph_constraint::CellMetrics {
         let primary = self.regular.first().unwrap_or(&self.last_resort).font();
         let cap_height = primary
@@ -341,8 +272,7 @@ impl Fonts {
     }
 
     /// Whether `ch`, drawn by `font`, is a symbol - see
-    /// [`crate::backend::glyph_constraint::CellClass::of`]. Always text
-    /// when [`Self::fit_symbols`] is off.
+    /// [`crate::backend::glyph_constraint::CellClass::of`].
     fn cell_class(&self, ch: char, font: &Font) -> crate::backend::glyph_constraint::CellClass {
         use crate::backend::glyph_constraint::CellClass;
         if !self.fit_symbols {
@@ -361,19 +291,12 @@ impl Fonts {
 
     /// Stable identity for this `Fonts` instance - used to key the
     /// render-world's per-font shared GPU atlas store.
-    /// Two terminals share GPU (and, via [`Fonts::with_shared_cpu_state`],
-    /// CPU) glyph-cache state exactly when they hold the same `Arc<Fonts>`
-    /// (this returns the same value for any two `&Fonts` borrowed from
-    /// clones of the same `Arc`, since they deref to the same address).
     pub(crate) fn identity(&self) -> usize {
         self as *const Self as usize
     }
 
     /// Runs `f` against this `Fonts`' shared CPU-side glyph cache state,
-    /// creating it on first use. Locks for the duration of `f` - callers
-    /// should do all of one flush's shaping/rasterization work inside a
-    /// single call rather than re-locking per row, since a flush touching
-    /// several rows would otherwise re-acquire the lock that many times.
+    /// creating it on first use.
     pub(crate) fn with_shared_cpu_state<R>(
         &self,
         f: impl FnOnce(&mut SharedFontCpuState) -> R,
@@ -387,13 +310,6 @@ impl Fonts {
     }
 
     /// Build from a loaded [`TerminalFontAsset`].
-    /// Synchronous - call once `Assets<TerminalFontAsset>::get` returns
-    /// `Some` for the handle you loaded via `asset_server.load(...)`, the
-    /// same "wait until loaded, then use" pattern every bevy user already
-    /// writes for glTF. `size_px` stays a parameter here rather than living
-    /// on the asset, since spawn APIs take the resulting `Arc<Fonts>`
-    /// directly (already sized) and would have nowhere to put a
-    /// per-asset size.
     pub fn from_asset(
         asset: &TerminalFontAsset,
         size_px: u32,
@@ -437,11 +353,7 @@ impl Fonts {
             .unwrap_or_default();
     }
 
-    /// Add a collection of fonts for various styles. They will automatically be
-    /// added to the appropriate fallback font list based on the font's
-    /// bold/italic properties. Note that this will automatically organize fonts
-    /// by relative width in order to optimize fallback rendering quality. The
-    /// ordering of already provided fonts will remain unchanged.
+    /// Add a collection of fonts for various styles.
     pub fn add_fonts(&mut self, fonts: impl IntoIterator<Item = Font>) {
         let bold_italic_len = self.bold_italic.len();
         let italic_len = self.italic.len();
@@ -471,8 +383,7 @@ impl Fonts {
         self.regular[regular_len..].sort_by_key(|font| font.char_width(self.char_height));
     }
 
-    /// Add a new collection of fonts for regular styled text. These fonts will
-    /// come _after_ previously provided fonts in the fallback order.
+    /// Add a new collection of fonts for regular styled text.
     pub fn add_regular_fonts(&mut self, fonts: impl IntoIterator<Item = Font>) {
         self.char_width = self.char_width.min(Self::add_fonts_internal(
             &mut self.regular,
@@ -482,12 +393,7 @@ impl Fonts {
     }
 
     /// TODO
-    /// Add a new collection of fonts for bold styled text. These fonts will
-    /// come _after_ previously provided fonts in the fallback order.
-    ///
-    /// You do not have to provide these for bold text to be supported. If no
-    /// bold fonts are supplied, rendering will fallback to the regular fonts
-    /// with fake bolding.
+    /// Add a new collection of fonts for bold styled text.
     pub fn add_bold_fonts(&mut self, fonts: impl IntoIterator<Item = Font>) {
         self.char_width = self.char_width.min(Self::add_fonts_internal(
             &mut self.bold,
@@ -497,13 +403,7 @@ impl Fonts {
     }
 
     /// TODO
-    /// Add a new collection of fonts for italic styled text. These fonts will
-    /// come _after_ previously provided fonts in the fallback order.
-    ///
-    /// It is recommended, but not required, that you provide italic fonts if
-    /// your application intends to make use of italics. If no italic fonts
-    /// are supplied, rendering will fallback to the regular fonts with fake
-    /// italics.
+    /// Add a new collection of fonts for italic styled text.
     pub fn add_italic_fonts(&mut self, fonts: impl IntoIterator<Item = Font>) {
         self.char_width = self.char_width.min(Self::add_fonts_internal(
             &mut self.italic,
@@ -513,12 +413,7 @@ impl Fonts {
     }
 
     /// TODO
-    /// Add a new collection of fonts for bold italic styled text. These fonts
-    /// will come _after_ previously provided fonts in the fallback order.
-    ///
-    /// You do not have to provide these for bold text to be supported. If no
-    /// bold fonts are supplied, rendering will fallback to the italic fonts
-    /// with fake bolding.
+    /// Add a new collection of fonts for bold italic styled text.
     pub fn add_bold_italic_fonts(&mut self, fonts: impl IntoIterator<Item = Font>) {
         self.char_width = self.char_width.min(Self::add_fonts_internal(
             &mut self.bold_italic,
@@ -526,6 +421,70 @@ impl Fonts {
             self.char_height,
         ));
     }
+}
+
+#[cfg(feature = "emoji")]
+impl Fonts {
+    /// Fallback fonts for emoji, in color (COLRv0, COLRv1, CBDT or sbix;
+    /// not OT-SVG) or monochrome.
+    pub fn add_emoji_fonts(&mut self, fonts: impl IntoIterator<Item = Font>) {
+        self.emoji.extend(fonts);
+    }
+
+    pub(crate) fn is_emoji_font(&self, id: u64) -> bool {
+        self.emoji.iter().any(|font| font.id() == id)
+    }
+
+    fn emoji_font_with(&self, ch: char) -> Option<&Font> {
+        self.emoji
+            .iter()
+            .find(|font| font.font().glyph_index(ch).is_some())
+    }
+
+    /// A text font with `ch`: the style slots and the last resort, never an
+    /// emoji font.
+    pub(crate) fn text_font_with(&self, ch: char) -> Option<&Font> {
+        [&self.regular, &self.bold, &self.italic, &self.bold_italic]
+            .into_iter()
+            .flatten()
+            .chain(std::iter::once(&self.last_resort))
+            .find(|font| font.font().glyph_index(ch).is_some())
+    }
+}
+
+/// Whether a cell's symbol is shown as an emoji: it starts with a default
+/// emoji-presentation char (and not `U+FE0E`), or carries a selector,
+/// joiner, keycap or skin tone, or is a flag.
+#[cfg(feature = "emoji")]
+pub(crate) fn emoji_presentation(symbol: &str) -> bool {
+    use unicode_properties::{EmojiStatus, UnicodeEmoji};
+    const REGIONAL: std::ops::RangeInclusive<char> = '\u{1F1E6}'..='\u{1F1FF}';
+    let mut chars = symbol.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if symbol.contains('\u{FE0E}') {
+        return false;
+    }
+    let default_emoji = !REGIONAL.contains(&first)
+        && matches!(
+            first.emoji_status(),
+            EmojiStatus::EmojiPresentation
+                | EmojiStatus::EmojiPresentationAndModifierBase
+                | EmojiStatus::EmojiPresentationAndEmojiComponent
+                | EmojiStatus::EmojiPresentationAndModifierAndEmojiComponent
+        );
+    if chars.next().is_none() {
+        return default_emoji;
+    }
+    default_emoji
+        || REGIONAL.contains(&first)
+        || symbol.chars().any(|c| {
+            matches!(
+                c,
+                '\u{FE0F}' | '\u{200D}' | '\u{20E3}' | '\u{1F3FB}'..='\u{1F3FF}'
+            )
+        })
 }
 
 impl Fonts {
@@ -540,14 +499,20 @@ impl Fonts {
     }
 
     pub(crate) fn count(&self) -> usize {
-        1 + self.bold.len() + self.italic.len() + self.bold_italic.len() + self.regular.len()
+        #[cfg(feature = "emoji")]
+        let emoji = self.emoji.len();
+        #[cfg(not(feature = "emoji"))]
+        let emoji = 0;
+        1 + self.bold.len()
+            + self.italic.len()
+            + self.bold_italic.len()
+            + self.regular.len()
+            + emoji
     }
 
     /// [`Self::font_for_cell`] plus the cell's symbol class (see
     /// [`Self::set_fit_symbols`]), memoized through `cache` for the usual
-    /// single-`char` symbol. Multi-codepoint clusters always take the full
-    /// probe (the best font depends on every codepoint of the cluster) and
-    /// are classified by their first char.
+    /// single-`char` symbol.
     pub(crate) fn font_for_cell_cached(
         &self,
         cell: &Cell,
@@ -573,21 +538,32 @@ impl Fonts {
         (self.font_by_id(id), fake_bold, fake_italic, class)
     }
 
-    /// The font with this id. Ids come from this same `Fonts` (via
-    /// `font_for_cell`), so the lookup always succeeds; the last-resort
-    /// font - the answer for a single-font setup - is checked first.
+    /// The font with this id.
     fn font_by_id(&self, id: u64) -> &Font {
         if self.last_resort.id() == id {
             return &self.last_resort;
         }
-        [&self.regular, &self.bold, &self.italic, &self.bold_italic]
+        let found = [&self.regular, &self.bold, &self.italic, &self.bold_italic]
             .into_iter()
             .flatten()
-            .find(|font| font.id() == id)
-            .unwrap_or(&self.last_resort)
+            .find(|font| font.id() == id);
+        // Without this an emoji font's id would silently resolve to the
+        // last resort.
+        #[cfg(feature = "emoji")]
+        let found = found.or_else(|| self.emoji.iter().find(|font| font.id() == id));
+        found.unwrap_or(&self.last_resort)
     }
 
     pub(crate) fn font_for_cell(&self, cell: &Cell) -> (&Font, bool, bool) {
+        #[cfg(feature = "emoji")]
+        let first = cell.symbol().chars().next().unwrap_or(' ');
+        #[cfg(feature = "emoji")]
+        if emoji_presentation(cell.symbol())
+            && let Some(font) = self.emoji_font_with(first)
+        {
+            return (font, false, false);
+        }
+
         let is_bold = cell.modifier.contains(ratatui::style::Modifier::BOLD);
         let is_italic = cell.modifier.contains(ratatui::style::Modifier::ITALIC);
 
@@ -596,7 +572,6 @@ impl Fonts {
         // for every cell of every reshaped row (`font_runs` in
         // `bevy_backend.rs`), so it must not allocate.
         let slots: [(&[Font], bool, bool); 4] = if is_bold && is_italic {
-            // Bold + Italic: try bold_italic first, then fall back with fake styling
             [
                 (&self.bold_italic[..], false, false),
                 (&self.bold[..], false, true),
@@ -604,7 +579,6 @@ impl Fonts {
                 (&self.regular[..], true, true),
             ]
         } else if is_bold {
-            // Bold only: try bold, then fake bold on regular
             [
                 (&self.bold[..], false, false),
                 (&self.regular[..], true, false),
@@ -612,7 +586,6 @@ impl Fonts {
                 (&self.bold_italic[..], false, false),
             ]
         } else if is_italic {
-            // Italic only: try italic, then fake italic on regular
             [
                 (&self.italic[..], false, false),
                 (&self.regular[..], false, true),
@@ -620,7 +593,6 @@ impl Fonts {
                 (&self.bold_italic[..], false, false),
             ]
         } else {
-            // Regular: try regular, then any other
             [
                 (&self.regular[..], false, false),
                 (&self.bold[..], false, false),
@@ -634,13 +606,14 @@ impl Fonts {
                 fonts.iter().map(move |font| (font, fake_bold, fake_italic))
             });
 
-        // Select font with fake styling as last resort
-        self.select_font(
-            cell.symbol(),
-            fonts_to_try,
-            is_bold,   // Use fake bold if no real bold font found
-            is_italic, // Use fake italic if no real italic font found
-        )
+        let chosen = self.select_font(cell.symbol(), fonts_to_try, is_bold, is_italic);
+        #[cfg(feature = "emoji")]
+        if chosen.0.font().glyph_index(first).is_none()
+            && let Some(font) = self.emoji_font_with(first)
+        {
+            return (font, false, false);
+        }
+        chosen
     }
 
     fn select_font<'fonts>(
@@ -698,14 +671,6 @@ impl Fonts {
     }
 }
 
-// ============================================================================
-// Test: font_for_cell's per-style fallback order. Pure CPU - loads
-// the shipped M+ font multiple times (each load gets a fresh random `id()`,
-// see `Font::build`'s `RandomState::new()` per call) to stand in for
-// distinct "regular"/"bold"/"italic"/"bold_italic" font slots, and checks
-// which slot's `id()` wins for each `Modifier` combination.
-// ============================================================================
-
 #[cfg(test)]
 mod font_for_cell_tests {
     use super::*;
@@ -714,10 +679,6 @@ mod font_for_cell_tests {
 
     const FONT_DATA: &[u8] = include_bytes!("../examples/assets/fonts/Mplus1Code-Regular.ttf");
 
-    /// A fresh `Font` with its own random `id()` - loading the same bytes
-    /// twice via `Font::from_vec` yields two distinguishable `Font`s (see
-    /// module doc comment), letting tests tell "which slot was picked"
-    /// apart without needing physically different font files.
     fn fresh_font() -> Font {
         Font::from_vec(FONT_DATA.to_vec()).expect("failed to load test font")
     }
@@ -731,7 +692,7 @@ mod font_for_cell_tests {
 
     #[test]
     fn regular_cell_prefers_the_regular_slot() {
-        let mut fonts = Fonts::new(fresh_font(), 16); // last_resort
+        let mut fonts = Fonts::new(fresh_font(), 16);
         let regular = fresh_font();
         let regular_id = regular.id();
         fonts.add_regular_fonts([regular]);
@@ -767,7 +728,6 @@ mod font_for_cell_tests {
         let regular = fresh_font();
         let regular_id = regular.id();
         fonts.add_regular_fonts([regular]);
-        // No bold font registered at all.
 
         let (font, fake_bold, fake_italic) = fonts.font_for_cell(&cell_with(Modifier::BOLD));
         assert_eq!(
@@ -783,7 +743,7 @@ mod font_for_cell_tests {
     fn bold_cell_falls_back_to_last_resort_when_nothing_else_registered() {
         let last_resort = fresh_font();
         let last_resort_id = last_resort.id();
-        let fonts = Fonts::new(last_resort, 16); // no regular/bold/italic added at all
+        let fonts = Fonts::new(last_resort, 16);
 
         let (font, fake_bold, _) = fonts.font_for_cell(&cell_with(Modifier::BOLD));
         assert_eq!(font.id(), last_resort_id);
@@ -826,7 +786,6 @@ mod font_for_cell_tests {
         let bold_id = bold.id();
         fonts.add_regular_fonts([fresh_font()]);
         fonts.add_bold_fonts([bold]);
-        // No bold_italic or italic-only slot registered.
 
         let (font, fake_bold, fake_italic) =
             fonts.font_for_cell(&cell_with(Modifier::BOLD | Modifier::ITALIC));
@@ -839,5 +798,109 @@ mod font_for_cell_tests {
             !fake_bold && fake_italic,
             "bold is real (no faking needed) but italic must be faked on top"
         );
+    }
+}
+
+#[cfg(all(test, feature = "emoji"))]
+mod emoji_tests {
+    use super::*;
+
+    const MPLUS: &[u8] = include_bytes!("../examples/assets/fonts/Mplus1Code-Regular.ttf");
+    const COLRV1: &[u8] = include_bytes!("backend/testdata/noto_colrv1_subset.ttf");
+    const CBDT: &[u8] = include_bytes!("backend/testdata/noto_cbdt_subset.ttf");
+
+    fn cell(symbol: &str) -> Cell {
+        let mut cell = Cell::default();
+        cell.set_symbol(symbol);
+        cell
+    }
+
+    #[test]
+    fn emoji_presentation_is_true_for_emoji_sequences() {
+        for symbol in [
+            "\u{1F600}",
+            "\u{1F44D}\u{1F3FD}",
+            "\u{1F9D1}\u{200D}\u{1F4BB}",
+            "\u{1F1EF}\u{1F1F5}",
+            "\u{2764}\u{FE0F}",
+            "1\u{FE0F}\u{20E3}",
+            "\u{1F3F3}\u{FE0F}\u{200D}\u{1F308}",
+            "\u{1F525}",
+            "\u{1F3FD}",
+            "\u{1F600}\u{301}",
+        ] {
+            assert!(emoji_presentation(symbol), "{symbol:?}");
+        }
+    }
+
+    #[test]
+    fn emoji_presentation_is_false_for_text() {
+        for symbol in [
+            "1",
+            "#",
+            "\u{A9}",
+            "\u{2764}",
+            "\u{2600}",
+            "\u{2764}\u{FE0E}",
+            "\u{1F600}\u{FE0E}",
+            "\u{E9}",
+            "e\u{301}",
+            "1\u{301}",
+            "\u{3042}",
+            "\u{1F1EF}",
+            "a",
+        ] {
+            assert!(!emoji_presentation(symbol), "{symbol:?}");
+        }
+    }
+
+    #[test]
+    fn emoji_fonts_win_emoji_presentation_and_text_keeps_its_font() {
+        for data in [COLRV1, CBDT] {
+            let emoji = Font::new(data).expect("emoji fixture parses");
+            let emoji_id = emoji.id();
+            let mplus = Font::new(MPLUS).expect("M+ parses");
+            let mplus_id = mplus.id();
+            let mut fonts = Fonts::new(mplus, 16);
+            fonts.add_emoji_fonts([emoji]);
+
+            for symbol in ["\u{1F600}", "\u{2764}\u{FE0F}"] {
+                let (font, fake_bold, fake_italic) = fonts.font_for_cell(&cell(symbol));
+                assert_eq!(font.id(), emoji_id, "{symbol:?}");
+                assert!(!fake_bold && !fake_italic);
+                assert!(fonts.is_emoji_font(emoji_id));
+                assert_eq!(fonts.font_by_id(emoji_id).id(), emoji_id);
+            }
+            assert_eq!(fonts.font_for_cell(&cell("1")).0.id(), mplus_id);
+            assert!(!fonts.is_emoji_font(mplus_id));
+        }
+    }
+
+    #[test]
+    fn an_emoji_font_is_the_fallback_for_a_char_no_text_font_has() {
+        let emoji = Font::new(COLRV1).expect("emoji fixture parses");
+        let emoji_id = emoji.id();
+        let mut fonts = Fonts::new(Font::new(MPLUS).expect("M+ parses"), 16);
+        fonts.add_emoji_fonts([emoji]);
+        let sun = cell("\u{2600}");
+        assert!(!emoji_presentation(sun.symbol()));
+        assert!(fonts.last_resort.font().glyph_index('\u{2600}').is_none());
+        assert_eq!(fonts.font_for_cell(&sun).0.id(), emoji_id);
+        assert_eq!(
+            fonts.font_for_cell(&cell("#")).0.id(),
+            fonts.last_resort.id()
+        );
+    }
+
+    #[test]
+    fn adding_emoji_fonts_does_not_change_the_cell_size() {
+        for data in [COLRV1, CBDT] {
+            let mut fonts = Fonts::new(Font::new(MPLUS).expect("M+ parses"), 16);
+            let (width, height, count) = (fonts.min_width_px(), fonts.height_px(), fonts.count());
+            fonts.add_emoji_fonts([Font::new(data).expect("emoji fixture parses")]);
+            assert_eq!(fonts.min_width_px(), width);
+            assert_eq!(fonts.height_px(), height);
+            assert_eq!(fonts.count(), count + 1, "the plan cache is sized for it");
+        }
     }
 }

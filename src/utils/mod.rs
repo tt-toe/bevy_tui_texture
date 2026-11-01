@@ -93,11 +93,6 @@ impl<'f, 'd, 'p> Painter<'f, 'd, 'p> {
     fn compute_transform(&self) -> Transform {
         self.transforms
             .iter()
-            // Applying the pushed transforms in reverse order empirically produces the correct
-            // result. I can find no indication in the documentation of any font parsing crate nor
-            // in the documention for the colr tables indicating that this is the expected way to
-            // apply these transforms. It's possible I missed something (possibly this has to do
-            // with the fact that layers are specified from the bottom up?).
             .rev()
             .fold(Transform::default(), |tfm, t| {
                 tfm.then(&Transform::new(t.a, t.b, t.c, t.d, t.e, t.f))
@@ -118,13 +113,7 @@ impl<'a> rustybuzz::ttf_parser::colr::Painter<'a> for Painter<'_, '_, '_> {
     }
 
     /// The documentation for this states "Paint the stored outline using the
-    /// provided color", but this is only true for colr v0 outlines. For colr
-    /// v1, the outline will have been pushed using `push_clip`, and we
-    /// should instead fill the clipped region with the provided paint. We
-    /// handle this by storing the outline in an optional, which will be taken
-    /// from during the `push_clip` operation, leaving it empty. This way we
-    /// know if the outline is present that we are supposed to paint the
-    /// path directly.
+    /// provided color", but this is only true for colr v0 outlines.
     fn paint(&mut self, paint: rustybuzz::ttf_parser::colr::Paint<'a>) {
         let paint = match paint {
             rustybuzz::ttf_parser::colr::Paint::Solid(color) => {
@@ -136,7 +125,6 @@ impl<'a> rustybuzz::ttf_parser::colr::Painter<'a> for Painter<'_, '_, '_> {
                 ))
             }
             rustybuzz::ttf_parser::colr::Paint::LinearGradient(grad) => {
-                // https://learn.microsoft.com/en-us/typography/opentype/spec/colr#linear-gradients
                 let mut stops = grad
                     .stops(0, &[])
                     .map(|stop| GradientStop {
@@ -160,11 +148,9 @@ impl<'a> rustybuzz::ttf_parser::colr::Painter<'a> for Painter<'_, '_, '_> {
                     return;
                 }
 
-                // Get the line perpendicular to p0p2
                 let dist = p2 - p0;
                 let perp = Vector::new(dist.y, -dist.x);
 
-                // Project the vector p0p1 onto the perpendicular line passing through p0
                 let dist = p1 - p0;
                 let p3 = p0 + dist.project_onto_vector(perp);
 
@@ -262,7 +248,7 @@ impl<'a> rustybuzz::ttf_parser::colr::Painter<'a> for Painter<'_, '_, '_> {
         };
 
         let draw_options = DrawOptions {
-            antialias: raqote::AntialiasMode::None,
+            antialias: raqote::AntialiasMode::Gray,
             ..Default::default()
         };
 

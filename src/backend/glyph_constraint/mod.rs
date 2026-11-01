@@ -1,29 +1,5 @@
-//! Fitting symbol glyphs (Nerd Font icons, Powerline extras, wide-drawn
+//! Fitting symbol glyphs (Nerd Fonts icons, Powerline extras, wide-drawn
 //! ambiguous-width symbols) to the terminal's cell grid.
-//!
-//! A text glyph is drawn the way its font positions it. A symbol is not:
-//! the font it comes from is usually a fallback whose em and advance have
-//! nothing to do with this terminal's cells (Symbols Nerd Font's icons are
-//! about one em wide, two to three cells of a typical primary font). Nerd
-//! Fonts' font-patcher solves the same problem when it patches icons into a
-//! font: every symbol set comes with rules for how to scale and align its
-//! glyphs into the target font's cell. This module applies those rules at
-//! render time, against this terminal's cells, so the same icons look the
-//! same whatever font they come from (patched or not, Mono or not).
-//!
-//! - [`GlyphConstraint`] is the rule: how to size the glyph, how to align
-//!   it, how many cells it may use. The resolution math
-//!   ([`GlyphConstraint::constrain`]) is a port of Ghostty's
-//!   `Glyph.RenderOptions.Constraint` (MIT, see NOTICE), which mirrors
-//!   font-patcher.
-//! - `nerd_font.rs` is font-patcher's own rule set, generated from it by
-//!   `tools/nerd_font_constraints.py`. Symbols it doesn't cover get
-//!   [`GlyphConstraint::FIT`]: shrink to fit if too big, otherwise
-//!   untouched.
-//! - [`CellClass`] says whether a cell is a symbol and how many cells it
-//!   may take; it is decided once per `(char, style)` together with the
-//!   cell's font. A symbol may use two cells when the next cell is blank -
-//!   see [`symbol_span`].
 
 mod nerd_font;
 
@@ -82,12 +58,10 @@ pub(crate) struct GlyphConstraint {
     pub(crate) align_x: Align,
     pub(crate) align_y: Align,
     /// Padding inside the box: top, right, bottom, left, as fractions of
-    /// the cell height (top/bottom) or width (left/right). Negative values
-    /// let the glyph overlap its neighbours.
+    /// the cell height (top/bottom) or width (left/right).
     pub(crate) pad: [f32; 4],
     /// The glyph's bounding box relative to that of its scale group:
-    /// x, y, width, height. Glyphs of one group are scaled by the same
-    /// factor and aligned as one, which keeps their relative sizes.
+    /// x, y, width, height.
     pub(crate) group: [f32; 4],
     /// Widest aspect ratio (width / height) a stretch may produce; 0 for
     /// no limit.
@@ -135,9 +109,6 @@ impl GlyphConstraint {
         }
         let mut c = *self;
         if c.size == Size::Stretch {
-            // Negative padding on a stretched glyph only guards against
-            // rounding gaps between the face and the pixel grid; there is
-            // no such gap here (the face is the cell).
             c.pad = c.pad.map(|p| p.max(0.0));
         }
         c.constrain_inner(glyph, metrics, cells)
@@ -162,7 +133,6 @@ impl GlyphConstraint {
         group.x = glyph.x - group.width * rel_x;
         group.y = glyph.y - group.height * rel_y;
 
-        // Scale about the group's center, then align.
         let (width_factor, height_factor) = self.scale_factors(&group, m, cells);
         let center_x = group.x + group.width / 2.0;
         let center_y = group.y + group.height / 2.0;
@@ -237,8 +207,6 @@ impl GlyphConstraint {
         let end = m.cell_height - group.height - pad_top * m.cell_height;
         let center = (start + end) / 2.0;
         match self.align_y {
-            // Every size rule implies staying inside the padded cell; a
-            // glyph too tall for it is centered.
             Align::None if end < start => center,
             Align::None => group.y.min(end).max(start),
             Align::Start => start,
@@ -255,7 +223,6 @@ impl GlyphConstraint {
         let start = pad_left * m.cell_width;
         let end = cells as f32 * m.cell_width - group.width - pad_right * m.cell_width;
         match self.align_x {
-            // The left edge wins when the group is too wide.
             Align::None => group.x.min(end).max(start),
             Align::Start => start,
             Align::End => end.max(start),
@@ -293,8 +260,7 @@ pub(crate) struct CellMetrics {
 /// reading it back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct CellClass {
-    /// 0: not a symbol, drawn as before. 1 or 2: a symbol, constrained into
-    /// at most this many cells.
+    /// 0: not a symbol, drawn as before.
     pub(crate) max_cells: u8,
     /// A terminal graphics element (box drawing, blocks, Powerline
     /// separators): a symbol before it doesn't stop the next one from
@@ -314,12 +280,6 @@ impl CellClass {
 
     /// Classifies `ch` as drawn by a font whose glyph for it is
     /// `advance_px` wide, in a grid of `cell_width_px` cells.
-    ///
-    /// A symbol is a Nerd Font codepoint, anything in a Private Use Area,
-    /// or an ambiguous-width character (one cell by `unicode-width`, two in
-    /// East Asian contexts) whose font draws it wider than a cell - the
-    /// arrows, circles and stars of Japanese fonts. Procedurally drawn
-    /// glyphs (box drawing, blocks, braille, Powerline) are never symbols.
     pub(crate) fn of(ch: char, advance_px: impl FnOnce() -> f32, cell_width_px: f32) -> Self {
         let graphics = is_graphics_element(ch);
         if crate::backend::programmatic_glyphs::is_programmatic_glyph(ch) {
@@ -364,10 +324,7 @@ fn is_graphics_element(ch: char) -> bool {
 
 /// How many cells a symbol of class `class` gets: two when the next cell is
 /// blank (`blank_next`, see [`is_blank`]; false at the end of the row) and
-/// it may use two, one otherwise. Ghostty's rule: a symbol right after
-/// another symbol (`prev`, the class of the cell before it) stays in one
-/// cell, so a run of symbols keeps its alignment; graphics elements
-/// (Powerline separators etc.) don't count.
+/// it may use two, one otherwise.
 pub(crate) fn symbol_span(class: CellClass, prev: Option<CellClass>, blank_next: bool) -> u32 {
     if class.max_cells < 2 || !blank_next {
         return 1;
@@ -414,12 +371,10 @@ mod tests {
                 .iter()
                 .all(|&(a, b, i)| a <= b && (i as usize) < nerd_font::CONSTRAINTS.len())
         );
-        // nf-fa-folder, nf-md-ab_testing, nf-cod-account: icons in a 2-cell box.
         for ch in ['\u{F07B}', '\u{F0001}', '\u{EA60}'] {
             let c = GlyphConstraint::nerd_font(ch).expect("patched icon");
             assert_eq!((c.size, c.max_cells), (Size::FitCover1, 2), "{ch:?}");
         }
-        // Powerline's hard divider is stretched into exactly one cell.
         let divider = GlyphConstraint::nerd_font('\u{E0B0}').unwrap();
         assert_eq!((divider.size, divider.max_cells), (Size::Stretch, 1));
         assert!(GlyphConstraint::nerd_font('a').is_none());
@@ -428,7 +383,6 @@ mod tests {
 
     #[test]
     fn fit_shrinks_an_oversized_glyph_and_keeps_its_aspect_ratio() {
-        // A 16 px square icon (Symbols Nerd Font at 16 px) in 6 x 16 cells.
         let icon = GlyphRect {
             x: 0.0,
             y: 1.0,
@@ -472,8 +426,6 @@ mod tests {
     #[test]
     fn a_patched_icon_grows_to_one_cell_but_not_to_two() {
         let rule = GlyphConstraint::nerd_font('\u{F07B}').unwrap();
-        // Small (a Mono font's icon): covers one cell either way, centered
-        // in the first cell.
         let small = GlyphRect {
             x: 0.0,
             y: 5.0,
@@ -492,8 +444,6 @@ mod tests {
                 height: 6.0,
             },
         );
-        // Wide (a non-Mono font's icon, 1.5 cells): keeps its size in two
-        // cells, left-aligned; shrinks into one.
         let wide = GlyphRect {
             x: 0.0,
             y: 4.0,
@@ -551,10 +501,8 @@ mod tests {
             "patched, one cell"
         );
         assert!(CellClass::of('\u{E0C0}', narrow, 6.0).graphics);
-        // Procedural glyphs are drawn by the backend, never constrained.
         assert!(!CellClass::of('\u{E0B0}', wide, 6.0).is_symbol());
         assert!(!CellClass::of('─', wide, 6.0).is_symbol());
-        // Ambiguous width: a symbol only where the font draws it wide.
         assert_eq!(CellClass::of('→', wide, 6.0).max_cells, 2);
         assert!(!CellClass::of('→', narrow, 6.0).is_symbol());
         assert!(!CellClass::of('a', wide, 6.0).is_symbol());

@@ -89,7 +89,7 @@ wasm-opt -Oz --strip-debug --strip-producers \
 
 No asset-copying step is needed - `examples/assets/` is fetched
 directly at runtime from its sibling location, the same directory native
-builds read from (see `examples/retro_crt.rs`'s `build_app` doc comment).
+builds read from (see `build_app` in `examples/retro_crt.rs`).
 
 **After regenerating, bump `ASSET_VERSION` in `index.html`** (a `const` near
 the top of its `<script type="module">`) to any new value (e.g. today's

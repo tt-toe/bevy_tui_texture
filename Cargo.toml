@@ -1,6 +1,6 @@
 [package]
 name = "bevy_tui_texture"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 rust-version = "1.97.1"
 authors = ["TTT"]
@@ -207,6 +207,10 @@ path = "examples/resize.rs"
 [[example]]
 name = "nerd_font_icons"
 path = "examples/nerd_font_icons.rs"
+[[example]]
+name = "emoji"
+path = "examples/emoji.rs"
+required-features = ["emoji"]
 [[example]]
 name = "transparent_world_quad"
 path = "examples/transparent_world_quad.rs"

@@ -1,67 +1,4 @@
 //! Terminal texture creation and ECS spawning.
-//!
-//! Two levels of abstraction for creating and managing terminals:
-//!
-//! 1. **`TerminalTexture`** - Core texture operations only
-//!    - Just creates the terminal texture and ratatui Terminal
-//!    - User must manually spawn entities and add input components
-//!    - Maximum flexibility and control; wrap it in a [`Tui`] to draw with
-//!      zero render-resource parameters per frame (`gpu_flush_system`,
-//!      registered by `TerminalPlugin`, extracts a draw payload; the render
-//!      world renders it directly into the terminal's `Image`/`GpuImage` -
-//!      no CPU readback, no material touch needed)
-//!
-//! 2. **[`TuiRequest`]** - declarative spawning: spawn the request component
-//!    (plus any `Node`/`Transform`/markers) and the plugin's
-//!    `materialize_tui_requests` system creates the texture and inserts
-//!    the right components (`Tui`, `ImageNode`+`Node` or
-//!    `Mesh3d`+`MeshMaterial3d<StandardMaterial>`, `TerminalInput`) next
-//!    frame - **no render resources in user code at all**
-//!
-//! For attaching a `Tui` to an *existing* mesh (e.g. a glTF primitive) or a
-//! custom material type, see [`AttachTerminal`]/[`AttachMaterial`]
-//! (combined with a [`TuiKind::Headless`] request for the `Tui` itself).
-//!
-//! # Examples
-//!
-//! ## Level 1: TerminalTexture (Manual Entity Management)
-//!
-//! ```ignore
-//! use bevy::prelude::*;
-//! use bevy_tui_texture::setup::TerminalTexture;
-//! use bevy_tui_texture::prelude::*;
-//!
-//! fn setup(
-//!     mut commands: Commands,
-//!     mut images: ResMut<Assets<Image>>,
-//! ) {
-//!     let fonts = /* load fonts */;
-//!
-//!     let texture = TerminalTexture::create(
-//!         80, 25, fonts, true, false, [0, 0, 0, 255], &mut images,
-//!     ).unwrap();
-//!
-//!     // Manually spawn entity with input support
-//!     commands.spawn((
-//!         ImageNode { image: texture.image_handle(), ..default() },
-//!         Node::default(),
-//!         TerminalInput::default(),
-//!         Tui::from_texture_state(texture),
-//!         texture.dimensions(),
-//!     ));
-//! }
-//! ```
-//!
-//! ## Level 2: TuiRequest (Declarative, 2D UI Overlay)
-//!
-//! ```ignore
-//! use bevy::prelude::*;
-//! use bevy_tui_texture::prelude::*;
-//!
-//! fn setup(mut commands: Commands) {
-//!     commands.spawn((TuiRequest::ui(80, 25, fonts), Node::default()));
-//! }
-//! ```
 
 use std::sync::Arc;
 #[cfg(feature = "3d")]
@@ -78,14 +15,6 @@ use crate::fonts::Fonts;
 use crate::input::TerminalInput;
 
 /// Core terminal texture state without entity management.
-///
-/// This is the lowest-level abstraction - it creates the terminal texture and
-/// ratatui Terminal, but does not spawn any entities. Users must manually:
-/// - Spawn their own entity with the image
-/// - Add input components if needed (TerminalInput, TerminalComponent, TerminalDimensions)
-///
-/// This provides maximum flexibility for users who want full control over
-/// entity composition and component setup.
 pub struct TerminalTexture {
     pub terminal: ratatui::Terminal<BevyTerminalBackend>,
     pub image_handle: Handle<Image>,
@@ -99,36 +28,6 @@ pub struct TerminalTexture {
 
 impl TerminalTexture {
     /// Create a new terminal texture without spawning an entity.
-    ///
-    /// # Arguments
-    ///
-    /// * `cols` - Number of columns (characters wide)
-    /// * `rows` - Number of rows (characters tall)
-    /// * `fonts` - Font configuration (shared via Arc)
-    /// * `programmatic_glyphs` - If true, pre-populate box drawing, braille, and powerline glyphs
-    /// * `transparent_reset_bg` - If true, cells with no explicit background
-    ///   render with alpha 0 instead of an opaque fill - see
-    ///   `TerminalConfig::transparent_reset_bg`.
-    /// * `initial_fill` - Color shown before any content is drawn - see
-    ///   `TerminalConfig::initial_fill`.
-    /// * `images` - Bevy's Image assets
-    ///
-    /// # Returns
-    ///
-    /// Returns `Ok(TerminalTexture)` on success, or an error message on failure.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// # use bevy::prelude::*;
-    /// # use bevy_tui_texture::setup::TerminalTexture;
-    /// # fn setup(mut images: ResMut<Assets<Image>>) {
-    /// let fonts = /* load fonts */;
-    /// let texture = TerminalTexture::create(
-    ///     80, 25, fonts, true, false, [0, 0, 0, 255], &mut images,
-    /// ).unwrap();
-    /// # }
-    /// ```
     pub fn create(
         cols: u16,
         rows: u16,
@@ -143,13 +42,6 @@ impl TerminalTexture {
         let width = cols as u32 * char_width_px;
         let height = rows as u32 * char_height_px;
 
-        // Render-world-only image: no CPU-side pixel data ever exists for
-        // it, and no main-world wgpu texture exists either - the render
-        // world's `TerminalGpuState::render` (`backend/mod.rs`) renders
-        // directly into this asset's own `GpuImage::texture_view` every
-        // dirty frame (see `render_tui_textures` in `bevy_plugin.rs`).
-        // `RENDER_ATTACHMENT` makes that possible; `TEXTURE_BINDING` lets
-        // materials sample it; `COPY_SRC` backs `Tui::read_back_blocking`.
         let mut image = Image::new_uninit(
             bevy::render::render_resource::Extent3d {
                 width,
@@ -166,14 +58,12 @@ impl TerminalTexture {
                 | bevy::render::render_resource::TextureUsages::COPY_SRC;
         let image_handle = images.add(image);
 
-        // Create backend - pure CPU construction, no Device/Queue needed.
         let mut backend = TerminalBuilder::new(fonts)
             .with_dimensions(cols, rows)
             .with_transparent_reset_bg(transparent_reset_bg)
             .with_initial_fill(initial_fill)
             .build();
 
-        // Optionally pre-populate programmatic glyphs
         if programmatic_glyphs {
             backend.populate_programmatic_glyphs();
         }
@@ -193,9 +83,6 @@ impl TerminalTexture {
     }
 
     /// Get the terminal dimensions for entity setup.
-    ///
-    /// Returns a `TerminalDimensions` component that should be added to
-    /// the entity for input coordinate mapping to work correctly.
     pub fn dimensions(&self) -> TerminalDimensions {
         TerminalDimensions {
             cols: self.cols,
@@ -206,24 +93,11 @@ impl TerminalTexture {
     }
 
     /// Get the image handle for entity setup.
-    ///
-    /// This is the `Handle<Image>` that should be used in the entity's
-    /// ImageNode or Material component.
     pub fn image_handle(&self) -> Handle<Image> {
         self.image_handle.clone()
     }
 
-    /// Resize to a new grid size in place. Recreates the destination
-    /// `Image` at the **same handle** (`images.insert`, not a new
-    /// `images.add`) so every `ImageNode`/material already pointing at it
-    /// keeps working with no re-pointing needed. Font metrics are
-    /// unchanged by a grid resize, so pixel dimensions follow directly from
-    /// the stored `char_width_px`/`char_height_px`.
-    ///
-    /// Does not itself touch ratatui's buffers - `Tui::apply_pending_resize`
-    /// (the only caller) also resizes the backend and calls
-    /// `Terminal::resize` immediately after this returns, so the two stay
-    /// in lockstep.
+    /// Resize to a new grid size in place.
     fn resize(&mut self, cols: u16, rows: u16, images: &mut Assets<Image>) {
         self.width = cols as u32 * self.char_width_px;
         self.height = rows as u32 * self.char_height_px;
@@ -251,22 +125,7 @@ impl TerminalTexture {
 }
 
 /// Registry mapping click regions to caller-defined `u64` ids, rebuilt on
-/// every [`Tui::draw_with_hits`] call. This is deliberately **a registry, not
-/// a retained-mode UI** - ratatui has no widget tree, so there is no way to
-/// derive hit regions automatically; record `(id, Rect)` next to the
-/// `render_widget` call that draws it, then look it up at event time via
-/// [`HitRegions::hit_at`].
-///
-/// `HitId` is a plain `u64` - no boxing, no dynamic dispatch, no
-/// downcasting; chosen for speed over a boxed/dynamic alternative. The cost
-/// is that callers encode their own hit-id enum into `u64` by hand
-/// (mechanical, but cheap and `Copy`).
-///
-/// A `Component`: this data is pure and keyed by `u64` - nothing about it
-/// is texture-specific. Making it spawnable as its own component lets a
-/// display-agnostic consumer (a future bevy_ratatui adapter, or any BYO
-/// input pipeline) own a registry without a `Tui`. The `Tui`-embedded
-/// instance and `draw_with_hits` are unaffected - this is purely additive.
+/// every [`Tui::draw_with_hits`] call.
 #[derive(Component, Default)]
 pub struct HitRegions {
     regions: Vec<(u64, ratatui::layout::Rect)>,
@@ -277,9 +136,7 @@ impl HitRegions {
         self.regions.clear();
     }
 
-    /// Register a hit region. Later registrations take priority over
-    /// earlier, overlapping ones in [`HitRegions::hit_at`] (last-registered
-    /// = topmost, matching draw order).
+    /// Register a hit region.
     pub fn add(&mut self, id: impl Into<u64>, rect: ratatui::layout::Rect) {
         self.regions.push((id.into(), rect));
     }
@@ -295,11 +152,7 @@ impl HitRegions {
         self.add(id, block.inner(rect));
     }
 
-    /// Decodes the topmost (last-registered) region containing `pos`. If
-    /// that region's id fails `T::try_from`, returns `None` - it does NOT
-    /// fall through to regions underneath. (Decode failure means the caller
-    /// used the wrong id type, not "try the next region"; falling through
-    /// would silently mask that bug.)
+    /// Decodes the topmost (last-registered) region containing `pos`.
     pub fn hit_at<T: TryFrom<u64>>(&self, pos: (u16, u16)) -> Option<T> {
         let point = ratatui::layout::Position { x: pos.0, y: pos.1 };
         self.regions
@@ -310,32 +163,11 @@ impl HitRegions {
     }
 }
 
-/// One terminal = one Entity. wgpu resources are `Send + Sync`, so this is a
-/// plain Component (no `NonSend` needed).
-///
-/// Named `Tui`, not `Terminal` or `TuiTerminal`: a bare `Terminal` would
-/// collide with `ratatui::prelude::Terminal` under the glob-import
-/// combination every example already uses, and `TuiTerminal` spells out to
-/// the redundant "Terminal User Interface Terminal".
-///
-/// [`Tui::draw`] only draws into ratatui's internal buffer and marks the
-/// component dirty (skipped entirely if the draw was byte-identical to the
-/// previous frame) - it touches no GPU state and is cheap to call every
-/// frame. The actual GPU render is owned by the plugin's
-/// [`gpu_flush_system`](crate::bevy_plugin::gpu_flush_system), registered
-/// automatically right after `TerminalSystemSet::Render`; a render-world system then
-/// copies the result into this `Tui`'s `Image`/`GpuImage` - no CPU
-/// readback, no material touch
+/// One terminal = one Entity.
 #[derive(Component)]
 pub struct Tui {
     texture_state: TerminalTexture,
-    /// Starts `true` (not `false`): the uninitialized-texture guard. The
-    /// destination `GpuImage` begins with genuinely undefined GPU memory
-    /// (`Image::new_uninit`, no CPU data ever uploaded), so the first
-    /// `gpu_flush_system` pass must run even if the caller hasn't drawn
-    /// anything yet - `TerminalGpuState::render` clears it to black instead
-    /// of leaving whatever garbage the GPU allocator handed back visible on
-    /// screen.
+    /// Starts `true` (not `false`): the uninitialized-texture guard.
     dirty: bool,
     /// Set by `flush` whenever it renders a fresh frame; drained by the
     /// render-world extract system (`extract_tui_draws` in
@@ -354,9 +186,7 @@ pub struct Tui {
 }
 
 impl Tui {
-    /// Wrap an already-created [`TerminalTexture`]. This is the
-    /// manual-entity-management constructor; for ergonomic spawning see the
-    /// declarative [`TuiRequest`] component instead.
+    /// Wrap an already-created [`TerminalTexture`].
     pub fn from_texture_state(texture_state: TerminalTexture) -> Self {
         Self {
             texture_state,
@@ -368,18 +198,7 @@ impl Tui {
         }
     }
 
-    /// Request a new grid size. No GPU work happens at the call site - it's
-    /// applied on the next [`gpu_flush_system`](crate::bevy_plugin::gpu_flush_system)
-    /// pass (before that frame's flush), which recreates the destination
-    /// `Image` **in place at the same handle** (no `ImageNode`/material
-    /// re-pointing needed) and resizes ratatui's own buffers, forcing a
-    /// full redraw into the new texture. A no-op if `(cols, rows)` already
-    /// matches the current grid size.
-    ///
-    /// No auto-fit helper ships:
-    /// compute `cols`/`rows` yourself, typically from an `InputEvent::
-    /// Resize` event's pixel size and `Tui::size_px()`'s per-cell metrics
-    /// (see `examples/resize.rs` for the recipe).
+    /// Request a new grid size.
     pub fn request_resize(&mut self, cols: u16, rows: u16) {
         let (current_cols, current_rows) = self.grid_size();
         if (cols, rows) != (current_cols, current_rows) {
@@ -406,12 +225,7 @@ impl Tui {
     /// the new pixel size, update the backend's grid dimensions, and resize
     /// ratatui's own buffers immediately (rather than waiting for the next
     /// `Terminal::draw`'s `autoresize` to notice the mismatch) so the very
-    /// next `Tui::draw` call already sees the new grid. Returns the new
-    /// `(cols, rows)` if a resize was actually applied, for callers (the
-    /// plugin's `gpu_flush_system`) that also need to sync a sibling
-    /// `TerminalDimensions` component or recompute a `TuiKind::WorldQuad`
-    /// mesh - both are keyed off this same return value via bevy's
-    /// `Changed<T>` filters, not a separate signal.
+    /// next `Tui::draw` call already sees the new grid.
     pub(crate) fn apply_pending_resize(
         &mut self,
         images: &mut Assets<Image>,
@@ -421,26 +235,10 @@ impl Tui {
         let backend = self.texture_state.terminal.backend_mut();
         backend.resize(cols, rows);
 
-        // Drain whatever the backend currently holds (geometry from the
-        // last draw, at the pre-resize grid size) - rendering it against
-        // the freshly resized texture would show garbled, wrongly-scaled
-        // content for one frame, so it's discarded. Glyph rasterizations
-        // queue in the shared per-font state (`Fonts`), not in this
-        // payload, so there is nothing grid-size-dependent to preserve
-        // there. A payload not yet drained by `extract_tui_draws`
-        // (`self.pending_draw`) is simply overwritten - its geometry is
-        // equally stale.
         let mut payload = backend.take_draw_payload();
         payload.discard_stale_geometry();
         self.pending_draw = Some(payload);
 
-        // `backend.resize()` (above) already set `full_redraw_needed`, but
-        // the `take_draw_payload()` call just above consumed and cleared
-        // it while building the discarded payload. Re-arm it so the
-        // FIRST REAL DRAW after this resize also comes out full rather
-        // than partial - the destination texture was just recreated at the
-        // new size, so a `LoadOp::Load` partial has nothing valid to
-        // preserve yet.
         backend.force_full_redraw();
 
         self.texture_state
@@ -454,16 +252,7 @@ impl Tui {
         Some((cols, rows))
     }
 
-    /// Draw with ratatui. Touches no GPU state - renders into the backend
-    /// buffer and, if the ratatui diff actually changed at least one cell,
-    /// sets the dirty flag (a byte-identical redraw is a no-op past this
-    /// point: no GPU render, no copy, next frame). Cheap to call every
-    /// frame either way.
-    ///
-    /// Error handling: ratatui's `Terminal::draw` returns `io::Result`; this
-    /// crate cannot recover from a backend draw failure, so it does not
-    /// panic - but the first occurrence per `Tui` is logged via `warn!`
-    /// (further occurrences are suppressed to avoid per-frame log spam).
+    /// Draw with ratatui.
     pub fn draw(&mut self, f: impl FnOnce(&mut ratatui::Frame)) {
         match self.texture_state.terminal.draw(f) {
             Ok(_) => self.mark_dirty_if_changed(),
@@ -473,8 +262,7 @@ impl Tui {
 
     /// `draw()` variant handing the caller a `&mut HitRegions` alongside the
     /// `Frame`, so click regions are registered right next to the
-    /// `render_widget` call that draws them. Regions are cleared at the
-    /// start of each call - register fresh ones every draw.
+    /// `render_widget` call that draws them.
     pub fn draw_with_hits(&mut self, f: impl FnOnce(&mut ratatui::Frame, &mut HitRegions)) {
         self.hit_regions.clear();
         let hit_regions = &mut self.hit_regions;
@@ -529,20 +317,12 @@ impl Tui {
     }
 
     /// Read this terminal's current pixels back to the CPU, **blocking**
-    /// until the render world performs the copy. An explicit opt-in for
-    /// screenshots and tests only - the normal per-frame path never touches
-    /// the CPU at all; do not call this every frame. Returns tightly-packed
-    /// RGBA8 bytes. Goes through the render world via a request/response
-    /// channel (`TuiReadbackChannel` in `bevy_plugin.rs`) - there is no
-    /// main-world texture to read from directly.
+    /// until the render world performs the copy.
     pub fn read_back_blocking(&self, channel: &crate::bevy_plugin::TuiReadbackChannel) -> Vec<u8> {
         channel.request_blocking(self.texture_state.image_handle.id())
     }
 
     /// Called by [`gpu_flush_system`](crate::bevy_plugin::gpu_flush_system).
-    /// If dirty, extracts the CPU-computed draw payload from the backend and
-    /// stashes it for the render-world extract system to pick up; the
-    /// actual GPU render happens there, not here.
     pub(crate) fn flush(&mut self) {
         if self.dirty {
             let backend = self.texture_state.terminal.backend_mut();
@@ -567,9 +347,7 @@ impl Tui {
     }
 
     /// Drain the pending draw payload, if set, returning it alongside the
-    /// destination image's asset id. Called once per frame by the
-    /// render-world extract system (`extract_tui_draws` in
-    /// `bevy_plugin.rs`) via `ResMut<MainWorld>`.
+    /// destination image's asset id.
     pub(crate) fn take_pending_draw(
         &mut self,
     ) -> Option<(AssetId<Image>, crate::backend::TerminalDrawPayload)> {
@@ -580,40 +358,38 @@ impl Tui {
 
     /// Returns this terminal's font identity key, alongside any glyph
     /// rasterizations still pending upload to that font's shared atlas.
-    /// The upload list is frequently empty: whichever
-    /// terminal sharing a given font is visited first in a frame drains it
-    /// for all of them (see `Fonts::with_shared_cpu_state`). Called once
-    /// per `Tui` per frame by the render-world extract system
-    /// (`extract_tui_draws` in `bevy_plugin.rs`).
     pub(crate) fn take_shared_font_uploads(
         &self,
     ) -> (usize, Vec<(crate::utils::text_atlas::CacheRect, Vec<u8>)>) {
         let backend = self.texture_state.terminal.backend();
         (backend.font_key(), backend.take_shared_glyph_uploads())
     }
+
+    /// [`Self::take_shared_font_uploads`] for the color glyph atlas: its
+    /// texture size, and the queued rasterizations.
+    #[cfg(feature = "emoji")]
+    pub(crate) fn take_shared_color_uploads(
+        &self,
+    ) -> (
+        (u32, u32),
+        Vec<(crate::utils::text_atlas::CacheRect, Vec<u8>)>,
+    ) {
+        self.texture_state
+            .terminal
+            .backend()
+            .take_shared_color_uploads()
+    }
 }
 
 /// Marks an entity as the visible *surface* for a terminal, when the surface
 /// and the [`Tui`] component live on different entities (the "attach to an
-/// existing mesh" case, see [`AttachTerminal`]). For library-spawned
-/// terminals the surface and the `Tui` are the same entity (`tui == self`).
-///
-/// The input system reads this to remap `TerminalEvent::target` from the
-/// surface entity (where hit-testing happens, via `TerminalInput`/
-/// `TerminalDimensions`) to the `Tui` entity, so user event code never needs
-/// to know whether a terminal was library-spawned or attached.
+/// existing mesh" case, see [`AttachTerminal`]).
 #[derive(Component, Debug, Clone, Copy)]
 pub struct TuiSurface {
     pub tui: Entity,
 }
 
-// ============================================================================
-// Config struct + declarative spawning
-// ============================================================================
-
-/// Configuration for [`TuiRequest`]. A single struct instead of a long run
-/// of positional bools, so call sites don't need to annotate every argument
-/// with a comment to stay readable.
+/// Configuration for [`TuiRequest`].
 pub struct TerminalConfig {
     /// Pre-populate box-drawing, braille, and powerline glyphs.
     pub programmatic_glyphs: bool,
@@ -623,28 +399,20 @@ pub struct TerminalConfig {
     pub mouse: bool,
     /// Drawn once at creation time (before the entity's own draw system
     /// runs), so the very first presented frame already has real content
-    /// instead of the create-time fill color. (`Sync` bound because this
-    /// struct rides inside the `TuiRequest` component.)
+    /// instead of the create-time fill color.
     pub initial_draw: Option<Box<dyn FnOnce(&mut ratatui::Frame) + Send + Sync>>,
     /// Color shown before any content has been drawn (or, transiently,
-    /// mid-resize - see `Tui::request_resize`). Default opaque black
-    /// (`[0, 0, 0, 255]`).
+    /// mid-resize - see `Tui::request_resize`).
     pub initial_fill: [u8; 4],
     /// If `true`, cells with no explicit background (`ratatui::style::
     /// Color::Reset`, ratatui's own default) render with alpha 0 instead
     /// of an opaque fill color - letting a `TuiKind::WorldQuad` terminal
     /// with `alpha_mode: AlphaMode::Blend` show the scene through its
     /// background, or a `TuiKind::Ui` terminal show through to whatever is
-    /// behind its `Node`. Cells with an explicit background color (`Color::
-    /// Rgb`/`Indexed`/etc., including any of ratatui's named colors) are
-    /// unaffected - only `Reset` becomes transparent. Default `false`.
+    /// behind its `Node`.
     pub transparent_reset_bg: bool,
     /// Alpha/transparency mode for the material [`TuiKind::WorldQuad`]
-    /// builds. Default `AlphaMode::Opaque`; combine with
-    /// `transparent_reset_bg: true` for a HUD-style see-through screen.
-    /// Ignored by `TuiKind::Ui`/`Headless` (2D UI transparency is
-    /// controlled by `transparent_reset_bg` alone - `ImageNode` always
-    /// respects its texture's alpha).
+    /// builds.
     #[cfg(feature = "3d")]
     pub alpha_mode: AlphaMode,
 }
@@ -671,8 +439,7 @@ pub enum TuiFontSource {
     /// runtime bytes + [`Font::from_vec`](crate::fonts::Font::from_vec)).
     Ready(Arc<Fonts>),
     /// Load via the `AssetServer` (Wasm-safe - `std::fs::read` doesn't work
-    /// on Wasm). The request stays pending until the asset resolves; the
-    /// terminal then materializes with the font rendered at `size_px`.
+    /// on Wasm).
     Asset {
         handle: Handle<crate::fonts::TerminalFontAsset>,
         size_px: u32,
@@ -694,19 +461,7 @@ pub enum TuiKind {
     #[cfg(feature = "2d")]
     Ui,
     /// A 3D quad sized in **world units**: `height` in world units, width
-    /// follows the texture's pixel aspect ratio. The quad's visible face
-    /// normal is local `+Z` - orient it with an ordinary `Transform` on the
-    /// same entity, e.g. to face a camera:
-    /// `Transform::from_translation(pos).with_rotation(Quat::from_rotation_arc(Vec3::Z, camera_pos - pos))`.
-    /// (`Transform::looking_at` aligns local `-Z` with the target - the
-    /// *opposite* convention - and would show the quad's back.)
-    ///
-    /// The `Mesh3d` + `MeshMaterial3d<StandardMaterial>` (unlit, textured
-    /// with the terminal) are only inserted if the entity doesn't already
-    /// carry them - but for a fully custom mesh or material type, prefer
-    /// [`TuiKind::Headless`] plus your own surface entity (a custom
-    /// `MeshMaterial3d<M>` is a *different component type*, so the
-    /// `StandardMaterial` one would be inserted alongside it, not skipped).
+    /// follows the texture's pixel aspect ratio.
     #[cfg(feature = "3d")]
     WorldQuad { height: f32 },
     /// A `Tui` with no surface components of its own - for terminals whose
@@ -717,9 +472,7 @@ pub enum TuiKind {
 }
 
 /// Records a [`TuiKind::WorldQuad`] terminal's configured world-unit height,
-/// inserted at materialization. Read back by the plugin's resize handling
-/// (`gpu_flush_system`) to recompute the mesh's aspect ratio when the grid
-/// size (and thus the texture's pixel aspect ratio) changes.
+/// inserted at materialization.
 #[cfg(feature = "3d")]
 #[derive(Component, Clone, Copy)]
 pub(crate) struct WorldQuadHeight(pub(crate) f32);
@@ -728,26 +481,6 @@ pub(crate) struct WorldQuadHeight(pub(crate) f32);
 /// `Transform` / marker components you want on the terminal entity), and
 /// the plugin's `materialize_tui_requests` system does the rest - **your
 /// systems never touch `Assets<Image>` or any other render resource**.
-///
-/// ```ignore
-/// commands.spawn((
-///     TuiRequest::ui(80, 25, fonts),
-///     Node {
-///         position_type: PositionType::Absolute,
-///         right: Val::Px(20.0),
-///         top: Val::Px(20.0),
-///         ..default()
-///     },
-///     MyTerminalMarker,
-/// ));
-/// ```
-///
-/// The request materializes on the next frame (or once the font asset
-/// resolves, for [`TuiFontSource::Asset`]): `TuiRequest` is removed and the
-/// terminal components (`Tui`, `TerminalDimensions`, ...) are inserted.
-/// Query for `&mut Tui` with your marker as usual - just tolerate it not
-/// existing yet (`let Ok(..) = query.single_mut() else { return }`), which
-/// idiomatic bevy systems do anyway.
 #[derive(Component)]
 pub struct TuiRequest {
     pub cols: u16,
@@ -803,39 +536,19 @@ impl TuiRequest {
     }
 }
 
-/// Marker for [`TuiKind::Ui`] terminals. Requires `Node`: if the caller's
-/// own spawn tuple includes a `Node`, that one wins (bevy only auto-inserts
-/// a required component when the entity doesn't already have one);
-/// otherwise a default `Node` is inserted so the entity is still a valid UI
-/// node.
+/// Marker for [`TuiKind::Ui`] terminals.
 #[cfg(feature = "2d")]
 #[derive(Component, Default)]
 #[require(Node)]
 pub struct TuiUi;
 
-/// Plugin system backing [`TuiRequest`]. Registered automatically by
-/// `TerminalPlugin`, scheduled before `TerminalSystemSet::Input` so a
-/// terminal materialized this frame is visible to the same frame's input
-/// and user-draw systems.
-///
-/// For each entity with `TuiRequest` and without `Tui`: resolve the font
-/// ([`TuiFontSource::Asset`] requests stay pending until the asset loads -
-/// or are dropped with a `warn!` if the load fails), create the
-/// [`TerminalTexture`], insert the surface components for the request's
-/// [`TuiKind`], and remove the `TuiRequest`. User-supplied components win:
-/// surface components are inserted via `insert_if_new`, so a `Node`,
-/// `Transform`, `TerminalInput`, or (for `WorldQuad`) `Mesh3d`/
-/// `MeshMaterial3d<StandardMaterial>` already on the entity is kept.
+/// Plugin system backing [`TuiRequest`].
 pub(crate) fn materialize_tui_requests(
     mut commands: Commands,
     mut requests: Query<(Entity, &mut TuiRequest), Without<Tui>>,
     asset_server: Res<AssetServer>,
     font_assets: Res<Assets<crate::fonts::TerminalFontAsset>>,
     mut images: ResMut<Assets<Image>>,
-    // `Option`: these assets only exist once something registers them
-    // (bevy's PbrPlugin, normally) - a headless or UI-only app shouldn't
-    // fail this system's parameter validation over resources that only
-    // `TuiKind::WorldQuad` needs.
     #[cfg(feature = "3d")] mut meshes: Option<ResMut<Assets<Mesh>>>,
     #[cfg(feature = "3d")] mut materials: Option<ResMut<Assets<StandardMaterial>>>,
 ) {
@@ -856,7 +569,7 @@ pub(crate) fn materialize_tui_requests(
                         tracing::warn!("TuiRequest dropped: font asset failed to load");
                         commands.entity(entity).remove::<TuiRequest>();
                     }
-                    continue; // still loading - retry next frame
+                    continue;
                 }
             },
         };
@@ -925,7 +638,6 @@ pub(crate) fn materialize_tui_requests(
                 let material = materials.add(StandardMaterial {
                     base_color: Color::WHITE,
                     base_color_texture: Some(image_handle),
-                    // Terminal content should not depend on scene lighting.
                     unlit: true,
                     alpha_mode: request.config.alpha_mode,
                     double_sided: true,
@@ -943,33 +655,20 @@ pub(crate) fn materialize_tui_requests(
     }
 }
 
-// ============================================================================
-// Attaching a Tui to an existing mesh
-// ============================================================================
-
-/// Type-erased "insert this material" action. Never constructed directly -
-/// [`AttachMaterial::standard`]/[`AttachMaterial::custom`] build it. `Arc`
-/// (not `Box`) so `attach_terminal_system` can cheaply clone it out of a
-/// query item into a `Commands::queue` closure every re-claim attempt.
+/// Type-erased "insert this material" action.
 #[cfg(feature = "3d")]
 #[derive(Clone)]
 struct UntypedMaterialInsert(
     std::sync::Arc<dyn Fn(Handle<Image>, Entity, &mut World) + Send + Sync>,
 );
 
-/// How to material a [`AttachTerminal`]-marked mesh. Fully type-erased so
-/// `AttachTerminal` itself never needs a generic parameter - a generic
-/// `AttachTerminal<M>` would force every call site, query, and system to
-/// name `M`.
+/// How to material a [`AttachTerminal`]-marked mesh.
 #[cfg(feature = "3d")]
 pub struct AttachMaterial(UntypedMaterialInsert);
 
 #[cfg(feature = "3d")]
 impl AttachMaterial {
     /// Plain `StandardMaterial`, unlit, textured with the terminal.
-    /// `alpha_mode: AlphaMode::Blend` combined with the attached `Tui`'s
-    /// `TerminalConfig::transparent_reset_bg: true` shows the scene through
-    /// cells with no explicit background.
     pub fn standard(alpha_mode: AlphaMode) -> Self {
         Self::custom(move |image| StandardMaterial {
             base_color_texture: Some(image),
@@ -979,17 +678,7 @@ impl AttachMaterial {
         })
     }
 
-    /// Any material type. `factory` builds a concrete material `M` from the
-    /// terminal's image handle - no plugin registration needed for any `M`,
-    /// custom or `StandardMaterial`: the render-world render
-    /// (`render_tui_textures` in `bevy_plugin.rs`) writes directly into the
-    /// same GPU texture the material's bind group already references.
-    ///
-    /// `factory` is invoked at most once per entity even though
-    /// `attach_terminal_system` may call this action every frame while
-    /// re-claiming (see that function's doc comment): the built handle is
-    /// cached internally and reused on subsequent calls, so re-claiming
-    /// never mints duplicate material assets.
+    /// Any material type.
     pub fn custom<M: Material>(
         factory: impl Fn(Handle<Image>) -> M + Send + Sync + 'static,
     ) -> Self {
@@ -997,12 +686,6 @@ impl AttachMaterial {
         AttachMaterial(UntypedMaterialInsert(std::sync::Arc::new(
             move |image, entity, world| {
                 let mut cached = cached.lock().unwrap();
-                // Not `get_or_insert_with`: its closure would have to either
-                // borrow `image` (forcing a clone to hand `factory` an owned
-                // `Handle<Image>`) or `move` it, which would also move
-                // `world` out of this scope, breaking the `entity_mut` call
-                // below. Branching by hand lets the `None` arm move `image`
-                // into `factory` directly, with no clone.
                 let handle = match cached.as_ref() {
                     Some(handle) => handle.clone(),
                     None => {
@@ -1011,10 +694,6 @@ impl AttachMaterial {
                         handle
                     }
                 };
-                // `TuiAttached` records exactly the handle just installed, so
-                // `attach_terminal_system` can recognize its own claim next
-                // frame and skip the remove+insert archetype churn entirely
-                // (see that function's doc comment).
                 world.entity_mut(entity).insert((
                     MeshMaterial3d(handle.clone()),
                     TuiAttached {
@@ -1030,8 +709,7 @@ impl AttachMaterial {
 /// [`attach_terminal_system`] most recently installed on an
 /// [`AttachTerminal`]-marked entity, so it can tell "still ours" (no-op)
 /// apart from "the loader stomped us" (re-claim) without an archetype move
-/// on every settled frame. See that function's doc comment for the full
-/// picture.
+/// on every settled frame.
 #[cfg(feature = "3d")]
 #[derive(Component)]
 pub(crate) struct TuiAttached {
@@ -1039,25 +717,6 @@ pub(crate) struct TuiAttached {
 }
 
 /// Insert on a mesh entity (e.g. a glTF primitive) to attach a `Tui` to it.
-/// `attach_terminal_system` then:
-/// 1. builds (or re-fetches the cached) material via [`AttachMaterial`],
-///    handing it the terminal's `Handle<Image>`, and swaps out
-///    `MeshMaterial3d<StandardMaterial>`,
-/// 2. inserts `TuiSurface { tui }` + `TerminalInput` + `TerminalDimensions`
-///    (mouse picking works on any UV-mapped mesh, curved included; the input
-///    system remaps event targets through `TuiSurface`, so user event code
-///    is identical to the library-spawned case),
-/// 3. RE-CLAIMS only while the entity's current
-///    `MeshMaterial3d<StandardMaterial>` handle differs from the
-///    `TuiAttached` bookkeeping component's recorded handle (e.g. a glTF
-///    loader asynchronously re-inserting its own stock material over ours -
-///    see CLAUDE.md "Common Gotchas" #8) - once the installed handle is
-///    recognized as already ours, the entity is skipped with **no**
-///    archetype move at all, for [`AttachMaterial::custom`] targets of a
-///    type other than `StandardMaterial` (which naturally drop out of the
-///    query below once `MeshMaterial3d<StandardMaterial>` is gone) as well
-///    as [`AttachMaterial::standard`] (which keeps re-matching the query
-///    forever, but settles into true no-ops).
 #[cfg(feature = "3d")]
 #[derive(Component)]
 pub struct AttachTerminal {
@@ -1066,9 +725,7 @@ pub struct AttachTerminal {
     pub material: AttachMaterial,
 }
 
-/// Plugin system backing [`AttachTerminal`]. Registered automatically by
-/// `TerminalPlugin`. See `AttachTerminal`'s doc comment for the full
-/// behavior.
+/// Plugin system backing [`AttachTerminal`].
 #[cfg(feature = "3d")]
 pub(crate) fn attach_terminal_system(
     mut commands: Commands,
@@ -1082,11 +739,11 @@ pub(crate) fn attach_terminal_system(
 ) {
     for (surface_entity, attach, current_material, attached) in &to_attach {
         if attached.is_some_and(|a| a.material.id() == current_material.0.id().untyped()) {
-            continue; // already ours - no archetype churn
+            continue;
         }
 
         let Ok(tui) = terminals.get(attach.terminal) else {
-            continue; // Tui not spawned (yet) - try again next frame
+            continue;
         };
 
         let image = tui.image_handle().clone();
@@ -1116,10 +773,6 @@ pub(crate) fn attach_terminal_system(
     }
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
-
 #[cfg(test)]
 mod tui_flush_tests {
     use super::*;
@@ -1133,12 +786,6 @@ mod tui_flush_tests {
         Arc::new(Fonts::new(font, 16))
     }
 
-    /// A repeatedly-failing `draw()` logs its error only once per `Tui`,
-    /// not once per call - `log_draw_error` is the de-duplication gate this
-    /// asserts on directly (a real ratatui backend failure is impractical
-    /// to trigger from the outside, so this drives the same private method
-    /// `draw`/`draw_with_hits` call on error). Pure CPU - `TerminalTexture`
-    /// needs no `RenderDevice`/`RenderQueue`.
     #[test]
     fn draw_error_logged_only_once() {
         let mut images = Assets::<Image>::default();
@@ -1158,17 +805,10 @@ mod tui_flush_tests {
         let fake_err = || std::io::Error::other("simulated backend failure");
         tui.log_draw_error(fake_err());
         assert!(tui.draw_error_logged, "first error must flip the flag");
-        // Second call must not panic and must leave the flag set - the
-        // actual "only warn! once" behavior lives in the `if
-        // !self.draw_error_logged` guard inside `log_draw_error` itself.
         tui.log_draw_error(fake_err());
         assert!(tui.draw_error_logged);
     }
 
-    /// No-change skip (design point 7): redrawing byte-identical content
-    /// must not re-mark the terminal dirty, so `flush` performs no work on
-    /// the second call. Pure CPU - `draw()`'s dirty tracking is ratatui
-    /// buffer-diff logic, unrelated to the render world.
     #[test]
     fn identical_redraw_does_not_mark_dirty() {
         let mut images = Assets::<Image>::default();
@@ -1191,16 +831,11 @@ mod tui_flush_tests {
             );
         };
 
-        // First draw: empty -> red is definitely a change. (`dirty` starts
-        // `true` from the uninitialized-texture guard - draw+flush once to
-        // get to a clean baseline before testing the no-change skip.)
         tui.draw(paint_red);
         assert!(tui.dirty, "first draw onto an empty buffer must be dirty");
         tui.flush();
         assert!(!tui.dirty, "flush must clear dirty");
 
-        // Second draw: byte-identical content -> zero-cell diff -> must
-        // NOT re-mark dirty (this is the whole point of the optimization).
         tui.draw(paint_red);
         assert!(
             !tui.dirty,
@@ -1208,18 +843,6 @@ mod tui_flush_tests {
         );
     }
 
-    /// Draw once inside a real headless bevy render world, then read the
-    /// destination `Image` back via [`Tui::read_back_blocking`]. Exercises
-    /// the full pipeline -
-    /// `gpu_flush_system` -> `extract_tui_draws` -> `render_tui_textures` ->
-    /// `TerminalGpuState::render` -> `process_tui_readbacks` - end to end.
-    ///
-    /// `read_back_blocking` is a genuine blocking round-trip through the
-    /// render world's channel, so it must be called from a different thread
-    /// than the one driving `app.update()` - exactly like a real
-    /// application using `PipelinedRenderingPlugin`. Skips (rather than
-    /// fails) if no GPU adapter shows up within the bound, so CI does not
-    /// depend on GPU availability.
     #[test]
     fn flush_renders_drawn_content_synchronously() {
         use crate::bevy_plugin::TerminalPlugin;
@@ -1230,11 +853,6 @@ mod tui_flush_tests {
         app.add_plugins((
             bevy::app::TaskPoolPlugin::default(),
             bevy::asset::AssetPlugin::default(),
-            // `primary_window: None` - headless, no actual OS window - but
-            // still registers the window message types (`WindowResized` and
-            // friends) that both `window_resize_system` (always registered
-            // by `TerminalPlugin`) and bevy_render's own window-extraction
-            // systems read.
             bevy::window::WindowPlugin {
                 primary_window: None,
                 exit_condition: bevy::window::ExitCondition::DontExit,
@@ -1247,10 +865,6 @@ mod tui_flush_tests {
             bevy::image::ImagePlugin::default(),
             TerminalPlugin::display_only(),
         ));
-        // Ordinarily inserted by `bevy_camera::CameraPlugin` (part of
-        // `DefaultPlugins`, which this headless test intentionally doesn't
-        // pull in) - `bevy_render`'s own camera module only extracts it,
-        // it doesn't create it.
         app.init_resource::<bevy::camera::ClearColor>();
         app.finish();
         app.cleanup();
@@ -1317,8 +931,6 @@ mod tui_flush_tests {
         );
     }
 
-    /// Headless render app for GPU-backed tests, or `None` when this
-    /// environment has no GPU adapter.
     fn gpu_app() -> Option<App> {
         use crate::bevy_plugin::TerminalPlugin;
         use bevy::render::renderer::RenderDevice;
@@ -1354,7 +966,6 @@ mod tui_flush_tests {
         None
     }
 
-    /// Runs `app` until the terminal on `entity` has been read back.
     fn read_back(app: &mut App, entity: Entity) -> Vec<u8> {
         use crate::bevy_plugin::TuiReadbackChannel;
 
@@ -1371,11 +982,6 @@ mod tui_flush_tests {
         panic!("readback never completed - render world stalled");
     }
 
-    /// GPU-backed check of the single-pass cell compositor end to end:
-    /// coverage masks reach the R8 atlas, each cell samples its own slot,
-    /// and background + glyph resolve to the right pixels - including a
-    /// second glyph in one cell (an overlay instance) keeping the cell's
-    /// background instead of overwriting it.
     #[test]
     fn cells_resolve_glyph_and_background_in_one_pass() {
         let Some(mut app) = gpu_app() else {
@@ -1401,31 +1007,26 @@ mod tui_flush_tests {
             let mut tui = Tui::from_texture_state(texture_state);
             tui.draw(|frame| {
                 let buf = frame.buffer_mut();
-                // Full block: coverage 1 everywhere -> pure foreground.
                 buf[(0, 0)].set_symbol("█").set_style(
                     Style::default()
                         .fg(RatatuiColor::Rgb(0, 255, 0))
                         .bg(RatatuiColor::Rgb(255, 0, 0)),
                 );
-                // Space: coverage 0 everywhere -> pure background.
                 buf[(1, 0)].set_symbol(" ").set_style(
                     Style::default()
                         .fg(RatatuiColor::Rgb(0, 255, 0))
                         .bg(RatatuiColor::Rgb(0, 0, 255)),
                 );
-                // A letter: both.
                 buf[(2, 0)].set_symbol("M").set_style(
                     Style::default()
                         .fg(RatatuiColor::Rgb(255, 255, 255))
                         .bg(RatatuiColor::Rgb(0, 0, 0)),
                 );
-                // Two glyphs in one cell: a cell instance plus an overlay.
-                buf[(3, 0)].set_symbol("i_").set_style(
+                buf[(3, 0)].set_symbol("i\u{331}").set_style(
                     Style::default()
                         .fg(RatatuiColor::Rgb(255, 255, 0))
                         .bg(RatatuiColor::Rgb(255, 0, 255)),
                 );
-                // Left at the default style: reset colors.
                 buf[(4, 0)].set_symbol(" ");
             });
             app.world_mut().spawn(tui).id()
@@ -1456,15 +1057,12 @@ mod tui_flush_tests {
         assert!(letter.contains(&[0, 0, 0, 255]));
 
         let stacked = cell(3);
-        // Thin strokes may never reach full coverage: "mostly foreground".
         let is_fg = |px: &[u8; 4]| px[1] > 128;
         let is_bg = |px: &[u8; 4]| *px == [255, 0, 255, 255];
         assert!(
             stacked.iter().any(is_fg) && stacked.iter().any(is_bg),
             "expected glyph and background pixels, got {stacked:?}"
         );
-        // The underscore sits on the bottom rows, the `i` above it: both
-        // glyphs must have left foreground pixels.
         let rows_with_fg: Vec<usize> = (0..cell_h)
             .filter(|y| stacked[y * cell_w..(y + 1) * cell_w].iter().any(is_fg))
             .collect();
@@ -1476,14 +1074,6 @@ mod tui_flush_tests {
         assert!(cell(4).iter().all(|px| *px == [0, 0, 0, 255]));
     }
 
-    /// Partial redraw, GPU-backed: draw two rows (red,
-    /// green), read back the fully-rendered texture, then redraw ONLY the
-    /// second row (green -> blue) and read back again. The first row's
-    /// pixels must be byte-identical across both readbacks (proving
-    /// `LoadOp::Load` actually preserved them - a `LoadOp::Clear` here
-    /// would wipe row 0 on the second render), and the second row must
-    /// show blue instead of green. Same skip-if-no-GPU policy as
-    /// `flush_renders_drawn_content_synchronously`.
     #[test]
     fn flush_renders_partial_redraw_correctly() {
         use crate::bevy_plugin::TerminalPlugin;
@@ -1574,9 +1164,6 @@ mod tui_flush_tests {
 
         let pixels_before = request_and_wait(&mut app, &channel);
 
-        // Redraw with row 0 UNCHANGED (same widget, same style - ratatui's
-        // own diff must see zero changed cells there) and row 1 changed
-        // from green to blue.
         app.world_mut()
             .get_mut::<Tui>(entity)
             .unwrap()
@@ -1591,9 +1178,6 @@ mod tui_flush_tests {
              a LoadOp::Clear bug here would wipe them instead of preserving them"
         );
 
-        // Named-color RGB values (colors.rs `named::GREEN`/`BLUE`) - bg
-        // quads are solid REPLACE-blended fills with no antialiasing, so
-        // an exact match is reliable away from glyph ink.
         let row1_before = &pixels_before[row0_bytes_len..];
         let row1_after = &pixels_after[row0_bytes_len..];
         assert!(
@@ -1613,13 +1197,191 @@ mod tui_flush_tests {
             "row 1 must show blue after being redrawn"
         );
     }
-}
 
-// ============================================================================
-// Test: TuiRequest with TuiFontSource::Asset materializes once the font
-// asset finishes loading. No GPU needed - materialization
-// is pure CPU + Assets<Image>; the app here has no RenderPlugin at all.
-// ============================================================================
+    #[cfg(feature = "emoji")]
+    mod emoji_gpu {
+        use super::*;
+
+        const COLRV1: &[u8] = include_bytes!("backend/testdata/noto_colrv1_subset.ttf");
+        const CBDT: &[u8] = include_bytes!("backend/testdata/noto_cbdt_subset.ttf");
+        const FIXTURES: [&[u8]; 2] = [COLRV1, CBDT];
+
+        const COLS: usize = 6;
+        const BG: [u8; 3] = [10, 20, 200];
+        const MAGENTA: RatatuiColor = RatatuiColor::Rgb(255, 0, 255);
+
+        fn emoji_fonts(emoji: &'static [u8]) -> Arc<Fonts> {
+            let mut fonts = Fonts::new(
+                Font::new(include_bytes!(
+                    "../examples/assets/fonts/Mplus1Code-Regular.ttf"
+                ))
+                .expect("M+ parses"),
+                16,
+            );
+            fonts.add_emoji_fonts([Font::new(emoji).expect("emoji fixture parses")]);
+            Arc::new(fonts)
+        }
+
+        fn spawn(
+            app: &mut App,
+            fonts: Arc<Fonts>,
+            transparent: bool,
+            paint: impl FnOnce(&mut ratatui::buffer::Buffer),
+        ) -> Entity {
+            let mut images = app.world_mut().resource_mut::<Assets<Image>>();
+            let texture_state = TerminalTexture::create(
+                COLS as u16,
+                3,
+                fonts,
+                false,
+                transparent,
+                [0, 0, 0, 255],
+                &mut images,
+            )
+            .expect("failed to create terminal texture");
+            let mut tui = Tui::from_texture_state(texture_state);
+            tui.draw(|frame| paint(frame.buffer_mut()));
+            app.world_mut().spawn(tui).id()
+        }
+
+        fn paint(buf: &mut ratatui::buffer::Buffer) {
+            let blue = Style::default()
+                .fg(RatatuiColor::White)
+                .bg(RatatuiColor::Rgb(BG[0], BG[1], BG[2]));
+            buf.set_string(0, 0, "a", Style::default());
+            buf.set_string(1, 0, "\u{1F600}", blue);
+            buf.set_string(3, 0, "b", Style::default());
+            buf.set_string(0, 1, "\u{1F600}\u{301}", Style::default().fg(MAGENTA));
+            buf.set_string(0, 2, "\u{1F600}", Style::default().fg(MAGENTA));
+        }
+
+        fn block(pixels: &[u8], fonts: &Fonts, col: usize, row: usize, w: usize) -> Vec<[u8; 4]> {
+            let (cw, ch) = (fonts.min_width_px() as usize, fonts.height_px() as usize);
+            (0..ch)
+                .flat_map(|y| (0..w * cw).map(move |x| (x, y)))
+                .map(|(x, y)| {
+                    let i = ((row * ch + y) * COLS * cw + col * cw + x) * 4;
+                    [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
+                })
+                .collect()
+        }
+
+        fn is_magenta(px: &[u8; 4]) -> bool {
+            px[0] > 150 && px[2] > 120 && px[1] < 110
+        }
+
+        #[test]
+        fn a_color_glyph_has_its_own_colors_over_the_cell_background() {
+            for emoji in FIXTURES {
+                let Some(mut app) = gpu_app() else {
+                    return;
+                };
+                let fonts = emoji_fonts(emoji);
+                let entity = spawn(&mut app, Arc::clone(&fonts), false, paint);
+                let pixels = read_back(&mut app, entity);
+                let (cw, ch) = (fonts.min_width_px() as usize, fonts.height_px() as usize);
+                assert_eq!(pixels.len(), COLS * cw * 3 * ch * 4);
+
+                let face = block(&pixels, &fonts, 1, 0, 2);
+                assert!(
+                    face.iter().any(|px| {
+                        let max = px[0].max(px[1]).max(px[2]);
+                        let min = px[0].min(px[1]).min(px[2]);
+                        max - min > 60
+                    }),
+                    "an emoji has pixels whose R, G and B differ"
+                );
+                let bg = [BG[0], BG[1], BG[2], 255];
+                for corner in [0, 2 * cw - 1, (ch - 1) * 2 * cw, ch * 2 * cw - 1] {
+                    assert_eq!(face[corner], bg, "corner {corner}");
+                }
+
+                for col in [0, 3] {
+                    let letter = block(&pixels, &fonts, col, 0, 1);
+                    assert!(letter.iter().any(|px| px[1] > 200), "col {col}: ink");
+                    assert!(letter.contains(&[0, 0, 0, 255]), "col {col}: background");
+                }
+            }
+        }
+
+        #[test]
+        fn a_combining_mark_is_drawn_in_the_text_color_on_top_of_the_emoji() {
+            for emoji in FIXTURES {
+                let Some(mut app) = gpu_app() else {
+                    return;
+                };
+                let fonts = emoji_fonts(emoji);
+                let entity = spawn(&mut app, Arc::clone(&fonts), false, paint);
+                let pixels = read_back(&mut app, entity);
+
+                let plain = block(&pixels, &fonts, 0, 2, 2);
+                let marked = block(&pixels, &fonts, 0, 1, 2);
+                assert!(
+                    !plain.iter().any(is_magenta),
+                    "the emoji alone has no magenta"
+                );
+                assert!(
+                    marked.iter().any(is_magenta),
+                    "the mark is in the fg color, so the overlay draw is back on the R8 atlas"
+                );
+                let differing = |px: &&[u8; 4]| px[0].abs_diff(px[2]) > 60;
+                assert!(marked.iter().filter(differing).count() > 20);
+            }
+        }
+
+        #[test]
+        fn a_transparent_reset_background_shows_at_the_glyph_corners() {
+            for emoji in FIXTURES {
+                let Some(mut app) = gpu_app() else {
+                    return;
+                };
+                let fonts = emoji_fonts(emoji);
+                let entity = spawn(&mut app, Arc::clone(&fonts), true, |buf| {
+                    buf.set_string(0, 0, "\u{1F600}", Style::default());
+                });
+                let pixels = read_back(&mut app, entity);
+                let (cw, ch) = (fonts.min_width_px() as usize, fonts.height_px() as usize);
+                let face = block(&pixels, &fonts, 0, 0, 2);
+                for corner in [0, 2 * cw - 1, (ch - 1) * 2 * cw, ch * 2 * cw - 1] {
+                    assert_eq!(face[corner][3], 0, "corner {corner}");
+                }
+                assert!(face.iter().any(|px| px[3] == 255), "the face is opaque");
+            }
+        }
+
+        #[test]
+        fn a_partial_redraw_leaves_the_emoji_of_other_rows_intact() {
+            for emoji in FIXTURES {
+                let Some(mut app) = gpu_app() else {
+                    return;
+                };
+                let fonts = emoji_fonts(emoji);
+                let entity = spawn(&mut app, Arc::clone(&fonts), false, paint);
+                let before = read_back(&mut app, entity);
+
+                app.world_mut()
+                    .get_mut::<Tui>(entity)
+                    .unwrap()
+                    .draw(|frame| {
+                        paint(frame.buffer_mut());
+                        frame.buffer_mut().set_string(0, 2, "xy", Style::default());
+                    });
+                let after = read_back(&mut app, entity);
+
+                let row_bytes =
+                    fonts.height_px() as usize * COLS * fonts.min_width_px() as usize * 4;
+                assert_eq!(before[..2 * row_bytes], after[..2 * row_bytes]);
+                assert_ne!(before[2 * row_bytes..], after[2 * row_bytes..]);
+                assert!(
+                    block(&after, &fonts, 1, 0, 2)
+                        .iter()
+                        .any(|px| px[0].abs_diff(px[2]) > 60),
+                    "the emoji is still drawn"
+                );
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod tui_request_tests {
@@ -1631,15 +1393,10 @@ mod tui_request_tests {
         let mut app = App::new();
         app.add_plugins((
             bevy::app::TaskPoolPlugin::default(),
-            // Test fixture fonts live in examples/assets/ (shared with the
-            // examples, see examples/retro_crt.rs's `build_app`), not the
-            // AssetPlugin default `assets/` relative to the crate root.
             bevy::asset::AssetPlugin {
                 file_path: "examples/assets".into(),
                 ..default()
             },
-            // Headless: registers the window message types
-            // `window_resize_system` reads, without an OS window.
             bevy::window::WindowPlugin {
                 primary_window: None,
                 exit_condition: bevy::window::ExitCondition::DontExit,
@@ -1651,8 +1408,6 @@ mod tui_request_tests {
         app.finish();
         app.cleanup();
 
-        // Spawn the request BEFORE the font has loaded - the async load has
-        // not even been polled yet at this point.
         let handle = app
             .world()
             .resource::<AssetServer>()
@@ -1694,8 +1449,6 @@ mod tui_request_tests {
     }
 }
 
-// ============================================================================
-// Test: attach_terminal_system settles into zero archetype churn.
 //
 // Component add/remove always re-stamps bevy's per-component change tick,
 // even when the reinserted value is identical - so "no remove+insert
@@ -1707,7 +1460,6 @@ mod tui_request_tests {
 // the change tick can, since it records *when* the value was last written,
 // not just *what* the current component set is). Pure `World` +
 // `RunSystemOnce`, no App/GPU needed.
-// ============================================================================
 
 #[cfg(all(test, feature = "3d"))]
 mod attach_churn_tests {
@@ -1732,9 +1484,6 @@ mod attach_churn_tests {
         };
         let tui_entity = world.spawn(Tui::from_texture_state(texture)).id();
 
-        // Simulate a mesh entity that already carries a stock material, as
-        // e.g. a glTF loader would have inserted before `AttachTerminal`
-        // gets a chance to claim it.
         let placeholder = world
             .resource_mut::<Assets<StandardMaterial>>()
             .add(StandardMaterial::default());
@@ -1761,10 +1510,6 @@ mod attach_churn_tests {
             .expect("surface entity must carry a MeshMaterial3d<StandardMaterial>")
             .last_changed();
 
-        // A real per-frame Update advances the world's change tick between
-        // system runs - do the same here so a spurious re-insert on the
-        // second run would actually get a *different* tick stamped, not
-        // coincidentally the same one.
         world.increment_change_tick();
 
         world
@@ -1784,11 +1529,6 @@ mod attach_churn_tests {
         );
     }
 }
-
-// ============================================================================
-// Test: runtime resize. Pure CPU + Assets<Image>, no GPU/App needed -
-// `TerminalTexture::resize`/`Tui::apply_pending_resize` touch neither.
-// ============================================================================
 
 #[cfg(test)]
 mod resize_tests {
@@ -1852,17 +1592,13 @@ mod resize_tests {
         .expect("failed to create terminal texture");
         let mut tui = Tui::from_texture_state(texture);
 
-        tui.request_resize(4, 2); // same as creation size
+        tui.request_resize(4, 2);
         assert!(
             tui.apply_pending_resize(&mut images).is_none(),
             "requesting the current grid size must not queue a resize"
         );
     }
 }
-
-// ============================================================================
-// Test: HitRegions. Pure CPU, no bevy/GPU needed at all.
-// ============================================================================
 
 #[cfg(test)]
 mod hit_regions_tests {
@@ -1889,8 +1625,8 @@ mod hit_regions_tests {
     #[test]
     fn last_registered_wins_on_overlap() {
         let mut regions = HitRegions::default();
-        regions.add(0u64, Rect::new(0, 0, 10, 10)); // A: (0,0)-(9,9)
-        regions.add(1u64, Rect::new(5, 5, 10, 10)); // B: (5,5)-(14,14), overlaps A at (5,5)-(9,9)
+        regions.add(0u64, Rect::new(0, 0, 10, 10));
+        regions.add(1u64, Rect::new(5, 5, 10, 10));
 
         assert_eq!(
             regions.hit_at::<WidgetId>((6, 6)),
@@ -1907,8 +1643,8 @@ mod hit_regions_tests {
     #[test]
     fn decode_failure_returns_none_without_falling_through() {
         let mut regions = HitRegions::default();
-        regions.add(0u64, Rect::new(0, 0, 10, 10)); // A, decodes fine
-        regions.add(99u64, Rect::new(0, 0, 10, 10)); // topmost, same area, undecodable id
+        regions.add(0u64, Rect::new(0, 0, 10, 10));
+        regions.add(99u64, Rect::new(0, 0, 10, 10));
 
         assert_eq!(
             regions.hit_at::<WidgetId>((5, 5)),
@@ -1946,16 +1682,6 @@ mod hit_regions_tests {
     }
 }
 
-// ============================================================================
-// CPU hot-path micro-benchmark (no GPU, no App). `#[ignore]`d - run with:
-//   cargo test --release --lib cpu_hot_path -- --ignored --nocapture
-// Times the whole main-world cost of a dirty frame: ratatui's diff +
-// `Backend::draw`/`flush` (shaping, atlas lookups, geometry) inside
-// `Tui::draw`, then `Tui::flush` (payload assembly) and the extract-side
-// drains. Workloads write straight into the frame buffer so widget layout
-// cost stays out of the numbers.
-// ============================================================================
-
 #[cfg(test)]
 mod perf_bench {
     use super::*;
@@ -1968,15 +1694,12 @@ mod perf_bench {
     const FRAMES: u32 = 600;
     const TEXT: &[u8] = b"The quick brown fox jumps over the lazy dog. 0123456789 +-*/=<>[]{}() ";
 
-    /// Times `paint` under both shaping modes.
     fn run(name: &str, mut paint: impl FnMut(u32, &mut ratatui::buffer::Buffer)) {
         for shaping in [crate::fonts::Shaping::Row, crate::fonts::Shaping::Cell] {
             run_with(name, shaping, false, &mut paint);
         }
     }
 
-    /// [`run`], with fusion-pixel as a fallback font after M+: its Private
-    /// Use Area glyphs and arrows stand in for a symbol font's.
     fn run_symbols(name: &str, mut paint: impl FnMut(u32, &mut ratatui::buffer::Buffer)) {
         for shaping in [crate::fonts::Shaping::Row, crate::fonts::Shaping::Cell] {
             run_with(name, shaping, true, &mut paint);
@@ -1989,7 +1712,6 @@ mod perf_bench {
         symbol_font: bool,
         paint: &mut impl FnMut(u32, &mut ratatui::buffer::Buffer),
     ) {
-        // `CPU_HOT_PATH=<workload>[:<Row|Cell>]` runs only that workload.
         if let Ok(only) = std::env::var("CPU_HOT_PATH") {
             let (workload, mode) = only.split_once(':').unwrap_or((&only, ""));
             if workload != name || (!mode.is_empty() && mode != format!("{shaping:?}")) {
@@ -2016,7 +1738,6 @@ mod perf_bench {
 
         let mut draw = Duration::ZERO;
         let mut take = Duration::ZERO;
-        // Warm-up frames populate the glyph atlas / plan cache.
         let frames = std::env::var("CPU_HOT_PATH_FRAMES")
             .ok()
             .and_then(|f| f.parse().ok())
@@ -2051,8 +1772,6 @@ mod perf_bench {
     #[test]
     #[ignore = "benchmark - run explicitly with --ignored --nocapture"]
     fn cpu_hot_path() {
-        // Every cell's text and colors change every frame (the text scrolls,
-        // so row contents recur).
         run("full_text", |n, buf| {
             for y in 0..ROWS {
                 for x in 0..COLS {
@@ -2065,8 +1784,6 @@ mod perf_bench {
                 }
             }
         });
-        // The same, with bold and italic words: with `bold_italic_fonts`
-        // every style change starts a new font run.
         run("styled_text", |n, buf| {
             use ratatui::style::Modifier;
             const STYLES: [Modifier; 4] = [
@@ -2087,8 +1804,6 @@ mod perf_bench {
                 }
             }
         });
-        // Worst case for any text cache: every row is new, never-seen text
-        // every frame (pseudo-random printable ASCII).
         run("unique_text", |n, buf| {
             let mut state = n.wrapping_mul(2654435761).wrapping_add(12345);
             for y in 0..ROWS {
@@ -2100,7 +1815,6 @@ mod perf_bench {
                 }
             }
         });
-        // examples/benchmark.rs's gradient: one block glyph, colors scroll.
         run("gradient", |n, buf| {
             for y in 0..ROWS {
                 for x in 0..COLS {
@@ -2111,7 +1825,6 @@ mod perf_bench {
                 }
             }
         });
-        // Text stays put, only colors change (highlight/selection movement).
         run("colors_only", |n, buf| {
             for y in 0..ROWS {
                 for x in 0..COLS {
@@ -2122,7 +1835,6 @@ mod perf_bench {
                 }
             }
         });
-        // Static screen with one live row (a clock / counter / log tail).
         run("one_row", |n, buf| {
             for y in 0..ROWS {
                 for x in 0..COLS {
@@ -2131,8 +1843,6 @@ mod perf_bench {
                 }
             }
         });
-        // A file list: every row is an icon, a blank, a name and an arrow,
-        // scrolling every frame.
         run_symbols("symbols", |n, buf| {
             for y in 0..ROWS {
                 let i = (y as u32 + n) as usize;
@@ -2148,7 +1858,6 @@ mod perf_bench {
                 }
             }
         });
-        // Nothing changes at all.
         run("static", |_, buf| {
             for y in 0..ROWS {
                 for x in 0..COLS {

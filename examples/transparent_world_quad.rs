@@ -1,13 +1,4 @@
 //! Transparent `TuiKind::WorldQuad` — a HUD-style see-through screen.
-//!
-//! Combines `TerminalConfig::alpha_mode: AlphaMode::Blend` with
-//! `transparent_reset_bg: true`: cells with no explicit background
-//! (`ratatui::style::Color::Reset`, ratatui's own default) render with
-//! alpha 0, so the colorful spinning cube behind the terminal shows through
-//! everywhere except the bordered panel (which sets an explicit
-//! background) and the text itself.
-//!
-//! Run with: `cargo run --example transparent_world_quad`
 
 use bevy::prelude::*;
 use bevy_tui_texture::prelude::*;
@@ -56,8 +47,6 @@ fn setup(
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.6, 0.4, 0.0)),
     ));
 
-    // A colorful cube behind the screen - visible through the terminal's
-    // transparent (Color::Reset) background cells once the screen is drawn.
     commands.spawn((
         Mesh3d(meshes.add(Cuboid::new(2.5, 2.5, 2.5))),
         MeshMaterial3d(materials.add(StandardMaterial {
@@ -103,8 +92,6 @@ fn render_terminal(mut screens: Query<&mut Tui, With<ScreenTerminal>>) {
         let area = frame.area();
         let rows = Layout::vertical([Constraint::Length(4), Constraint::Min(0)]).split(area);
 
-        // An explicit background (not Reset) - stays opaque even with
-        // transparent_reset_bg enabled, since only Color::Reset is affected.
         let panel = Paragraph::new("see the cube\nthrough the gaps")
             .style(
                 Style::default()
@@ -119,7 +106,6 @@ fn render_terminal(mut screens: Query<&mut Tui, With<ScreenTerminal>>) {
             );
         frame.render_widget(panel, rows[0]);
 
-        // No background set (Color::Reset, ratatui's default) - transparent.
         let floating_text = Paragraph::new("floating text\nno background at all")
             .style(Style::default().fg(RatatuiColor::Yellow).bold())
             .alignment(Alignment::Center);

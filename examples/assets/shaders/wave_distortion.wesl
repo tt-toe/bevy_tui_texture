@@ -1,9 +1,3 @@
-// Wave Distortion Shader
-// Vertex shader that deforms the mesh with:
-// - Sine wave displacement
-// - Ripple effects from center
-// - Animated movement
-
 import bevy_pbr::render::{
     mesh_functions,
     forward_io::{Vertex, VertexOutput},
@@ -25,32 +19,25 @@ fn vertex(vertex: Vertex) -> VertexOutput {
     var position = vertex.position;
 
     if effect_enabled > 0.5 {
-        // Normalized coordinates (-1 to 1)
-        let x = position.x / 2.0; // Assuming plane width is 4.0
-        let y = position.y / 1.5; // Assuming plane height is 3.0
+        let x = position.x / 2.0;
+        let y = position.y / 1.5;
 
-        // Sine wave along X axis
         let wave_x = sin(x * wave_frequency + time * 2.0) * wave_amplitude;
 
-        // Ripple from center
         let dist = length(vec2<f32>(x, y));
         let ripple = sin(dist * 10.0 - time * 3.0) * wave_amplitude * 0.3;
 
-        // Combine effects
         position.z += wave_x + ripple;
 
-        // Add slight Y displacement for more dynamic effect
         position.y += sin(x * wave_frequency * 0.5 + time) * wave_amplitude * 0.2;
     }
 
-    // Transform to world space
     var world_from_local = mesh_functions::get_world_from_local(vertex.instance_index);
     let world_position = mesh_functions::mesh_position_local_to_world(world_from_local, vec4<f32>(position, 1.0));
 
     out.position = position_world_to_clip(world_position.xyz);
     out.world_position = world_position;
 
-    // Pass through normals and UVs
     out.world_normal = mesh_functions::mesh_normal_local_to_world(
         vertex.normal,
         vertex.instance_index
@@ -71,7 +58,6 @@ fn vertex(vertex: Vertex) -> VertexOutput {
 fn fragment(
     mesh: VertexOutput,
 ) -> @location(0) vec4<f32> {
-    // Simple texture sampling
     let color = textureSample(terminal_texture, terminal_sampler, mesh.uv);
     return color;
 }

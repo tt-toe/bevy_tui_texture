@@ -1,20 +1,4 @@
 //! `Tui::request_resize` — following the window size live.
-//!
-//! Demonstrates the runtime-resize recipe (no auto-fit helper ships - see
-//! the doc comment on `Tui::request_resize`):
-//! 1. listen for `InputEvent::Resize { pixels }` (already broadcast to
-//!    every terminal by the plugin's `window_resize_system`),
-//! 2. convert to `cols`/`rows` using the same font metrics the terminal was
-//!    created with,
-//! 3. call `Tui::request_resize(cols, rows)` - no GPU work at the call site,
-//!    applied on the next `gpu_flush_system` pass (one frame of latency).
-//!
-//! The terminal fills the window and shows a live cols×rows readout plus a
-//! click counter, so resizing the window and then clicking proves both the
-//! resize itself and the mouse coordinate mapping stay correct afterward
-//! (`TerminalDimensions` is kept in sync by the plugin automatically).
-//!
-//! Run with: `cargo run --example resize`
 
 use bevy::prelude::*;
 use bevy_tui_texture::prelude::*;
@@ -69,9 +53,6 @@ fn setup(mut commands: Commands) {
         16,
     ));
 
-    // Initial grid: an arbitrary starting size - the first window-resize
-    // event (bevy fires one on startup) immediately corrects it to match
-    // the actual window.
     commands.spawn((
         TuiRequest::ui(80, 25, fonts.clone()),
         Node {
@@ -85,9 +66,7 @@ fn setup(mut commands: Commands) {
     commands.insert_resource(TerminalFonts(fonts));
 }
 
-/// The resize recipe: pixels -> cols/rows -> `request_resize`. Runs in
-/// `UserUpdate`, same as any other draw-adjacent system - resizing takes
-/// no render resources and does no GPU work at the call site.
+/// The resize recipe: pixels -> cols/rows -> `request_resize`.
 fn handle_resize(
     mut events: MessageReader<TerminalEvent>,
     fonts: Res<TerminalFonts>,

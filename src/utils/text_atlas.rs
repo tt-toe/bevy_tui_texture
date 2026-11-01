@@ -19,8 +19,7 @@ pub(crate) struct Key {
 
 /// One hasher write per lookup instead of one per field: the font id is
 /// already a random 64-bit hash, so the small fields are folded into it,
-/// each in its own bits. Keys that differ only in their font still differ
-/// after the XOR; a coincidence across fonts is a mere collision.
+/// each in its own bits.
 impl std::hash::Hash for Key {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         let small =
@@ -68,12 +67,6 @@ struct Slot {
 
 /// CPU-side index of the glyph atlas: which fixed-size slot each glyph
 /// occupies, and which slot to reuse once the atlas is full.
-///
-/// A lookup is the hot path of every flush - it runs once per glyph of
-/// every reshaped row - so a hit costs one hash probe plus one store: the
-/// slot is stamped with the current flush's epoch instead of being relinked
-/// to the front of a recency list. Eviction (the rare path, only once the
-/// atlas is full) is a clock sweep over those stamps.
 #[derive(Debug)]
 pub(crate) struct Atlas {
     index: HashMap<Key, u32>,
@@ -91,10 +84,7 @@ pub(crate) struct Atlas {
     /// Where the next eviction sweep starts.
     hand: u32,
 
-    /// Bumped every time a slot is reassigned to a different key. A cached
-    /// row's atlas rects are only trustworthy as long as no reassignment
-    /// has happened since they were recorded; comparing this counter is how
-    /// `BevyTerminalBackend::flush` (the only reader) detects that.
+    /// Bumped every time a slot is reassigned to a different key.
     generation: u64,
 }
 
@@ -154,8 +144,6 @@ impl Atlas {
             });
             self.slots.len() as u32 - 1
         } else {
-            // Reassigning an existing slot to a new key - any row geometry
-            // caching that slot's old rect is now stale.
             self.generation += 1;
             let slot = self.evict();
             self.index.remove(&self.slots[slot as usize].key);
@@ -171,14 +159,9 @@ impl Atlas {
 
     /// Picks the slot to reuse, sweeping from the clock hand: preferably
     /// one no flush has touched for a while, otherwise any slot the current
-    /// flush hasn't used. Only when every slot is in use by the current
-    /// flush (more distinct glyphs on screen than the atlas holds) does it
-    /// take one of those - the generation bump in `get` makes the affected
-    /// rows reshape.
+    /// flush hasn't used.
     fn evict(&mut self) -> u32 {
         let count = self.slots.len() as u32;
-        // "Stale" = untouched by this flush and the one before it, so a
-        // glyph that merely skipped one frame isn't the first to go.
         for stale_before in [self.epoch.saturating_sub(1), self.epoch] {
             for step in 0..count {
                 let slot = (self.hand + step) % count;
@@ -226,7 +209,6 @@ mod tests {
         );
         let mut atlas = Atlas::new(&fonts, 24, 24);
 
-        // Get the correct width and height from the fonts
         let char_width = fonts.min_width_px();
         let char_height = fonts.height_px();
 
@@ -275,7 +257,6 @@ mod tests {
             24,
         );
         let (w, h) = (fonts.min_width_px(), fonts.height_px());
-        // Room for exactly 4 entries (2 x 2 slots of `2w` x `h`).
         (Atlas::new(&fonts, w * 4, h * 2), w, h)
     }
 
@@ -286,7 +267,6 @@ mod tests {
 
         atlas.begin_flush();
         let rects: Vec<_> = (0..4).map(|glyph| *atlas.get(&key(glyph), w, h)).collect();
-        // Two more flushes keep using everything except glyph 2.
         for _ in 0..2 {
             atlas.begin_flush();
             for glyph in [0, 1, 3] {
@@ -312,7 +292,6 @@ mod tests {
         for glyph in [0, 1, 2] {
             atlas.get(&key(glyph), w, h);
         }
-        // Only glyph 3 is unused by this flush - it must be the one replaced.
         assert_eq!(*atlas.get(&key(50), w, h), rects[3]);
         for glyph in [0, 1, 2] {
             assert!(atlas.get(&key(glyph), w, h).cached());

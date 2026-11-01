@@ -1,20 +1,5 @@
 //! `TuiRequest::world_quad` — world-unit-sized terminal screen inside a
 //! game scene, spawned declaratively.
-//!
-//! - quad sized in **world units** (height; width follows the texture aspect),
-//! - orientation is an ordinary `Transform` in the spawn tuple (no `facing`
-//!   parameter — see `TuiKind::WorldQuad`'s doc comment),
-//! - `update_screen` below takes **zero render-resource parameters**, and so
-//!   does `setup`: the screen is a single `TuiRequest` spawn; the plugin's
-//!   `materialize_tui_requests` system does all the resource work,
-//! - the font is loaded through the `AssetServer` via `TuiFontSource::Asset`
-//!   (works on native and Wasm alike) — the request simply stays pending
-//!   until the `.ttf` finishes loading, no hand-rolled waiting system,
-//! - in-world mouse picking (click the screen; the hit cell is displayed).
-//!
-//! Run with: `cargo run --example world_terminal`
-//! (use `cargo run`, not the bare binary: asset/font paths resolve via
-//! `CARGO_MANIFEST_DIR`.)
 
 use bevy::prelude::*;
 use ratatui::layout::{Constraint, Layout};
@@ -37,8 +22,6 @@ fn main() {
                     }),
                     ..default()
                 })
-                // assets/ lives at examples/assets/, not the crate-root
-                // default `assets/` bevy's AssetPlugin assumes.
                 .set(AssetPlugin {
                     file_path: "examples/assets".into(),
                     ..default()
@@ -75,7 +58,6 @@ fn setup(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    // Scene: camera, light, a spinning cube the screen reports on.
     commands.spawn((
         Camera3d::default(),
         Transform::from_translation(CAMERA_POS).looking_at(Vec3::ZERO, Vec3::Y),
@@ -97,10 +79,6 @@ fn setup(
         Spinning,
     ));
 
-    // The in-world screen: 2.2 world units tall, tilted toward the camera.
-    // The font loads through the AssetServer (works on native and Wasm
-    // alike); the request materializes automatically once it resolves - no
-    // hand-rolled "wait for the asset" system needed.
     commands.spawn((
         TuiRequest::world_quad(
             28,

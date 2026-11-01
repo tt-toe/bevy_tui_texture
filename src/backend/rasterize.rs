@@ -28,16 +28,14 @@ const LUT_4: [u8; 16] = [
     255,
 ];
 
-// ============================================================================
 // Fake Bold Rendering
-// ============================================================================
 //
 // Fake bold is achieved by rendering the glyph path multiple times at slight
 // horizontal offsets. This creates a thickened appearance that simulates
 // bold weight without requiring a dedicated bold font.
 
 /// Default stroke thickness as a fraction of the em-square when the font
-/// does not provide underline metrics. Approximately 3% of the em-square.
+/// does not provide underline metrics.
 const DEFAULT_STROKE_THICKNESS_RATIO: f32 = 1.0 / 32.0;
 
 /// Minimum bold offset in pixels to ensure visibility even at small sizes.
@@ -53,29 +51,13 @@ const FONT_WEIGHT_BOLD_DELTA: f32 = 300.0;
 const MAX_WEIGHT_FACTOR: f32 = 2.0;
 
 /// Horizontal offset ratios for fake bold rendering.
-/// Multiple passes at different offsets create a smooth, filled-in appearance.
-/// Positive values shift right, negative values shift left.
 const BOLD_OFFSET_RATIOS: [f32; 8] = [1.0, 0.5, -0.5, 1.5, 0.25, -0.25, 0.75, -0.75];
 
 /// Calculate the base bold offset based on font metrics.
-///
-/// The offset is derived from:
-/// 1. Font weight - heavier fonts need proportionally less additional bolding
-/// 2. Stroke thickness - from underline metrics or a reasonable default
-/// 3. Current rendering scale - converts from font units to pixels
-///
-/// # Arguments
-/// * `metrics` - Font face containing weight and metric information
-/// * `render_scale` - Current rendering scale (includes 2x supersampling)
-///
-/// # Returns
-/// Base offset in pixels for fake bold rendering
 fn calculate_bold_offset(metrics: &rustybuzz::Face, render_scale: f32) -> f32 {
     let font_weight = metrics.weight().to_number() as f32;
     let units_per_em = metrics.units_per_em() as f32;
 
-    // Calculate weight factor: 0.0 for normal weight, scaling up for heavier fonts
-    // Clamped to prevent excessive bolding on extra-bold fonts
     let weight_factor =
         ((font_weight - FONT_WEIGHT_NORMAL) / FONT_WEIGHT_BOLD_DELTA).clamp(0.0, MAX_WEIGHT_FACTOR);
 
@@ -86,7 +68,6 @@ fn calculate_bold_offset(metrics: &rustybuzz::Face, render_scale: f32) -> f32 {
         .map(|m| m.thickness as f32)
         .unwrap_or(units_per_em * DEFAULT_STROKE_THICKNESS_RATIO);
 
-    // Convert from font units to pixels, accounting for 2x supersampling
     let scale_to_pixels = render_scale / 2.0;
     let base_offset = stroke_thickness * scale_to_pixels * weight_factor / units_per_em;
 
@@ -94,11 +75,6 @@ fn calculate_bold_offset(metrics: &rustybuzz::Face, render_scale: f32) -> f32 {
 }
 
 /// Apply fake bold effect by rendering the path at multiple horizontal offsets.
-///
-/// # Arguments
-/// * `target` - Draw target to render into
-/// * `path` - Glyph outline path to render
-/// * `base_offset` - Base offset in pixels (will be multiplied by ratios)
 fn apply_fake_bold(target: &mut DrawTarget<&mut [u32]>, path: &raqote::Path, base_offset: f32) {
     let white = raqote::Source::Solid(SolidSource::from_unpremultiplied_argb(255, 255, 255, 255));
     let draw_options = DrawOptions::default();
@@ -231,8 +207,6 @@ pub(super) fn rasterize_glyph(
     let mut painter = Painter::new(
         metrics,
         &mut target,
-        // `Painter` applies this after its uniform `sy`, so the x-only
-        // part lands on x alone - same as the outline path below.
         Transform::scale(sx / sy, 1.0).then(&skew),
         sy,
         ty,
@@ -285,9 +259,6 @@ pub(super) fn rasterize_glyph(
     if let Some(bounds) = metrics.outline_glyph(GlyphId(info.glyph_id as _), &mut render) {
         let path = render.finish();
 
-        // Some fonts return bounds that are entirely negative. I'm not sure why this
-        // is, but it means the glyph won't render at all. We check for this here and
-        // offset it if so. This seems to let those fonts render correctly.
         let x_off = if natural && bounds.x_max < 0 {
             -bounds.x_min as f32
         } else {
@@ -351,10 +322,124 @@ pub(super) fn rasterize_glyph(
     )
 }
 
+/// A color glyph as premultiplied RGBA8 (`width * height * 4` bytes), or
+/// `None` if the font has no color data it can draw for it: COLR (v0 and
+/// v1), then a PNG strike (CBDT, sbix), then a premultiplied BGRA strike.
+#[cfg(feature = "emoji")]
+pub(super) fn rasterize_color_glyph(
+    face: &rustybuzz::Face,
+    glyph: GlyphId,
+    width: u32,
+    height: u32,
+) -> Option<Vec<u8>> {
+    let (w, h) = (width as usize, height as usize);
+    if face.is_color_glyph(glyph) {
+        let (canvas_w, canvas_h) = (2 * width, 2 * height);
+        let ascender = face.ascender() as f32;
+        let line_height = (face.ascender() - face.descender()).max(1) as f32;
+        let advance = face
+            .glyph_hor_advance(glyph)
+            .filter(|&advance| advance > 0)
+            .map_or(face.units_per_em() as f32, f32::from);
+        let scale = (canvas_w as f32 / advance).min(canvas_h as f32 / line_height);
+        let x_offset = (canvas_w as f32 - advance * scale) / 2.0;
+        let y_offset = (canvas_h as f32 - line_height * scale) / 2.0 + ascender * scale;
+
+        let mut image = vec![0u32; canvas_w as usize * canvas_h as usize];
+        let mut target = DrawTarget::from_backing(canvas_w as i32, canvas_h as i32, &mut image[..]);
+        let mut painter = Painter::new(
+            face,
+            &mut target,
+            Transform::identity(),
+            scale,
+            y_offset,
+            x_offset,
+        );
+        if face
+            .paint_color_glyph(glyph, 0, RgbaColor::new(255, 255, 255, 255), &mut painter)
+            .is_some()
+        {
+            let rgba: Vec<u8> = image
+                .iter()
+                .flat_map(|argb| {
+                    let [a, r, g, b] = argb.to_be_bytes();
+                    [r, g, b, a]
+                })
+                .collect();
+            return Some(box_down(&rgba, canvas_w as usize, canvas_h as usize, w, h));
+        }
+    }
+
+    let raster =
+        face.glyph_raster_image(glyph, (2 * width.max(height)).min(u16::MAX as u32) as u16)?;
+    if raster_is_empty(&raster) {
+        return None;
+    }
+    let (pixels, pw, ph) = match raster.format {
+        RasterImageFormat::PNG => {
+            let pixmap = tiny_skia::Pixmap::decode_png(raster.data).ok()?;
+            let (pw, ph) = (pixmap.width() as usize, pixmap.height() as usize);
+            (pixmap.take(), pw, ph)
+        }
+        RasterImageFormat::BitmapPremulBgra32 => {
+            let (pw, ph) = (raster.width as usize, raster.height as usize);
+            let bgra = raster.data.get(..pw * ph * 4)?;
+            let rgba = bgra
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .flat_map(|&[b, g, r, a]| [r, g, b, a])
+                .collect();
+            (rgba, pw, ph)
+        }
+        _ => return None,
+    };
+    if pw == 0 || ph == 0 {
+        return None;
+    }
+
+    let fit = (w as f32 / pw as f32).min(h as f32 / ph as f32);
+    let fit_w = ((pw as f32 * fit).round() as usize).clamp(1, w);
+    let fit_h = ((ph as f32 * fit).round() as usize).clamp(1, h);
+    let scaled = box_down(&pixels, pw, ph, fit_w, fit_h);
+    let mut out = vec![0u8; w * h * 4];
+    let (x0, y0) = ((w - fit_w) / 2, (h - fit_h) / 2);
+    for (row, line) in scaled.chunks_exact(fit_w * 4).enumerate() {
+        let start = ((y0 + row) * w + x0) * 4;
+        out[start..start + line.len()].copy_from_slice(line);
+    }
+    Some(out)
+}
+
+/// RGBA8 `src` (`sw` x `sh`) resampled to `dw` x `dh` by averaging the
+/// source pixels each destination pixel covers.
+#[cfg(feature = "emoji")]
+fn box_down(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<u8> {
+    let mut out = vec![0u8; dw * dh * 4];
+    for y in 0..dh {
+        let (y0, y1) = (y * sh / dh, ((y + 1) * sh).div_ceil(dh).min(sh));
+        for x in 0..dw {
+            let (x0, x1) = (x * sw / dw, ((x + 1) * sw).div_ceil(dw).min(sw));
+            let (mut sum, mut n) = ([0u32; 4], 0u32);
+            for yy in y0..y1 {
+                for xx in x0..x1 {
+                    let i = (yy * sw + xx) * 4;
+                    for c in 0..4 {
+                        sum[c] += src[i + c] as u32;
+                    }
+                    n += 1;
+                }
+            }
+            for c in 0..4 {
+                out[(y * dw + x) * 4 + c] = (sum[c] / n.max(1)) as u8;
+            }
+        }
+    }
+    out
+}
+
 /// An embedded bitmap with no pixels - what a bitmap strike stores for a
-/// blank glyph such as the space. There is nothing to decode (and the
-/// row-wise decoders cannot chunk a zero-width image); the caller falls
-/// back to an empty slot.
+/// blank glyph such as the space.
 fn raster_is_empty(raster: &RasterGlyphImage) -> bool {
     raster.width == 0 || raster.height == 0
 }
@@ -370,7 +455,6 @@ fn extract_color_image(
     }
     match raster.format {
         RasterImageFormat::PNG => {
-            // PNG format not supported (simplified implementation)
             return None;
         }
         RasterImageFormat::BitmapPremulBgra32 => {
@@ -533,8 +617,6 @@ mod tests {
         }
     }
 
-    /// A bitmap strike stores blank glyphs (the space) as zero-size images.
-    /// They decode to "no image" rather than reaching the row-wise decoders.
     #[test]
     fn a_zero_size_bitmap_glyph_has_no_image() {
         let slot = Entry::Uncached(CacheRect {

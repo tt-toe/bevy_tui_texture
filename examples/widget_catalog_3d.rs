@@ -1,14 +1,3 @@
-// Widget Catalog 3D Example
-//
-// Comprehensive showcase of ratatui widgets on a rotating 3D plane:
-// - Tabs for navigation
-// - Buttons with click handlers
-// - Interactive lists
-// - Charts (Bar chart, Sparkline)
-// - Interactive gauges
-// - 3D mouse input with ray casting
-// - Keyboard and mouse controls
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,7 +16,6 @@ use bevy_tui_texture::Font as TerminalFont;
 use bevy_tui_texture::input::KeyCode;
 use bevy_tui_texture::prelude::*;
 
-// Terminal dimensions
 const COLS: u16 = 100;
 const ROWS: u16 = 30;
 
@@ -63,7 +51,6 @@ struct WidgetCatalogState {
     counter: usize,
     mouse_position: Option<(u16, u16)>,
 
-    // Store layout rectangles for accurate hit testing
     button_rects: Vec<ratatui::layout::Rect>,
     h_button_rects: Vec<ratatui::layout::Rect>,
     list_inner_rect: Option<ratatui::layout::Rect>,
@@ -77,7 +64,6 @@ struct RotatingPlane;
 fn setup_terminal(mut commands: Commands) {
     info!("Setting up 3D widget catalog terminal with the declarative TuiRequest API...");
 
-    // Load font
     let font_data = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/examples/assets/fonts/Mplus1Code-Regular.ttf"
@@ -86,13 +72,11 @@ fn setup_terminal(mut commands: Commands) {
     let font = TerminalFont::new(font_data).expect("Failed to load font");
     let fonts = Arc::new(Fonts::new(font, 16));
 
-    // Spawn 3D camera
     commands.spawn((
         Camera3d::default(),
         Transform::from_xyz(0.0, 0.0, 800.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
 
-    // Add directional light
     commands.spawn((
         DirectionalLight {
             illuminance: 5000.0,
@@ -102,9 +86,6 @@ fn setup_terminal(mut commands: Commands) {
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.5, -0.5, 0.0)),
     ));
 
-    // Declarative 3D terminal. `world_quad`'s mesh faces +Z at rest (see
-    // `rotate_plane`). The height is the terminal's pixel height
-    // (ROWS * char_height_px), i.e. one world unit per pixel.
     let char_height_px = fonts.height_px();
     let terminal_entity = commands
         .spawn((
@@ -114,7 +95,6 @@ fn setup_terminal(mut commands: Commands) {
         ))
         .id();
 
-    // Create state with initial values
     commands.insert_resource(WidgetCatalogState {
         selected_tab: 0,
         list_state: ListState::default().with_selected(Some(0)),
@@ -163,7 +143,6 @@ fn handle_terminal_events(
                     col, row, event.target
                 );
 
-                // Tab detection (manual calculation as tabs are not stored)
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
@@ -196,7 +175,6 @@ fn handle_terminal_events(
                     }
                 }
 
-                // Buttons tab (0)
                 if ui_state.selected_tab == 0 {
                     info!(
                         "Checking buttons tab - button_rects.len()={}, h_button_rects.len()={}",
@@ -204,7 +182,6 @@ fn handle_terminal_events(
                         ui_state.h_button_rects.len()
                     );
 
-                    // Vertical buttons
                     for (i, rect) in ui_state.button_rects.iter().enumerate() {
                         info!(
                             "  V-Button[{}]: rect=(x:{}, y:{}, w:{}, h:{}) contains({},{})={}",
@@ -229,7 +206,6 @@ fn handle_terminal_events(
                         }
                     }
 
-                    // Horizontal buttons
                     for (i, rect) in ui_state.h_button_rects.iter().enumerate() {
                         if rect.contains(pos) {
                             ui_state.selected_button = Some(i + 3);
@@ -239,7 +215,6 @@ fn handle_terminal_events(
                     }
                 }
 
-                // Lists tab (1)
                 if ui_state.selected_tab == 1
                     && let Some(inner) = ui_state.list_inner_rect
                         && inner.contains(pos) {
@@ -247,7 +222,6 @@ fn handle_terminal_events(
                             ui_state.list_state.select(Some(index.min(9)));
                         }
 
-                // Interactive tab (3)
                 if ui_state.selected_tab == 3
                     && let Some(inner) = ui_state.gauge_inner_rect
                         && inner.contains(pos) {
@@ -290,9 +264,7 @@ fn handle_terminal_events(
     }
 }
 
-/// Update terminal content and render to 3D mesh. Zero render-resource
-/// parameters: `gpu_flush_system` (registered by `TerminalPlugin`) owns the
-/// GPU render + async copy + material touch.
+/// Update terminal content and render to 3D mesh.
 fn update_terminal_content(
     mut screens: Query<&mut Tui, With<RotatingPlane>>,
     mut ui_state: ResMut<WidgetCatalogState>,
@@ -301,7 +273,6 @@ fn update_terminal_content(
     let Ok(mut term) = screens.single_mut() else {
         return;
     };
-    // Update sparkline data with random values
     ui_state.sparkline_timer.tick(time.delta());
     if ui_state.sparkline_timer.just_finished() {
         let new_value = rand::random_range(1..=15);
@@ -311,10 +282,6 @@ fn update_terminal_content(
         }
     }
 
-    // Split into a plain `&mut` so `sparkline_data`/`list_state` below can
-    // be borrowed disjointly (one immutably, one mutably) instead of cloned -
-    // `ResMut::deref`/`deref_mut` can't be called twice at once, but a single
-    // `&mut WidgetCatalogState` splits into independent field borrows fine.
     let state = &mut *ui_state;
     let selected_tab = state.selected_tab;
     let selected_button = state.selected_button;
@@ -322,7 +289,6 @@ fn update_terminal_content(
     let counter = state.counter;
     let mouse_position = state.mouse_position;
 
-    // Variables to capture layout rectangles
     let mut button_rects = Vec::new();
     let mut h_button_rects = Vec::new();
     let mut list_inner_rect = None;
@@ -417,7 +383,6 @@ fn update_terminal_content(
             frame.render_widget(status, status_area);
         });
 
-    // Store captured layout rectangles for hit testing
     state.button_rects = button_rects;
     state.h_button_rects = h_button_rects;
     state.list_inner_rect = list_inner_rect;
@@ -521,7 +486,6 @@ fn draw_buttons_tab(
 
     frame.render_widget(info, chunks[4]);
 
-    // Return button rectangles for hit testing (`Rect` is `Copy`)
     let button_rects = chunks.iter().take(3).copied().collect();
     let h_button_rects = h_chunks.to_vec();
 
@@ -552,7 +516,6 @@ fn draw_lists_tab(
 
     frame.render_stateful_widget(list, area, list_state);
 
-    // Return inner area for hit testing
     ratatui::layout::Rect {
         x: area.x + 1,
         y: area.y + 1,
@@ -661,7 +624,6 @@ fn draw_interactive_tab(
 
     frame.render_widget(instructions, chunks[2]);
 
-    // Return gauge inner area for hit testing
     ratatui::layout::Rect {
         x: chunks[0].x + 1,
         y: chunks[0].y + 1,
@@ -674,16 +636,15 @@ fn draw_glyphs_tab(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // Box Drawing
-            Constraint::Length(3), // Block Elements
-            Constraint::Length(5), // Braille
-            Constraint::Length(3), // Powerline
-            Constraint::Min(0),    // Info
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(5),
+            Constraint::Length(3),
+            Constraint::Min(0),
         ])
         .margin(1)
         .split(area);
 
-    // Box Drawing
     let box_lines = vec![Line::from(vec![
         Span::raw("Box: "),
         Span::styled(
@@ -694,7 +655,6 @@ fn draw_glyphs_tab(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
     let box_para = Paragraph::new(box_lines).block(Block::bordered().title("Box Drawing"));
     frame.render_widget(box_para, chunks[0]);
 
-    // Block Elements
     let block_lines = vec![Line::from(vec![
         Span::raw("Block: "),
         Span::styled(
@@ -705,7 +665,6 @@ fn draw_glyphs_tab(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
     let block_para = Paragraph::new(block_lines).block(Block::bordered().title("Block Elements"));
     frame.render_widget(block_para, chunks[1]);
 
-    // Braille
     let braille_lines = vec![
         Line::from(vec![Span::styled(
             "⠀⠁⠂⠃⠄⠅⠆⠇ ⠈⠉⠊⠋⠌⠍⠎⠏ ⠐⠑⠒⠓⠔⠕⠖⠗",
@@ -724,7 +683,6 @@ fn draw_glyphs_tab(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
         Paragraph::new(braille_lines).block(Block::bordered().title("Braille Patterns"));
     frame.render_widget(braille_para, chunks[2]);
 
-    // Powerline
     let powerline_lines = vec![Line::from(vec![
         Span::raw("Powerline: "),
         Span::styled(
@@ -736,7 +694,6 @@ fn draw_glyphs_tab(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
         Paragraph::new(powerline_lines).block(Block::bordered().title("Powerline Symbols"));
     frame.render_widget(powerline_para, chunks[3]);
 
-    // Info
     let info = Paragraph::new(vec![
         Line::from(""),
         Line::from("All glyphs above are programmatically rendered")
@@ -751,12 +708,8 @@ fn draw_glyphs_tab(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
 }
 
 /// System that rotates the plane in seesaw motion for always-visible interaction.
-///
-/// `TuiKind::WorldQuad`'s mesh faces +Z at rest, so the seesaw here is a
-/// plain roll around Z, no base reorientation needed.
 fn rotate_plane(time: Res<Time>, mut query: Query<&mut Transform, With<RotatingPlane>>) {
     for mut transform in &mut query {
-        // Seesaw rotation: oscillate ±45° around Z axis
         let angle = (time.elapsed_secs() * 0.8).sin() * std::f32::consts::FRAC_PI_4;
         transform.rotation = Quat::from_rotation_y(angle);
     }

@@ -1,11 +1,22 @@
 # Changelog
 
-## Unreleased
+## 0.4.2
 
 ### Added
-- **Nerd Font icons fill two cells.** A symbol followed by a space is drawn
+- **Color emoji** (feature `emoji`). `Fonts::add_emoji_fonts` registers
+  fallback fonts for emoji in COLRv0, COLRv1, CBDT or sbix (OT-SVG is not
+  supported); emoji, skin tones, ZWJ sequences, flags and keycaps are drawn
+  in their own colors over the cell's background, in the two cells ratatui
+  reserves. Which cells are emoji follows Unicode: default emoji-presentation
+  chars, `U+FE0F`, joiners, keycaps and flags, but not `U+FE0E` or a lone
+  regional indicator. Color glyphs live in a second atlas (premultiplied
+  RGBA, 1 to 16 MiB, room for 1024 glyphs) drawn by a third pipeline; both
+  are created when the first color glyph appears. Combining marks on an
+  emoji come from a text font, in the cell's text color. See
+  `examples/emoji.rs`. No emoji font is bundled.
+- **Nerd Fonts icons fill two cells.** A symbol followed by a space is drawn
   over its own cell and the space, as in Ghostty, kitty and WezTerm, so
-  `"\u{f07b} src"` shows a full-size folder icon. A symbol is a Nerd Font
+  `"\u{f07b} src"` shows a full-size folder icon. A symbol is a Nerd Fonts
   icon (anything in a Private Use Area) or an ambiguous-width character
   its font draws wider than a cell, such as the full-width arrows and
   stars of Japanese fonts. A symbol right after another symbol stays in one
@@ -15,12 +26,24 @@
   font-patcher applies to each icon set (generated into
   `src/backend/glyph_constraint/nerd_font.rs` by
   `tools/nerd_font_constraints.py`), keeping their aspect ratio. Icons now
-  look the same whichever Nerd Font provides them - patched or the
+  look the same whichever Nerd Fonts font provides them - patched or the
   symbols-only font, Mono or not - where they used to be squeezed
   horizontally into one cell or cut off at its edge.
 - `Fonts::set_fit_symbols(false)` turns both off.
 - `cpu_hot_path` has a `symbols` workload, and runs a single workload with
   `CPU_HOT_PATH=<workload>[:Row|:Cell]` (frames: `CPU_HOT_PATH_FRAMES`).
+
+### Changed
+- `Cargo.lock` refreshed to the latest compatible versions (bevy 0.20.1,
+  wasm-bindgen 0.2.130): a `wasm-bindgen` CLI must now be 0.2.130.
+
+### Fixed
+- A cell's width is that of its whole symbol, not of its first char:
+  `"\u{2764}\u{FE0F}"`, flags and keycaps start with a one-cell char but
+  take the two cells ratatui reserves for them, and were squeezed into one.
+- COLR glyphs (a color font registered with `add_fonts`) are antialiased.
+- With the old `emoji` feature, fake bold/italic was skipped for `1`, `#` and
+  `©`, which Unicode counts as emoji chars.
 
 ## 0.4.1
 
