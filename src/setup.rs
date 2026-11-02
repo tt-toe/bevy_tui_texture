@@ -773,6 +773,28 @@ pub(crate) fn attach_terminal_system(
     }
 }
 
+// Mesa 26's lavapipe reports features it cannot create a device with, and
+// bevy's default priority requests every reported feature.
+#[cfg(test)]
+fn test_render_plugin() -> bevy::render::RenderPlugin {
+    use bevy::render::settings::{WgpuSettings, WgpuSettingsPriority};
+    bevy::render::RenderPlugin {
+        render_creation: WgpuSettings {
+            priority: WgpuSettingsPriority::WebGL2,
+            ..Default::default()
+        }
+        .into(),
+        ..Default::default()
+    }
+}
+
+// The Vulkan loader crashes when tests create and destroy devices concurrently.
+#[cfg(test)]
+fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tui_flush_tests {
     use super::*;
@@ -845,6 +867,7 @@ mod tui_flush_tests {
 
     #[test]
     fn flush_renders_drawn_content_synchronously() {
+        let _gpu = gpu_test_lock();
         use crate::bevy_plugin::TerminalPlugin;
         use crate::bevy_plugin::TuiReadbackChannel;
         use bevy::render::renderer::RenderDevice;
@@ -861,7 +884,7 @@ mod tui_flush_tests {
             bevy::mesh::MeshPlugin,
             bevy::diagnostic::FrameCountPlugin,
             bevy::time::TimePlugin,
-            bevy::render::RenderPlugin::default(),
+            super::test_render_plugin(),
             bevy::image::ImagePlugin::default(),
             TerminalPlugin::display_only(),
         ));
@@ -947,7 +970,7 @@ mod tui_flush_tests {
             bevy::mesh::MeshPlugin,
             bevy::diagnostic::FrameCountPlugin,
             bevy::time::TimePlugin,
-            bevy::render::RenderPlugin::default(),
+            super::test_render_plugin(),
             bevy::image::ImagePlugin::default(),
             TerminalPlugin::display_only(),
         ));
@@ -984,6 +1007,7 @@ mod tui_flush_tests {
 
     #[test]
     fn cells_resolve_glyph_and_background_in_one_pass() {
+        let _gpu = gpu_test_lock();
         let Some(mut app) = gpu_app() else {
             return;
         };
@@ -1076,6 +1100,7 @@ mod tui_flush_tests {
 
     #[test]
     fn flush_renders_partial_redraw_correctly() {
+        let _gpu = gpu_test_lock();
         use crate::bevy_plugin::TerminalPlugin;
         use crate::bevy_plugin::TuiReadbackChannel;
         use bevy::render::renderer::RenderDevice;
@@ -1092,7 +1117,7 @@ mod tui_flush_tests {
             bevy::mesh::MeshPlugin,
             bevy::diagnostic::FrameCountPlugin,
             bevy::time::TimePlugin,
-            bevy::render::RenderPlugin::default(),
+            super::test_render_plugin(),
             bevy::image::ImagePlugin::default(),
             TerminalPlugin::display_only(),
         ));
@@ -1272,6 +1297,7 @@ mod tui_flush_tests {
 
         #[test]
         fn a_color_glyph_has_its_own_colors_over_the_cell_background() {
+            let _gpu = gpu_test_lock();
             for emoji in FIXTURES {
                 let Some(mut app) = gpu_app() else {
                     return;
@@ -1306,6 +1332,7 @@ mod tui_flush_tests {
 
         #[test]
         fn a_combining_mark_is_drawn_in_the_text_color_on_top_of_the_emoji() {
+            let _gpu = gpu_test_lock();
             for emoji in FIXTURES {
                 let Some(mut app) = gpu_app() else {
                     return;
@@ -1331,6 +1358,7 @@ mod tui_flush_tests {
 
         #[test]
         fn a_transparent_reset_background_shows_at_the_glyph_corners() {
+            let _gpu = gpu_test_lock();
             for emoji in FIXTURES {
                 let Some(mut app) = gpu_app() else {
                     return;
@@ -1351,6 +1379,7 @@ mod tui_flush_tests {
 
         #[test]
         fn a_partial_redraw_leaves_the_emoji_of_other_rows_intact() {
+            let _gpu = gpu_test_lock();
             for emoji in FIXTURES {
                 let Some(mut app) = gpu_app() else {
                     return;

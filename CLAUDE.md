@@ -50,6 +50,8 @@ cargo run --example benchmark_partial   # BENCH_MODE=static|partial redraw costs
 
 # Tests: inline #[cfg(test)] modules next to the code (no tests/ dir).
 # Pure CPU except the GPU-backed tests, which skip without an adapter.
+# A GPU test must hold gpu_test_lock() and use test_render_plugin()
+# (src/setup.rs); without them Mesa 26's lavapipe segfaults or panics.
 cargo test
 
 # What CI runs (.github/workflows/ci.yml):
