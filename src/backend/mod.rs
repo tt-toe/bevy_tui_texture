@@ -13,12 +13,7 @@ pub(crate) const CACHE_HEIGHT: u32 = 2048;
 
 use std::num::NonZeroU32;
 
-use ratatui::style::Color;
 use wgpu::*;
-
-use crate::colors::ANSI_TO_RGB;
-use crate::colors::Rgb;
-use crate::colors::named::*;
 
 /// The surface dimensions of the backend in pixels.
 pub struct Dimensions {
@@ -191,28 +186,21 @@ fn build_compositor(
     }
 }
 
-fn c2c(color: ratatui::style::Color, reset: Rgb) -> Rgb {
-    match color {
-        Color::Reset => reset,
-        Color::Black => BLACK,
-        Color::Red => RED,
-        Color::Green => GREEN,
-        Color::Yellow => YELLOW,
-        Color::Blue => BLUE,
-        Color::Magenta => MAGENTA,
-        Color::Cyan => CYAN,
-        Color::Gray => GRAY,
-        Color::DarkGray => DARKGRAY,
-        Color::LightRed => LIGHTRED,
-        Color::LightGreen => LIGHTGREEN,
-        Color::LightYellow => LIGHTYELLOW,
-        Color::LightBlue => LIGHTBLUE,
-        Color::LightMagenta => LIGHTMAGENTA,
-        Color::LightCyan => LIGHTCYAN,
-        Color::White => WHITE,
-        Color::Rgb(r, g, b) => [r, g, b],
-        Color::Indexed(idx) => ANSI_TO_RGB[idx as usize],
+/// The blink classes in their "off" half after `elapsed`.
+#[cfg(feature = "blink")]
+pub(crate) fn blink_off_at(elapsed: std::time::Duration) -> ratatui::style::Modifier {
+    use ratatui::style::Modifier;
+    const SLOW_BLINK_HALF_MS: u128 = 500;
+    const RAPID_BLINK_HALF_MS: u128 = 200;
+    let ms = elapsed.as_millis();
+    let mut off = Modifier::empty();
+    if ms / SLOW_BLINK_HALF_MS % 2 == 1 {
+        off |= Modifier::SLOW_BLINK;
     }
+    if ms / RAPID_BLINK_HALF_MS % 2 == 1 {
+        off |= Modifier::RAPID_BLINK;
+    }
+    off
 }
 
 /// CPU-computed draw payload extracted from a dirty `Tui` each frame: the
@@ -367,14 +355,8 @@ impl SharedFontGpuState {
         });
         let text_cache_view = text_cache.create_view(&TextureViewDescriptor::default());
 
-        // The atlas starts as uninitialized GPU memory and glyph uploads
-        // only ever write small sub-rectangles (`upload_glyphs`). Without
-        // this, the first partial write makes wgpu perform its own
-        // full-texture lazy-initialization clear, which on GL/WebGL2
-        // surfaces as a console WARN ("texSubImage: Texture has not been
-        // initialized prior to a partial upload"). Zeroing it up front
-        // marks it initialized so that never triggers. One-time cost per
-        // font, shared by every terminal using it.
+        // Zeroed up front: otherwise the first partial glyph upload makes
+        // wgpu lazily clear the texture, which WebGL2 reports as a warning.
         zero_init_r8_texture(queue, &text_cache, CACHE_WIDTH, CACHE_HEIGHT);
 
         let sampler = device.create_sampler(&SamplerDescriptor {
@@ -721,7 +703,7 @@ impl TerminalGpuState {
             pass.draw(0..4, 0..colors);
             pass.set_bind_group(1, &shared.compositor.atlas_bindings, &[]);
         }
-        let overlays = total as u32 - cells - colors;
+        let overlays = (total as u32).saturating_sub(cells).saturating_sub(colors);
         if overlays > 0 {
             // Bound from the overlays' own offset rather than drawn with a
             // non-zero first instance, which WebGL2 has no native notion of.

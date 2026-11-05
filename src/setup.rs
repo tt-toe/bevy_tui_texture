@@ -118,9 +118,9 @@ impl TerminalTexture {
             bevy::render::render_resource::TextureUsages::RENDER_ATTACHMENT
                 | bevy::render::render_resource::TextureUsages::TEXTURE_BINDING
                 | bevy::render::render_resource::TextureUsages::COPY_SRC;
-        images
-            .insert(&self.image_handle, image)
-            .expect("resize: destination image handle must still be valid");
+        if images.insert(&self.image_handle, image).is_err() {
+            tracing::warn!("Tui resize: the destination image handle is no longer valid");
+        }
     }
 }
 
@@ -141,8 +141,8 @@ impl HitRegions {
         self.regions.push((id.into(), rect));
     }
 
-    /// Registers `block.inner(rect)` - the common case for bordered
-    /// widgets, where the clickable area excludes the border.
+    /// Registers the area inside `block`'s border, so the border itself is
+    /// not clickable.
     pub fn add_inner(
         &mut self,
         id: impl Into<u64>,
@@ -252,6 +252,49 @@ impl Tui {
         Some((cols, rows))
     }
 
+    /// Sets the foreground alpha of `Modifier::DIM` cells (default 128).
+    pub fn set_dim_alpha(&mut self, alpha: u8) {
+        let backend = self.texture_state.terminal.backend_mut();
+        if backend.dim_alpha() != alpha {
+            backend.set_dim_alpha(alpha);
+            self.dirty = true;
+        }
+    }
+
+    /// Replaces the color palette.
+    pub fn set_palette(&mut self, palette: crate::colors::TerminalPalette) {
+        let backend = self.texture_state.terminal.backend_mut();
+        if backend.palette() != &palette {
+            backend.set_palette(palette);
+            self.dirty = true;
+        }
+    }
+
+    /// Sets how the cursor ratatui shows is drawn.
+    pub fn set_cursor_style(&mut self, style: crate::backend::bevy_backend::CursorStyle) {
+        let backend = self.texture_state.terminal.backend_mut();
+        if backend.cursor_style() != style {
+            backend.set_cursor_style(style);
+            self.dirty = true;
+        }
+    }
+
+    /// Whether switching to the `off` blink phase changes any row.
+    #[cfg(feature = "blink")]
+    pub(crate) fn blink_needs_update(&self, off: ratatui::style::Modifier) -> bool {
+        self.texture_state
+            .terminal
+            .backend()
+            .blink_needs_update(off)
+    }
+
+    /// Switches to the `off` blink phase.
+    #[cfg(feature = "blink")]
+    pub(crate) fn set_blink_off(&mut self, off: ratatui::style::Modifier) {
+        self.texture_state.terminal.backend_mut().set_blink_off(off);
+        self.dirty = true;
+    }
+
     /// Draw with ratatui.
     pub fn draw(&mut self, f: impl FnOnce(&mut ratatui::Frame)) {
         match self.texture_state.terminal.draw(f) {
@@ -327,17 +370,8 @@ impl Tui {
         if self.dirty {
             let backend = self.texture_state.terminal.backend_mut();
             if self.pending_draw.is_some() {
-                // About to overwrite a not-yet-extracted payload (the
-                // render world skipped a frame - it extracts every frame
-                // once running, but sits out the first few while the
-                // renderer initializes asynchronously). A partial payload
-                // only covers the rows dirty as of ITS take - if the new
-                // payload were also partial, the overwritten payload's
-                // rows would simply be dropped, never rendered. Force a
-                // full payload instead, which safely supersedes anything
-                // (glyph rasterizations live in the shared per-font state,
-                // `Fonts`, rather than in this payload, so there is
-                // nothing font-side to lose here either way).
+                // The previous payload was never extracted; a partial
+                // payload would drop its rows, so send a full one.
                 backend.force_full_redraw();
             }
             let draw = backend.take_draw_payload();
@@ -411,6 +445,12 @@ pub struct TerminalConfig {
     /// background, or a `TuiKind::Ui` terminal show through to whatever is
     /// behind its `Node`.
     pub transparent_reset_bg: bool,
+    /// Foreground alpha of `Modifier::DIM` cells; 255 is no dimming, 0 hides them.
+    pub dim_alpha: u8,
+    /// The RGB values of ratatui's named and indexed colors.
+    pub palette: crate::colors::TerminalPalette,
+    /// How the cursor ratatui shows is drawn.
+    pub cursor_style: crate::backend::bevy_backend::CursorStyle,
     /// Alpha/transparency mode for the material [`TuiKind::WorldQuad`]
     /// builds.
     #[cfg(feature = "3d")]
@@ -426,6 +466,9 @@ impl Default for TerminalConfig {
             initial_draw: None,
             initial_fill: [0, 0, 0, 255],
             transparent_reset_bg: false,
+            dim_alpha: crate::backend::bevy_backend::DEFAULT_DIM_ALPHA,
+            palette: crate::colors::TerminalPalette::default(),
+            cursor_style: crate::backend::bevy_backend::CursorStyle::default(),
             #[cfg(feature = "3d")]
             alpha_mode: AlphaMode::Opaque,
         }
@@ -591,6 +634,11 @@ pub(crate) fn materialize_tui_requests(
             }
         };
 
+        let mut texture_state = texture_state;
+        let backend = texture_state.terminal.backend_mut();
+        backend.set_dim_alpha(request.config.dim_alpha);
+        backend.set_cursor_style(request.config.cursor_style);
+        backend.set_palette(std::mem::take(&mut request.config.palette));
         #[cfg(any(feature = "2d", feature = "3d"))]
         let dimensions = texture_state.dimensions();
         #[cfg(any(feature = "2d", feature = "3d"))]
@@ -685,7 +733,7 @@ impl AttachMaterial {
         let cached: Mutex<Option<Handle<M>>> = Mutex::new(None);
         AttachMaterial(UntypedMaterialInsert(std::sync::Arc::new(
             move |image, entity, world| {
-                let mut cached = cached.lock().unwrap();
+                let mut cached = cached.lock().unwrap_or_else(|e| e.into_inner());
                 let handle = match cached.as_ref() {
                     Some(handle) => handle.clone(),
                     None => {
@@ -1099,6 +1147,53 @@ mod tui_flush_tests {
     }
 
     #[test]
+    fn underline_pixels_use_foreground() {
+        let _gpu = gpu_test_lock();
+        let Some(mut app) = gpu_app() else {
+            return;
+        };
+
+        let fonts = test_fonts();
+        let (cell_w, cell_h) = (fonts.min_width_px() as usize, fonts.height_px() as usize);
+        let decorations = fonts.decoration_metrics();
+        let entity = {
+            let mut images = app.world_mut().resource_mut::<Assets<Image>>();
+            let texture_state =
+                TerminalTexture::create(1, 1, fonts, true, false, [0, 0, 0, 255], &mut images)
+                    .expect("failed to create terminal texture");
+            let mut tui = Tui::from_texture_state(texture_state);
+            tui.draw(|frame| {
+                frame.buffer_mut()[(0, 0)].set_symbol(" ").set_style(
+                    Style::default()
+                        .fg(RatatuiColor::Rgb(255, 0, 0))
+                        .bg(RatatuiColor::Rgb(255, 255, 255))
+                        .add_modifier(ratatui::style::Modifier::UNDERLINED),
+                );
+            });
+            app.world_mut().spawn(tui).id()
+        };
+
+        let pixels = read_back(&mut app, entity);
+        let pixel = |x: usize, y: usize| {
+            let i = (y * cell_w + x) * 4;
+            [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
+        };
+        let top = decorations.underline_top as usize;
+        let bottom = top + decorations.underline_thickness as usize;
+        for x in 0..cell_w {
+            for y in top..bottom {
+                assert_eq!(pixel(x, y), [255, 0, 0, 255], "bar pixel ({x}, {y})");
+            }
+            if top > 0 {
+                assert_eq!(pixel(x, top - 1), [255, 255, 255, 255], "above the bar");
+            }
+            if bottom < cell_h {
+                assert_eq!(pixel(x, bottom), [255, 255, 255, 255], "below the bar");
+            }
+        }
+    }
+
+    #[test]
     fn flush_renders_partial_redraw_correctly() {
         let _gpu = gpu_test_lock();
         use crate::bevy_plugin::TerminalPlugin;
@@ -1478,17 +1573,8 @@ mod tui_request_tests {
     }
 }
 
-//
-// Component add/remove always re-stamps bevy's per-component change tick,
-// even when the reinserted value is identical - so "no remove+insert
-// commands after settling" is directly observable as "the component's
-// `last_changed()` tick is unchanged across a second run", without needing
-// to inspect archetype storage directly (a full remove-then-reinsert cycle
-// always settles back into the *same* final archetype - same component
-// set - so archetype identity alone can't distinguish churn from no-op;
-// the change tick can, since it records *when* the value was last written,
-// not just *what* the current component set is). Pure `World` +
-// `RunSystemOnce`, no App/GPU needed.
+// Remove + reinsert re-stamps a component's change tick even for an identical
+// value, so an unchanged `last_changed()` across a second run proves no churn.
 
 #[cfg(all(test, feature = "3d"))]
 mod attach_churn_tests {
@@ -1820,6 +1906,26 @@ mod perf_bench {
                 Modifier::BOLD,
                 Modifier::ITALIC,
                 Modifier::BOLD.union(Modifier::ITALIC),
+            ];
+            for y in 0..ROWS {
+                for x in 0..COLS {
+                    let c = (x as u32 * 2 + y as u32 * 5 + n) as u8;
+                    let style = STYLES[(x as usize / 6 + y as usize) % STYLES.len()];
+                    buf[(x, y)].set_symbol(text_at(n, x, y)).set_style(
+                        Style::default()
+                            .fg(RColor::Rgb(c, 255 - c, 128))
+                            .add_modifier(style),
+                    );
+                }
+            }
+        });
+        run("decorated_text", |n, buf| {
+            use ratatui::style::Modifier;
+            const STYLES: [Modifier; 4] = [
+                Modifier::empty(),
+                Modifier::UNDERLINED,
+                Modifier::CROSSED_OUT,
+                Modifier::DIM,
             ];
             for y in 0..ROWS {
                 for x in 0..COLS {

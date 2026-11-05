@@ -88,7 +88,9 @@ impl GlyphConstraint {
         let ranges = &nerd_font::RANGES;
         let idx = ranges.partition_point(|&(_, last, _)| last < cp);
         let &(first, _, constraint) = ranges.get(idx)?;
-        (first <= cp).then(|| &nerd_font::CONSTRAINTS[constraint as usize])
+        (first <= cp)
+            .then(|| nerd_font::CONSTRAINTS.get(constraint as usize))
+            .flatten()
     }
 
     /// The rule for symbol `ch`: font-patcher's, or [`Self::FIT`].
@@ -168,7 +170,7 @@ impl GlyphConstraint {
         let mut width_factor = target_width / group.width;
         let mut height_factor = target_height / group.height;
         match self.size {
-            Size::None => unreachable!(),
+            Size::None | Size::Stretch => {}
             Size::Fit => {
                 height_factor = height_factor.min(width_factor).min(1.0);
                 width_factor = height_factor;
@@ -187,7 +189,6 @@ impl GlyphConstraint {
                 }
                 width_factor = height_factor;
             }
-            Size::Stretch => {}
         }
 
         if self.max_xy_ratio > 0.0
@@ -266,12 +267,15 @@ pub(crate) struct CellClass {
     /// separators): a symbol before it doesn't stop the next one from
     /// spreading.
     pub(crate) graphics: bool,
+    /// No font has the glyph, but `fallback_symbols` can draw it.
+    pub(crate) fallback: bool,
 }
 
 impl CellClass {
     pub(crate) const TEXT: Self = Self {
         max_cells: 0,
         graphics: false,
+        fallback: false,
     };
 
     pub(crate) fn is_symbol(self) -> bool {
@@ -286,6 +290,7 @@ impl CellClass {
             return Self {
                 max_cells: 0,
                 graphics,
+                fallback: false,
             };
         }
         let max_cells = if let Some(constraint) = GlyphConstraint::nerd_font(ch) {
@@ -302,6 +307,7 @@ impl CellClass {
         Self {
             max_cells,
             graphics,
+            fallback: false,
         }
     }
 }
@@ -466,14 +472,17 @@ mod tests {
         let icon = CellClass {
             max_cells: 2,
             graphics: false,
+            fallback: false,
         };
         let one_cell = CellClass {
             max_cells: 1,
             graphics: false,
+            fallback: false,
         };
         let separator = CellClass {
             max_cells: 1,
             graphics: true,
+            fallback: false,
         };
         let text = Some(CellClass::TEXT);
         assert_eq!(symbol_span(icon, None, true), 2);

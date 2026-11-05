@@ -87,6 +87,8 @@ jobs:
           - "--no-default-features"
           - "--no-default-features --features 2d"
           - "--no-default-features --features 3d"
+          - "--no-default-features --features blink"
+          - "--no-default-features --features underline_color"
           - "--no-default-features --features 3d,keyboard_input,mouse_input"
     steps:
       - uses: actions/checkout@v4

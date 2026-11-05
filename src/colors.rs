@@ -1,5 +1,87 @@
 pub(crate) type Rgb = [u8; 3];
 
+/// The RGB values ratatui's named and indexed colors resolve to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalPalette {
+    /// `Color::Black` .. `Color::White`, in ANSI order.
+    pub named: [[u8; 3]; 16],
+    /// `Color::Indexed(n)`.
+    pub indexed: [[u8; 3]; 256],
+}
+
+impl Default for TerminalPalette {
+    /// The values earlier versions used: SVG color names for `named`, xterm for `indexed`.
+    fn default() -> Self {
+        use named::*;
+        Self {
+            named: [
+                BLACK,
+                RED,
+                GREEN,
+                YELLOW,
+                BLUE,
+                MAGENTA,
+                CYAN,
+                GRAY,
+                DARKGRAY,
+                LIGHTRED,
+                LIGHTGREEN,
+                LIGHTYELLOW,
+                LIGHTBLUE,
+                LIGHTMAGENTA,
+                LIGHTCYAN,
+                WHITE,
+            ],
+            indexed: ANSI_TO_RGB,
+        }
+    }
+}
+
+impl TerminalPalette {
+    /// Named colors taken from the xterm table, so `Color::Red` and `Color::Indexed(1)` agree.
+    pub fn xterm() -> Self {
+        let mut named = [[0; 3]; 16];
+        named.copy_from_slice(&ANSI_TO_RGB[..16]);
+        Self {
+            named,
+            indexed: ANSI_TO_RGB,
+        }
+    }
+
+    /// Replaces the 16 ANSI colors, both as named colors and as indexes 0..16.
+    pub fn with_ansi16(mut self, colors: [[u8; 3]; 16]) -> Self {
+        self.named = colors;
+        self.indexed[..16].copy_from_slice(&colors);
+        self
+    }
+
+    #[inline(always)]
+    pub(crate) fn resolve(&self, color: ratatui::style::Color, reset: Rgb) -> Rgb {
+        use ratatui::style::Color;
+        match color {
+            Color::Reset => reset,
+            Color::Black => self.named[0],
+            Color::Red => self.named[1],
+            Color::Green => self.named[2],
+            Color::Yellow => self.named[3],
+            Color::Blue => self.named[4],
+            Color::Magenta => self.named[5],
+            Color::Cyan => self.named[6],
+            Color::Gray => self.named[7],
+            Color::DarkGray => self.named[8],
+            Color::LightRed => self.named[9],
+            Color::LightGreen => self.named[10],
+            Color::LightYellow => self.named[11],
+            Color::LightBlue => self.named[12],
+            Color::LightMagenta => self.named[13],
+            Color::LightCyan => self.named[14],
+            Color::White => self.named[15],
+            Color::Rgb(r, g, b) => [r, g, b],
+            Color::Indexed(index) => self.indexed[index as usize],
+        }
+    }
+}
+
 /// <https://www.w3.org/TR/SVG11/types.html#ColorKeywords>
 pub(crate) mod named {
     use crate::colors::Rgb;

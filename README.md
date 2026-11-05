@@ -12,8 +12,9 @@ https://github.com/user-attachments/assets/64e1e136-7d2d-4e32-9c10-1da2cfb78ccd
 - **Declarative spawning** — spawn a `TuiRequest` component and the plugin materializes the terminal; no render resources in your systems
 - **Flexible display targets** — Bevy UI nodes, world-unit 3D quads, or attach to an existing mesh (e.g. a glTF screen) via `AttachTerminal`
 - **Interactive input** — keyboard, mouse, and touch (taps emulate left-click) with focus management and per-widget hit testing
-- **Full Unicode** — CJK support, font fallback chains, and procedural box-drawing / block / Braille / powerline glyphs
+- **Full Unicode** — CJK support, font fallback chains, and procedural box-drawing / block / Braille / powerline / sextant / octant glyphs
 - **Nerd Fonts icons** — icons (and other symbols, e.g. the full-width arrows of Japanese fonts) are fitted to the cell grid by Nerd Fonts' own scaling rules and spread over two cells when followed by a space, as in Ghostty, kitty and WezTerm (`Fonts::set_fit_symbols(false)` turns it off)
+- **Every ratatui style** — `DIM`, `HIDDEN`, underline, strikeout and (feature `blink`) blinking text, a drawn cursor in five styles, and a configurable 16/256-color palette; see [Appearance](#appearance)
 - **Color emoji** (feature `emoji`) — COLRv0, COLRv1, CBDT and sbix fonts, including ZWJ sequences, flags, keycaps and skin tones, drawn in their own colors; bring your own font (`Fonts::add_emoji_fonts`)
 - **Efficient updates** — dirty-cell tracking, partial row redraws, and a glyph atlas shared across terminals using the same fonts
 - **WebAssembly** — runs in the browser on WebGL2
@@ -26,7 +27,7 @@ Add to your `Cargo.toml`:
 [dependencies]
 bevy = "0.20"
 font-kit = "0.14"
-bevy_tui_texture = "0.4"
+bevy_tui_texture = "0.5"
 ```
 
 ### Hello World
@@ -66,9 +67,8 @@ fn setup(mut commands: Commands) {
             .expect("No monospace font found on this system")
             .load().expect("Failed to load font").copy_font_data()
             .expect("Failed to copy font data");
-        let font_data: &'static [u8] = Box::leak(font_data.to_vec().into_boxed_slice());
         Arc::new(Fonts::new(
-            TerminalFont::new(font_data).expect("Failed to parse font"), 16))
+            TerminalFont::from_vec(font_data.to_vec()).expect("Failed to parse font"), 16))
     };
 
     commands.spawn((
@@ -144,7 +144,7 @@ wasm-opt -Oz --strip-debug --strip-producers \
 
 ```toml
 [dependencies.bevy_tui_texture]
-version = "0.4"
+version = "0.5"
 default-features = false
 features = ["3d", "keyboard_input", "mouse_input"]   # e.g. a 3D-only app
 ```
@@ -155,9 +155,28 @@ features = ["3d", "keyboard_input", "mouse_input"]   # e.g. a 3D-only app
 - **`mouse_input`** (default) — mouse events for 2D UI and 3D mesh terminals; touch taps ride the same path (a tap emulates a left-button click at the touch position)
 - **`bold_italic_fonts`** — real bold/italic font slots; without it, bold/italic are faked from the regular font
 - **`emoji`** — color emoji: `Fonts::add_emoji_fonts` takes a color font (COLRv0, COLRv1, CBDT or sbix; not OT-SVG), and emoji, ZWJ sequences, flags, keycaps and skin tones are drawn in their own colors in two cells. No font ships with the crate. The color glyphs get a second atlas and a third pipeline, created when the first one is drawn. Without the feature, register a *monochrome* emoji font (e.g. Noto Emoji) with `add_fonts`: a color font there gives a solid silhouette (COLR) or a blank cell (PNG glyphs). See `examples/emoji.rs`
+- **`blink`** — `SLOW_BLINK` (500 ms) and `RAPID_BLINK` (200 ms) cells blank out during the off half of their period, and a shown cursor blinks with the slow phase. Only rows with blinking cells are redrawn, only when the phase flips. Without the feature both modifiers are ignored
+- **`underline_color`** — underlines are drawn in `Cell::underline_color` (ratatui-core's `underline-color`) unless it is `Reset`. Opt-in because it grows every ratatui `Cell`; without it underlines use the foreground color
 - **`crossterm-compat`** (native-only) — lossy conversions between `input::InputEvent` and `crossterm::event::Event`, for interop with ratatui-ecosystem widget crates or a bevy_ratatui adapter; not available on wasm32 (crossterm doesn't build there)
 
 `TuiKind` variants gate individually: `Ui` needs `2d`, `WorldQuad` needs `3d`, `Headless` is always available.
+
+## Appearance
+
+Every ratatui `Modifier` is drawn:
+
+| Modifier | Drawn as |
+|---|---|
+| `BOLD`, `ITALIC` | real font slots with `bold_italic_fonts`, otherwise faked |
+| `REVERSED` | foreground and background swapped |
+| `DIM` | foreground at alpha 128 (`TerminalConfig::dim_alpha`); color emoji stay undimmed |
+| `HIDDEN` | a blank in the cell's colors |
+| `UNDERLINED`, `CROSSED_OUT` | bars at the font's metrics, in the foreground color (`underline_color` feature: `Cell::underline_color`) |
+| `SLOW_BLINK`, `RAPID_BLINK` | `blink` feature; ignored without it |
+
+- **Cursor**: `Frame::set_cursor_position` shows a `CursorStyle`: `Block` (default), `HollowBlock`, `Underline`, `Bar` or `Hidden` (`TerminalConfig::cursor_style`, `Tui::set_cursor_style`).
+- **Palette**: `TerminalPalette` sets the RGB of the 16 named and 256 indexed colors (`TerminalConfig::palette`, `Tui::set_palette`). `default()` keeps earlier versions' colors; `xterm()` makes `Color::Red` and `Color::Indexed(1)` identical.
+- **Procedural glyphs** line up cell to cell at any size with no font: box drawing (every light/heavy/double combination), block elements, Braille, Powerline, ratatui's sextant and octant markers, wedges and corner triangles. `←↑→↓ ▲►▼◄ ▰▱ • ×` use the font's glyph, or a procedural one when no font has it.
 
 ## Performance
 
@@ -206,7 +225,7 @@ separate "N versions behind stable" policy on top.
 
 | `bevy` | `ratatui` | `wgpu` | `bevy_tui_texture` |
 |--------|-----------|--------|--------------------|
-| `0.20` | `0.30`    | `30`   | `0.4`              |
+| `0.20` | `0.30`    | `30`   | `0.4`, `0.5`       |
 | `0.19` | `0.30`    | `29`   | `0.3`              |
 | `0.18` | `0.30`    | `27`   | `0.2`              |
 | `0.17` | `0.29`    | `26`   | `0.1`              |

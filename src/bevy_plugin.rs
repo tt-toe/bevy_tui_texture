@@ -134,6 +134,13 @@ impl Plugin for TerminalPlugin {
             crate::setup::materialize_tui_requests.before(TerminalSystemSet::Input),
         );
 
+        #[cfg(feature = "blink")]
+        app.add_systems(
+            Update,
+            blink_system
+                .after(TerminalSystemSet::Render)
+                .before(gpu_flush_system),
+        );
         app.add_systems(Update, gpu_flush_system.after(TerminalSystemSet::Render));
         #[cfg(feature = "3d")]
         app.add_systems(Update, resize_world_quad_meshes.after(gpu_flush_system));
@@ -151,29 +158,12 @@ impl Plugin for TerminalPlugin {
         let (readback_tx, readback_rx) = std::sync::mpsc::channel();
         app.insert_resource(TuiReadbackChannel(readback_tx));
 
-        // Render-world half of the GPU render: extract each dirty
-        // terminal's CPU-computed draw payload, then render it directly
-        // into the destination `GpuImage`'s own texture. Absent (no render
-        // sub-app) in configurations without a rendering backend, e.g. some
-        // headless test setups - silently skip registration there, matching
-        // every other bevy render-world plugin's own convention.
-        //
-        // Registered on the `RenderGraph` schedule (a schedule run once per
-        // frame from inside `render_system`, with sets `Begin -> Render ->
-        // Submit -> Finish`; bevy_core_pipeline's camera passes run in
-        // `Render` and are batch-submitted in `Submit`).
-        //
-        // Those sets are only *weakly* chained: an ordering holds between
-        // two systems only if their tracked ECS access conflicts. None of the orderings this plugin depends on are
-        // visible that way (command buffers travel through `Deferred`
-        // state, and the GPU itself is the shared resource), so each one
-        // is spelled out explicitly below instead of being inherited from
-        // set membership:
-        // - `render_tui_textures` strictly before the whole `Render` set,
-        //   so a material samples this frame's terminal content, not the
-        //   previous frame's;
-        // - the submit after the terminal passes were recorded;
-        // - the blocking readback after that submit.
+        // The `RenderGraphSystems` sets are only weakly chained (ordered
+        // only where ECS access conflicts), and command buffers and the GPU
+        // are invisible to that, so every ordering is explicit: terminals
+        // render before the camera passes, are submitted after, and the
+        // blocking readback runs after the submit. No render sub-app (some
+        // headless setups) means nothing to register.
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
             #[cfg(feature = "emoji")]
             render_app.init_resource::<PendingColorUploads>();
@@ -192,18 +182,9 @@ impl Plugin for TerminalPlugin {
                         render_tui_textures
                             .in_set(RenderGraphSystems::Begin)
                             .before(RenderGraphSystems::Render),
-                        // Safety net for app configurations without
-                        // `CorePipelinePlugin` (bevy_core_pipeline's own
-                        // `submit_pending_command_buffers`, which normally
-                        // does this) - e.g. the headless GPU test in
-                        // setup.rs, which builds its app from
-                        // `RenderPlugin` alone. With `CorePipelinePlugin`
-                        // present, whichever of the two flushes runs first
-                        // submits every pending command buffer in recording
-                        // order and the other is an empty no-op - never a
-                        // double submit, since both take
-                        // `ResMut<PendingCommandBuffers>` and so can't
-                        // interleave.
+                        // For apps without `CorePipelinePlugin`, whose own
+                        // submit normally does this; with it, whichever runs
+                        // second finds nothing pending.
                         flush_tui_commands
                             .in_set(RenderGraphSystems::Submit)
                             .after(render_tui_textures)
@@ -227,6 +208,21 @@ pub struct TerminalDimensions {
     pub rows: u16,
     pub char_width_px: u32,
     pub char_height_px: u32,
+}
+
+/// Switches blinking rows between their lit and blank halves on a real-time clock.
+#[cfg(feature = "blink")]
+fn blink_system(time: Option<Res<Time<Real>>>, mut terminals: Query<&mut Tui>) {
+    let Some(time) = time else {
+        return;
+    };
+    let off = crate::backend::blink_off_at(time.elapsed());
+    for mut tui in &mut terminals {
+        // Shared access first: a mutable deref would flag the terminal as changed.
+        if tui.blink_needs_update(off) {
+            tui.set_blink_off(off);
+        }
+    }
 }
 
 /// Plugin-owned CPU flush for every [`Tui`] entity.
@@ -390,15 +386,9 @@ fn render_tui_textures(
 ) {
     font_store.0.retain(|key, _| live_fonts.0.contains(key));
 
-    // Glyph uploads can arrive in a frame with no draw for their font: a
-    // `Tui::draw` made after `gpu_flush_system` (from a system outside
-    // `TerminalSystemSet`, say) is only flushed next frame, and a payload
-    // whose destination isn't prepared yet is retried later - while the
-    // rasterizations are extracted right away. The CPU-side atlas already
-    // marks these glyphs cached,
-    // so discarding the uploads here would leave them invisible for good.
-    // Upload to every atlas that already exists; keep the rest (for fonts
-    // whose GPU state is created below, on their first draw) until then.
+    // Uploads can arrive in a frame with no draw for their font, and the CPU
+    // atlas already marks them cached: upload to existing atlases and keep
+    // the rest until their font's GPU state exists, never drop them.
     for (key, uploads) in &mut font_uploads.0 {
         if let Some(shared) = font_store.0.get(key) {
             shared.upload_glyphs(&render_queue, uploads);
@@ -534,7 +524,15 @@ fn process_tui_readbacks(
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
 ) {
-    pending.0.extend(receiver.0.lock().unwrap().try_iter());
+    // A poisoned lock only means another thread panicked mid-send; the
+    // queued requests are still valid.
+    pending.0.extend(
+        receiver
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .try_iter(),
+    );
     if pending.0.is_empty() {
         return;
     }
@@ -579,15 +577,12 @@ fn strip_row_padding(
     bytes_per_row: u32,
     height: u32,
 ) -> Vec<u8> {
-    let mut out = vec![0u8; (unpadded_bytes_per_row * height) as usize];
-    if bytes_per_row == unpadded_bytes_per_row {
-        out.copy_from_slice(padded);
-    } else {
-        for y in 0..height {
-            let src_offset = (y * bytes_per_row) as usize;
-            let dst_offset = (y * unpadded_bytes_per_row) as usize;
-            out[dst_offset..dst_offset + unpadded_bytes_per_row as usize]
-                .copy_from_slice(&padded[src_offset..src_offset + unpadded_bytes_per_row as usize]);
+    let row = unpadded_bytes_per_row as usize;
+    let mut out = vec![0u8; row * height as usize];
+    for (y, dst) in out.chunks_exact_mut(row.max(1)).enumerate() {
+        let src_offset = y * bytes_per_row as usize;
+        if let Some(src) = padded.get(src_offset..src_offset + dst.len()) {
+            dst.copy_from_slice(src);
         }
     }
     out
@@ -651,14 +646,14 @@ fn read_back_gpu_image_blocking(
             timeout: None,
         })
         .ok();
-    receiver
-        .recv()
-        .expect("map_async callback never ran")
-        .expect("failed to map readback buffer");
-
-    let mapped = buffer_slice
-        .get_mapped_range()
-        .expect("readback buffer was just mapped");
+    if !matches!(receiver.recv(), Ok(Ok(()))) {
+        tracing::warn!("Tui readback: mapping the staging buffer failed");
+        return Vec::new();
+    }
+    let Ok(mapped) = buffer_slice.get_mapped_range() else {
+        tracing::warn!("Tui readback: the staging buffer is not mapped");
+        return Vec::new();
+    };
     let out = strip_row_padding(&mapped, unpadded_bytes_per_row, bytes_per_row, height);
     drop(mapped);
     staging_buffer.unmap();
@@ -668,6 +663,12 @@ fn read_back_gpu_image_blocking(
 #[cfg(test)]
 mod row_padding_tests {
     use super::*;
+
+    #[test]
+    fn a_short_readback_buffer_leaves_missing_rows_zeroed() {
+        let out = strip_row_padding(&[1, 2, 3, 4, 9, 9], 4, 6, 2);
+        assert_eq!(out, [1, 2, 3, 4, 0, 0, 0, 0]);
+    }
 
     #[test]
     fn already_aligned_rows_need_no_padding() {

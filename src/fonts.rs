@@ -13,53 +13,63 @@ use ratatui::buffer::Cell;
 use rustybuzz::Face;
 use tracing::warn;
 
+self_cell::self_cell!(
+    /// Runtime-loaded font bytes and the `Face` parsed from them.
+    struct OwnedFace {
+        owner: std::sync::Arc<[u8]>,
+        #[covariant]
+        dependent: Face,
+    }
+);
+
+#[derive(Clone)]
+enum FontFace {
+    Static(Box<Face<'static>>),
+    Owned(std::sync::Arc<OwnedFace>),
+}
+
 /// A TrueType font that can be used for text rendering.
 #[derive(Clone)]
 pub struct Font {
-    font: Face<'static>,
+    face: FontFace,
     advance: f32,
     id: u64,
-    /// Keeps runtime-loaded font bytes alive for the lifetime of the `Face`
-    /// (`None` for `&'static` data).
-    _data: Option<std::sync::Arc<[u8]>>,
 }
 
 impl Font {
     /// Load a font from a static byte slice (e.g. `include_bytes!`).
     pub fn new(data: &'static [u8]) -> Option<Self> {
-        Self::build(data, None)
+        let face = Face::from_slice(data, 0)?;
+        Some(Self::build(
+            data,
+            &face,
+            FontFace::Static(Box::new(face.clone())),
+        ))
     }
 
     /// Load a font from owned bytes (e.g. `std::fs::read` at runtime).
     pub fn from_vec(data: Vec<u8>) -> Option<Self> {
-        let data: std::sync::Arc<[u8]> = data.into();
-        // SAFETY: `slice` points into the Arc's heap allocation, which
-        // - is never moved (Arc contents are heap-stable),
-        // - is never mutated (`Arc<[u8]>` is immutable),
-        // - outlives the `Face`: the Arc is stored in `_data` next to the
-        //   `Face`, `Clone` clones the Arc alongside the Face, and the field
-        //   order makes the Face drop first.
-        // The `Face` is never handed out with the `'static` lifetime beyond
-        // `&self` borrows (`Font::font()` is crate-private).
-        let slice: &'static [u8] = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(&data) };
-        Self::build(slice, Some(data))
+        let owned =
+            OwnedFace::try_new(data.into(), |bytes| Face::from_slice(bytes, 0).ok_or(())).ok()?;
+        let owned = std::sync::Arc::new(owned);
+        Some(Self::build(
+            owned.borrow_owner(),
+            owned.borrow_dependent(),
+            FontFace::Owned(std::sync::Arc::clone(&owned)),
+        ))
     }
 
-    fn build(data: &'static [u8], keep_alive: Option<std::sync::Arc<[u8]>>) -> Option<Self> {
+    fn build(data: &[u8], face: &Face<'_>, store: FontFace) -> Self {
         let mut hasher = RandomState::new().build_hasher();
         hasher.write(data);
-
-        Face::from_slice(data, 0).map(|font| {
-            let advance = font
-                .glyph_hor_advance(font.glyph_index('m').unwrap_or_default())
-                .unwrap_or_default() as f32;
-            Self {
-                font,
-                advance,
-                id: hasher.finish(),
-                _data: keep_alive,
-            }
-        })
+        let advance = face
+            .glyph_hor_advance(face.glyph_index('m').unwrap_or_default())
+            .unwrap_or_default() as f32;
+        Self {
+            face: store,
+            advance,
+            id: hasher.finish(),
+        }
     }
 }
 
@@ -68,12 +78,15 @@ impl Font {
         self.id
     }
 
-    pub(crate) fn font(&self) -> &Face<'static> {
-        &self.font
+    pub(crate) fn font(&self) -> &Face<'_> {
+        match &self.face {
+            FontFace::Static(face) => face,
+            FontFace::Owned(owned) => owned.borrow_dependent(),
+        }
     }
 
     pub(crate) fn char_width(&self, height_px: u32) -> u32 {
-        let scale = height_px as f32 / self.font.height() as f32;
+        let scale = height_px as f32 / self.font().height() as f32;
         (self.advance * scale) as u32
     }
 }
@@ -189,6 +202,15 @@ pub enum Shaping {
     Row,
 }
 
+/// Underline and strikeout bars in pixels from the cell top.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct DecorationMetrics {
+    pub(crate) underline_top: u32,
+    pub(crate) underline_thickness: u32,
+    pub(crate) strikeout_top: u32,
+    pub(crate) strikeout_thickness: u32,
+}
+
 /// A collection of fonts to use for rendering.
 pub struct Fonts {
     char_width: u32,
@@ -271,10 +293,67 @@ impl Fonts {
         }
     }
 
+    /// Where the primary font puts underline and strikeout bars in this cell grid.
+    pub(crate) fn decoration_metrics(&self) -> DecorationMetrics {
+        let face = self.regular.first().unwrap_or(&self.last_resort).font();
+        let cell_height = self.char_height;
+        let scale = cell_height as f32 / face.height() as f32;
+        let baseline = face.ascender() as f32 * scale;
+        let px = |units: f32| (units * scale).round().max(1.0) as u32;
+        let bar = |metrics: Option<rustybuzz::ttf_parser::LineMetrics>| {
+            metrics.filter(|m| m.thickness > 0).map(|m| {
+                (
+                    px(m.thickness as f32),
+                    (baseline - m.position as f32 * scale).round(),
+                )
+            })
+        };
+
+        let fallback_thickness = ((cell_height as f32 / 16.0).round() as u32).max(1);
+        let (underline_thickness, underline_top) = bar(face.underline_metrics()).unwrap_or((
+            fallback_thickness,
+            baseline.round() + fallback_thickness as f32,
+        ));
+        let (strikeout_thickness, strikeout_top) =
+            bar(face.strikeout_metrics()).unwrap_or_else(|| {
+                let x_height = face
+                    .x_height()
+                    .map_or(face.ascender() as f32 * 0.5, f32::from);
+                (
+                    underline_thickness,
+                    (baseline - x_height * scale / 2.0).round() - (underline_thickness / 2) as f32,
+                )
+            });
+
+        let clamp = |thickness: u32, top: f32| {
+            let thickness = thickness.min(cell_height).max(1);
+            (
+                thickness,
+                (top.max(0.0) as u32).min(cell_height.saturating_sub(thickness)),
+            )
+        };
+        let (underline_thickness, underline_top) = clamp(underline_thickness, underline_top);
+        let (strikeout_thickness, strikeout_top) = clamp(strikeout_thickness, strikeout_top);
+        DecorationMetrics {
+            underline_top,
+            underline_thickness,
+            strikeout_top,
+            strikeout_thickness,
+        }
+    }
+
     /// Whether `ch`, drawn by `font`, is a symbol - see
     /// [`crate::backend::glyph_constraint::CellClass::of`].
     fn cell_class(&self, ch: char, font: &Font) -> crate::backend::glyph_constraint::CellClass {
         use crate::backend::glyph_constraint::CellClass;
+        if crate::backend::programmatic_glyphs::fallback_symbols::is_fallback_symbol(ch)
+            && font.font().glyph_index(ch).is_none()
+        {
+            return CellClass {
+                fallback: true,
+                ..CellClass::TEXT
+            };
+        }
         if !self.fit_symbols {
             return CellClass::TEXT;
         }
@@ -377,10 +456,17 @@ impl Fonts {
             }
         }
 
-        self.bold_italic[bold_italic_len..].sort_by_key(|font| font.char_width(self.char_height));
-        self.italic[italic_len..].sort_by_key(|font| font.char_width(self.char_height));
-        self.bold[bold_len..].sort_by_key(|font| font.char_width(self.char_height));
-        self.regular[regular_len..].sort_by_key(|font| font.char_width(self.char_height));
+        let char_height = self.char_height;
+        for (fonts, from) in [
+            (&mut self.bold_italic, bold_italic_len),
+            (&mut self.italic, italic_len),
+            (&mut self.bold, bold_len),
+            (&mut self.regular, regular_len),
+        ] {
+            if let Some(added) = fonts.get_mut(from..) {
+                added.sort_by_key(|font| font.char_width(char_height));
+            }
+        }
     }
 
     /// Add a new collection of fonts for regular styled text.
@@ -663,8 +749,9 @@ impl Fonts {
         let len = target.len();
         target.extend(fonts);
 
-        target[len..]
+        target
             .iter()
+            .skip(len)
             .map(|font| font.char_width(char_height))
             .min()
             .unwrap_or(u32::MAX)

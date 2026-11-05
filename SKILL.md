@@ -166,6 +166,25 @@ let fonts = Arc::new(fonts);
 
 See `examples/emoji.rs` (`--features emoji`).
 
+Styling — every ratatui `Modifier` renders; use plain ratatui `Style`s:
+
+- `DIM` = lower fg alpha (`TerminalConfig::dim_alpha`, default 128);
+  `HIDDEN` = blank cell; `UNDERLINED` / `CROSSED_OUT` = bars in the fg color.
+- Opt-in features: `blink` (`SLOW_BLINK` / `RAPID_BLINK`, else ignored) and
+  `underline_color` (`Style::underline_color`, else the fg color).
+- The cursor from `frame.set_cursor_position(...)` is drawn as
+  `TerminalConfig::cursor_style` (`Block` default, `HollowBlock`,
+  `Underline`, `Bar`, `Hidden`).
+- `TerminalConfig::palette`: `TerminalPalette::default()` keeps historic
+  colors (`DarkGray` brighter than `Gray`), `xterm()` is standard,
+  `.with_ansi16([...])` themes.
+- Runtime changes (`Tui::set_dim_alpha` / `set_palette` /
+  `set_cursor_style`) redraw by themselves; no `draw` needed.
+- Box drawing (all weights, so ratatui's thick/dashed/merged borders),
+  blocks, Braille, Powerline, sextants/octants (`Marker::Sextant` /
+  `Octant`) are drawn procedurally; scrollbar/gauge symbols fall back to
+  procedural glyphs only when no font has them.
+
 ## Input, focus, and hit testing
 
 Read `MessageReader<TerminalEvent>` (bevy messages, not `EventReader`);
@@ -326,8 +345,9 @@ a complete interactive form built on nothing but `TerminalEvent` +
   `<MESH>.<MATERIAL>` (e.g. `Object_2.Monitor_Glass`), not after the node;
   exact-match, never prefix-match (`Object_2` also hits `Object_20`).
 - **Feature gates**: `2d`/`3d`/`keyboard_input`/`mouse_input` (all
-  default), plus opt-in `bold_italic_fonts`, `emoji` and `crossterm-compat`. `TuiKind::Ui` needs `2d`, `WorldQuad`
-  needs `3d`, `Headless` is always available.
+  default), plus opt-in `bold_italic_fonts`, `emoji`, `blink`,
+  `underline_color` and `crossterm-compat`. `TuiKind::Ui` needs `2d`,
+  `WorldQuad` needs `3d`, `Headless` is always available.
 
 ## Verification (what CI runs — .github/workflows/ci.yml)
 
@@ -336,7 +356,8 @@ cargo test --all-features                       # inline #[cfg(test)] modules;
                                                 # GPU tests skip without an adapter
 cargo clippy --all-features --all-targets -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
-cargo check --lib --no-default-features         # + --features 2d / 3d variants
+cargo check --lib --no-default-features         # + --features 2d / 3d / blink /
+                                                # underline_color variants
 cargo check --target wasm32-unknown-unknown --example wasm_demo
 cargo run --example helloworld                  # ALWAYS cargo run, never the bare
                                                 # binary (assets resolve via CARGO_MANIFEST_DIR)

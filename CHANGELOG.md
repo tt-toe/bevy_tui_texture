@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.5.0
+
+### Added
+- **Every ratatui `Modifier` is drawn.** `DIM` lowers the foreground alpha
+  (default 128, `with_dim_alpha` / `set_dim_alpha`); `HIDDEN` draws a blank in
+  the cell's colors; `UNDERLINED` and `CROSSED_OUT` are bars at the primary
+  font's metrics. Rows without them cost nothing extra.
+- **Blinking** (feature `blink`): `SLOW_BLINK` / `RAPID_BLINK` cells blank out
+  every other 500 / 200 ms; only rows with blinking cells are redrawn.
+- **Cursor**: the cursor set with `Frame::set_cursor_position` is drawn as a
+  `CursorStyle` (`Block`, `HollowBlock`, `Underline`, `Bar`, `Hidden`).
+- **`TerminalPalette`** for the 16 named and 256 indexed colors: `default()`
+  keeps the previous values, `xterm()` makes `Color::Red` equal
+  `Color::Indexed(1)`, `with_ansi16` applies a theme.
+- **Underline color** (feature `underline_color`): underlines use
+  `Cell::underline_color` unless it is `Reset`.
+- Procedural glyphs for ratatui's `Marker::Sextant` / `Marker::Octant`, the
+  wedges U+1FB3C–1FB67 and the triangles U+25E2–25E5, U+25F8–25FA, U+25FF.
+  `←↑→↓ ▲►▼◄ ▰▱ • ×` fall back to procedural glyphs when no font has them.
+
+### Changed
+- **Breaking:** `TerminalConfig` gained `dim_alpha`, `palette` and
+  `cursor_style`; struct literals need `..Default::default()`.
+- **Behavior:** a cursor the app shows is now drawn; use
+  `CursorStyle::Hidden` for the old look.
+- No `unsafe` code (`#![deny(unsafe_code)]`) and no panicking paths outside
+  tests: runtime-loaded fonts use `self_cell`, and the `evictor` dependency is
+  gone.
+
+### Fixed
+- 80 of the 128 box-drawing characters (mixed light/heavy such as `┣ ╋`, the
+  double dashes `╌ ╍ ╎ ╏`, half lines `╴ ╵ ╶ ╷`, some double/single mixes)
+  were invisible. All lines and junctions are now built from their four arm
+  weights (Ghostty's `linesChar`), so ratatui's thick, dashed and merged
+  borders render and adjacent cells always join.
+- Shades `░ ▒ ▓` are a one-pixel 25/50/75% dither that holds at any size and
+  tiles across even-sized cells (`▓` was a solid block and the dot patterns
+  fell apart at small sizes). Braille dots are equal squares on whole pixels
+  with gaps between them, as Ghostty draws them (they were sub-pixel circles
+  that merged or vanished).
+- A zero-width or oversized cell no longer divides by zero in the glyph atlas,
+  and a short GPU readback no longer panics.
+
 ## 0.4.2
 
 ### Added

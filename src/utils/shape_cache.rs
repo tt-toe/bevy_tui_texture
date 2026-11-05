@@ -64,13 +64,16 @@ impl FontCellShapes {
             (Some(ch), None) => Some((ch, ch as usize & (Self::SINGLE_SLOTS - 1))),
             _ => None,
         };
-        if let Some((ch, slot)) = single
-            && self.single[slot].is_some_and(|(cached, _)| cached == ch)
-        {
-            return self.single[slot]
-                .as_ref()
-                .map(|(_, glyph)| std::slice::from_ref(glyph))
-                .expect("checked above");
+        let hit = single.and_then(|(ch, slot)| {
+            matches!(self.single.get(slot), Some(Some((cached, _))) if *cached == ch)
+                .then_some(slot)
+        });
+        if let Some(slot) = hit {
+            return self
+                .single
+                .get(slot)
+                .and_then(Option::as_ref)
+                .map_or(&[], |(_, glyph)| std::slice::from_ref(glyph));
         }
         if !self.all.contains_key(symbol) {
             if self.all.len() >= Self::MAX_SYMBOLS {
@@ -78,9 +81,11 @@ impl FontCellShapes {
             }
             self.all.insert(symbol.into(), shape().into_boxed_slice());
         }
-        let glyphs = &self.all[symbol];
-        if let (Some((ch, slot)), [glyph]) = (single, &**glyphs) {
-            self.single[slot] = Some((ch, *glyph));
+        let glyphs = self.all.get(symbol).map_or(&[][..], |glyphs| &**glyphs);
+        if let (Some((ch, slot)), [glyph]) = (single, glyphs)
+            && let Some(entry) = self.single.get_mut(slot)
+        {
+            *entry = Some((ch, *glyph));
         }
         glyphs
     }
@@ -114,9 +119,12 @@ impl FontChoiceCache {
         style: u8,
         choose: impl FnOnce() -> FontChoice,
     ) -> FontChoice {
-        debug_assert!(style < 4);
         if ch.is_ascii() {
-            *self.ascii[ch as usize | (style as usize) << 7].get_or_insert_with(choose)
+            let index = ch as usize | usize::from(style & 3) << 7;
+            match self.ascii.get_mut(index) {
+                Some(slot) => *slot.get_or_insert_with(choose),
+                None => choose(),
+            }
         } else {
             *self.other.entry((ch, style)).or_insert_with(choose)
         }

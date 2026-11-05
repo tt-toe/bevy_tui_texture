@@ -34,9 +34,8 @@ fn setup(mut commands: Commands) {
             .expect("Failed to load font")
             .copy_font_data()
             .expect("Failed to copy font data");
-        let font_data: &'static [u8] = Box::leak(font_data.to_vec().into_boxed_slice());
         Arc::new(Fonts::new(
-            TerminalFont::new(font_data).expect("Failed to parse font"),
+            TerminalFont::from_vec(font_data.to_vec()).expect("Failed to parse font"),
             16,
         ))
     };

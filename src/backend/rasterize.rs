@@ -394,7 +394,7 @@ pub(super) fn rasterize_color_glyph(
         }
         _ => return None,
     };
-    if pw == 0 || ph == 0 {
+    if pw == 0 || ph == 0 || w == 0 || h == 0 {
         return None;
     }
 
@@ -406,7 +406,9 @@ pub(super) fn rasterize_color_glyph(
     let (x0, y0) = ((w - fit_w) / 2, (h - fit_h) / 2);
     for (row, line) in scaled.chunks_exact(fit_w * 4).enumerate() {
         let start = ((y0 + row) * w + x0) * 4;
-        out[start..start + line.len()].copy_from_slice(line);
+        if let Some(dst) = out.get_mut(start..start + line.len()) {
+            dst.copy_from_slice(line);
+        }
     }
     Some(out)
 }
@@ -424,14 +426,19 @@ fn box_down(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<u8> {
             for yy in y0..y1 {
                 for xx in x0..x1 {
                     let i = (yy * sw + xx) * 4;
-                    for c in 0..4 {
-                        sum[c] += src[i + c] as u32;
+                    if let Some(&[r, g, b, a]) = src.get(i..i + 4) {
+                        for (sum, value) in sum.iter_mut().zip([r, g, b, a]) {
+                            *sum += u32::from(value);
+                        }
+                        n += 1;
                     }
-                    n += 1;
                 }
             }
-            for c in 0..4 {
-                out[(y * dw + x) * 4 + c] = (sum[c] / n.max(1)) as u8;
+            let i = (y * dw + x) * 4;
+            if let Some(dst) = out.get_mut(i..i + 4) {
+                for (dst, sum) in dst.iter_mut().zip(sum) {
+                    *dst = (sum / n.max(1)) as u8;
+                }
             }
         }
     }
@@ -460,11 +467,10 @@ fn extract_color_image(
         RasterImageFormat::BitmapPremulBgra32 => {
             image.resize(raster.width as usize * raster.height as usize, 0);
             for (y, row) in raster.data.chunks(raster.width as usize * 4).enumerate() {
-                for (x, pixel) in row.chunks(4).enumerate() {
-                    let pixel: &[u8; 4] = pixel.try_into().expect("Invalid chunk size");
-                    let [b, g, r, a] = *pixel;
-                    let pixel = u32::from_be_bytes([a, r, g, b]);
-                    image[y * raster.width as usize + x] = pixel;
+                for (x, &[b, g, r, a]) in row.as_chunks::<4>().0.iter().enumerate() {
+                    if let Some(dst) = image.get_mut(y * raster.width as usize + x) {
+                        *dst = u32::from_be_bytes([a, r, g, b]);
+                    }
                 }
             }
         }
@@ -579,7 +585,7 @@ fn from_gray_unpacked<const BITS: usize, const ENTRIES: usize>(
             for idx in bits.iter_ones() {
                 index |= 1 << (BITS - idx - 1);
             }
-            let value = steps[index as usize];
+            let value = steps.get(index as usize).copied().unwrap_or(0);
             *dst = u32::from_be_bytes([value, 255, 255, 255]);
         }
     }
@@ -596,7 +602,7 @@ fn from_gray_packed<const BITS: usize, const ENTRIES: usize>(
         for idx in bits.iter_ones() {
             index |= 1 << (BITS - idx - 1);
         }
-        let value = steps[index as usize];
+        let value = steps.get(index as usize).copied().unwrap_or(0);
         *dst = u32::from_be_bytes([value, 255, 255, 255]);
     }
 }

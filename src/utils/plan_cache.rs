@@ -1,6 +1,3 @@
-use std::num::NonZeroUsize;
-
-use evictor::Lru;
 use rustybuzz::Direction;
 use rustybuzz::Script;
 use rustybuzz::ShapePlan;
@@ -15,25 +12,24 @@ struct Key {
     script: Script,
 }
 
+/// Least-recently-used rustybuzz shape plans; a handful per font, so a
+/// linear scan beats hashing.
 pub(crate) struct PlanCache {
-    lru: Lru<Key, ShapePlan>,
+    capacity: usize,
+    /// Most recently used last.
+    plans: Vec<(Key, ShapePlan)>,
 }
-
-// SAFETY: evictor 0.7's `Lru` exclusively owns its arena (the raw pointers it
-// holds only point into that arena) and has no thread-affine state, so
-// moving it to another thread is sound for `Send` keys/values. Only `Send`
-// is asserted - shared access always goes through the `Mutex` in
-// `Fonts::with_shared_cpu_state`.
-unsafe impl Send for PlanCache {}
 
 impl PlanCache {
     pub(crate) fn new(capacity: usize) -> Self {
         Self {
-            lru: Lru::new(NonZeroUsize::new(capacity).expect("Capacity must be non-zero")),
+            capacity: capacity.max(1),
+            plans: Vec::new(),
         }
     }
 
-    pub(crate) fn get(&mut self, font: &Font, buffer: &mut UnicodeBuffer) -> &ShapePlan {
+    /// The plan for `buffer`'s direction and script in `font`, building it on a miss.
+    pub(crate) fn get(&mut self, font: &Font, buffer: &mut UnicodeBuffer) -> Option<&ShapePlan> {
         buffer.guess_segment_properties();
         let key = Key {
             face_id: font.id(),
@@ -41,16 +37,25 @@ impl PlanCache {
             script: buffer.script(),
         };
 
-        self.lru
-            .get_or_insert_with(key, |_| {
-                ShapePlan::new(
+        match self.plans.iter().position(|(cached, _)| *cached == key) {
+            Some(index) => {
+                let entry = self.plans.remove(index);
+                self.plans.push(entry);
+            }
+            None => {
+                if self.plans.len() >= self.capacity {
+                    self.plans.remove(0);
+                }
+                let plan = ShapePlan::new(
                     font.font(),
                     buffer.direction(),
                     Some(buffer.script()),
                     buffer.language().as_ref(),
                     &[],
-                )
-            })
-            .0
+                );
+                self.plans.push((key, plan));
+            }
+        }
+        self.plans.last().map(|(_, plan)| plan)
     }
 }

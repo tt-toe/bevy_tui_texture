@@ -90,8 +90,8 @@ pub(crate) struct Atlas {
 
 impl Atlas {
     pub(crate) fn new(fonts: &Fonts, width: u32, height: u32) -> Self {
-        let entry_width = fonts.min_width_px() * 2;
-        let entry_height = fonts.height_px();
+        let entry_width = (fonts.min_width_px() * 2).max(1);
+        let entry_height = fonts.height_px().max(1);
         let max_entries = ((width / entry_width) * (height / entry_height)).max(1);
         info!(
             "Glyph atlas: {width}x{height}px in use, entries {entry_width}x{entry_height}px, capacity {max_entries}"
@@ -121,19 +121,11 @@ impl Atlas {
         self.epoch += 1;
     }
 
-    pub(crate) fn get(&mut self, key: &Key, width: u32, height: u32) -> Entry {
-        debug_assert_eq!(
-            self.entry_height, height,
-            "Internal height not equal to provided height - entry size is fixed at Atlas::new time"
-        );
-        debug_assert_eq!(
-            self.entry_width % width,
-            0,
-            "Internal width not a multiple of provided width - entry size is fixed at Atlas::new time"
-        );
-
+    pub(crate) fn get(&mut self, key: &Key, width: u32, _height: u32) -> Entry {
         if let Some(&slot) = self.index.get(key) {
-            self.slots[slot as usize].last_used = self.epoch;
+            if let Some(cached) = self.slots.get_mut(slot as usize) {
+                cached.last_used = self.epoch;
+            }
             return Entry::Cached(self.slot_to_rect(slot, width));
         }
 
@@ -146,11 +138,13 @@ impl Atlas {
         } else {
             self.generation += 1;
             let slot = self.evict();
-            self.index.remove(&self.slots[slot as usize].key);
-            self.slots[slot as usize] = Slot {
-                key: *key,
-                last_used: self.epoch,
-            };
+            if let Some(evicted) = self.slots.get_mut(slot as usize) {
+                self.index.remove(&evicted.key);
+                *evicted = Slot {
+                    key: *key,
+                    last_used: self.epoch,
+                };
+            }
             slot
         };
         self.index.insert(*key, slot);
@@ -161,11 +155,15 @@ impl Atlas {
     /// one no flush has touched for a while, otherwise any slot the current
     /// flush hasn't used.
     fn evict(&mut self) -> u32 {
-        let count = self.slots.len() as u32;
+        let count = (self.slots.len() as u32).max(1);
         for stale_before in [self.epoch.saturating_sub(1), self.epoch] {
             for step in 0..count {
                 let slot = (self.hand + step) % count;
-                if self.slots[slot as usize].last_used < stale_before {
+                if self
+                    .slots
+                    .get(slot as usize)
+                    .is_some_and(|candidate| candidate.last_used < stale_before)
+                {
                     self.hand = (slot + 1) % count;
                     return slot;
                 }
@@ -177,8 +175,9 @@ impl Atlas {
     }
 
     fn slot_to_rect(&self, slot: u32, width: u32) -> CacheRect {
-        let x = slot % (self.width / self.entry_width) * self.entry_width;
-        let y = slot / (self.width / self.entry_width) * self.entry_height;
+        let columns = (self.width / self.entry_width).max(1);
+        let x = slot % columns * self.entry_width;
+        let y = slot / columns * self.entry_height;
         CacheRect {
             x,
             y,
@@ -196,6 +195,29 @@ mod tests {
     use crate::Fonts;
     use crate::utils::text_atlas::Atlas;
     use crate::utils::text_atlas::Key;
+
+    #[test]
+    fn an_atlas_smaller_than_one_entry_still_hands_out_slots() {
+        let fonts = Fonts::new(
+            Font::new(include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/examples/assets/fonts/Mplus1Code-Regular.ttf"
+            )))
+            .expect("font"),
+            32,
+        );
+        let mut atlas = Atlas::new(&fonts, 1, 1);
+        let key = |glyph| Key {
+            style: Modifier::empty(),
+            glyph,
+            font: 0,
+            cells: 1,
+        };
+        let (w, h) = (fonts.min_width_px(), fonts.height_px());
+        assert!(!atlas.get(&key(1), w, h).cached());
+        assert!(!atlas.get(&key(2), w, h).cached());
+        assert!(atlas.get(&key(2), w, h).cached());
+    }
 
     #[test]
     fn reuse() {

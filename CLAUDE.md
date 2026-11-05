@@ -15,9 +15,17 @@ can name matching types).
 ## Comments
 
 Keep source comments to the necessary minimum: a one-sentence doc comment on
-public items, and a line comment only for what the code cannot say (safety,
-ordering constraints, traps). Never put sample code in a comment; examples
-belong in `examples/` and the README.
+public items, and a line comment only for what the code cannot say (ordering
+constraints, traps). Never put sample code in a comment; examples belong in
+`examples/` and the README.
+
+## Safety
+
+`#![deny(unsafe_code)]`, and no panicking paths outside tests: no
+`unwrap`/`expect`/`unreachable!`/`assert!` (not even `debug_assert!` - users
+run debug builds), slice/index with `get`, divide only by values clamped to
+at least 1, subtract unsigned values with `saturating_sub`, and treat a
+poisoned `Mutex` as usable (`unwrap_or_else(|e| e.into_inner())`).
 
 ## Build & Verify
 
@@ -78,6 +86,13 @@ feature (the lib's own bevy is default-features=false and logs nothing).
   otherwise bold/italic are faked from the regular font
 - `emoji` (opt-in) — color emoji (see "Color glyphs" below; pulls in
   `unicode-properties`). Without it, register a monochrome emoji font instead
+- `blink` (opt-in) — `SLOW_BLINK`/`RAPID_BLINK` and cursor blink: `blink_system`
+  (src/bevy_plugin.rs, `Time<Real>`) flips the off phase, reshaping only rows
+  whose `RowGeometry::blink` changed. Off, every blink item is `#[cfg]`'d out
+  and the compiled hot path is unchanged
+- `underline_color` (opt-in) — underlines in `Cell::underline_color` via
+  ratatui-core's `underline-color`; opt-in because it grows every ratatui
+  `Cell` (about 1% on the CPU hot path). Without it underlines use the fg
 - `crossterm-compat` (opt-in, native-only) — `InputEvent::to_crossterm`/
   `from_crossterm` (src/input/crossterm_compat.rs), lossy conversions
   to/from `crossterm::event::Event` for interop with ratatui-ecosystem
@@ -175,6 +190,25 @@ slot's right half; the blank is marked `Cover::SymbolTail` so its own glyph
 is skipped. Whether a cell is a symbol (`CellClass`) is memoized with its
 font choice; `FontRun::symbols` keeps text runs from asking per cell.
 
+### Appearance (modifiers, cursor, palette)
+
+None of it changes `CellInstance`, the shaders or the pipelines, and a row
+that doesn't use it pays at most one OR of its cells' modifiers:
+
+- Underline, strikeout and non-block cursors are overlay instances sampling
+  the `'█'` slot (`solid_slot`), one per cell, kept inside the cell; their
+  position is `Fonts::decoration_metrics`, computed at build/`update_fonts`.
+- `DIM` is a lower fg alpha in `cell_colors`. HIDDEN cells, blink cells in
+  their off phase, and the `Block` cursor are rewritten in a scratch copy of
+  the row (`blank_invisible`) before shaping.
+- ratatui calls the cursor ops on every draw; they dirty rows only on change.
+- `TerminalPalette::default()` keeps the old SVG-keyword named colors
+  (`DarkGray` brighter than `Gray`); `xterm()` unifies named and indexed.
+- Setting changes reshape via `reshape_dirty_rows` / `restyle_all_rows`
+  outside `flush`, possibly before the first draw sized the per-row state.
+  `TuiRequest` applies them through setters right after
+  `TerminalTexture::create`, whose signature stays fixed.
+
 ### Color glyphs (feature `emoji`)
 
 A cell with emoji presentation (`emoji_presentation`, src/fonts.rs) uses a font
@@ -253,13 +287,29 @@ benchmark's own paint closures), so confirm with a time profile
 (`xcrun xctrace record --template 'Time Profiler'`) before chasing them.
 Compare like with like: thin and fat LTO differ by more than most changes
 (`static` is about 68 µs on thin and 115 µs on fat, `full_text` about 280 and
-215).
+215). `decorated_text` times underline/strikeout/DIM rows (about 1.35x
+`styled_text`: one overlay instance per decorated cell). For a fair
+before/after, build both trees into separate target dirs and alternate the
+two binaries; a single target dir can reuse the other tree's artifact.
 
 ### Other modules
 
 - **src/backend/** — `bevy_backend.rs` (ratatui `Backend` impl),
   `rasterize.rs` (rustybuzz + raqote), `programmatic_glyphs/`
-  (box-drawing, braille, block elements, powerline — procedural)
+  (procedural: box-drawing via `box_lines.rs` (4-direction line weights,
+  Ghostty `linesChar`), block elements, braille, powerline, `mosaic.rs`
+  (sextants/octants inverted from ratatui's `symbols::pixel` tables, plus the
+  U+1FB3C wedges), `geometric.rs` (triangles), `fallback_symbols.rs`
+  (arrows, `▲►▼◄`, `▰▱`, `•`, `×`: used only when no font has the glyph;
+  memoized as `CellClass::fallback` with the font choice, and
+  `FontRun::fallbacks` keeps text runs from checking per glyph). Only the
+  original four ranges are pre-rasterized (`all_programmatic_glyphs`); the
+  newer ranges rasterize lazily on first use. `is_programmatic_glyph` runs
+  per glyph, so it rejects everything below U+2500 with one compare first.
+  `ratatui_symbols_are_all_drawable` guards ratatui's symbol sets, and
+  `box_lines_join_across_cells` checks every line weight meets its
+  neighbor's at the cell edges - box glyphs must all come from `draw_lines`,
+  or adjacent cells misalign)
 - **src/bevy_plugin.rs** — `TerminalPlugin`, `TerminalSystemSet`
   (Input → UserUpdate → Render in `Update`), the systems above
 - **src/input/** — message-driven (`TerminalEvent` via `MessageReader`,
@@ -293,7 +343,7 @@ Compare like with like: thin and fat LTO differ by more than most changes
   "Nerd Font Mono" primary.
 - **src/utils/** — `text_atlas.rs` (glyph atlas slot index),
   `shape_cache.rs` (per-cell shape + font-choice caches), `plan_cache.rs`
-  (rustybuzz shape plans, `evictor` LRU)
+  (rustybuzz shape plans, a small `Vec` LRU)
 
 ## Key Patterns
 
@@ -356,8 +406,8 @@ this contract plus `HitRegions` — the reference for how little app code
 that costs (no form/widget framework ships in this crate).
 
 Fonts: TrueType only. `Font::new(&'static [u8])` for `include_bytes!`,
-`Font::from_vec(Vec<u8>)` for runtime-loaded data (Arc-backed, never
-`Box::leak`). Default example font:
+`Font::from_vec(Vec<u8>)` for runtime-loaded data (owned through
+`self_cell`, never `Box::leak`). Default example font:
 `examples/assets/fonts/Mplus1Code-Regular.ttf`.
 
 ## Common Gotchas
@@ -554,7 +604,7 @@ automatically, no manual Node bookkeeping.
 
 | bevy | ratatui | wgpu | bevy_tui_texture |
 |------|---------|------|------------------|
-| 0.20 | 0.30.2  | 30   | 0.4              |
+| 0.20 | 0.30.2  | 30   | 0.4, 0.5         |
 
 Rust edition 2024, `rust-version = "1.97.1"` — tracks bevy 0.20's MSRV, not
 this crate's own code (see README.md "MSRV policy").

@@ -28,32 +28,6 @@ pub fn draw_rect(pixmap: &mut Pixmap, x: f32, y: f32, width: f32, height: f32, c
     }
 }
 
-/// Draw a horizontal line across the full width of the pixmap
-/// Note: Goes exactly from edge to edge (0 to width) for pixel-perfect alignment
-pub fn draw_horizontal_line(pixmap: &mut Pixmap, y: f32, stroke: f32, color: Color) {
-    draw_rect(
-        pixmap,
-        0.0,
-        y - stroke / 2.0,
-        pixmap.width() as f32,
-        stroke,
-        color,
-    );
-}
-
-/// Draw a vertical line across the full height of the pixmap
-/// Note: Goes exactly from edge to edge (0 to height) for pixel-perfect alignment
-pub fn draw_vertical_line(pixmap: &mut Pixmap, x: f32, stroke: f32, color: Color) {
-    draw_rect(
-        pixmap,
-        x - stroke / 2.0,
-        0.0,
-        stroke,
-        pixmap.height() as f32,
-        color,
-    );
-}
-
 /// Draw a stroked line from (x1, y1) to (x2, y2)
 pub fn draw_line(
     pixmap: &mut Pixmap,
@@ -189,10 +163,12 @@ pub fn draw_polygon(pixmap: &mut Pixmap, points: &[(f32, f32)], color: Color) {
     paint.set_color(color);
     paint.anti_alias = false;
 
+    let Some((&(x0, y0), rest)) = points.split_first() else {
+        return;
+    };
     let mut pb = PathBuilder::new();
-    pb.move_to(points[0].0, points[0].1);
-
-    for &(x, y) in &points[1..] {
+    pb.move_to(x0, y0);
+    for &(x, y) in rest {
         pb.line_to(x, y);
     }
     pb.close();

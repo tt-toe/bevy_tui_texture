@@ -1,5 +1,18 @@
 use super::primitives::*;
-use tiny_skia::Pixmap;
+use tiny_skia::{Pixmap, PremultipliedColorU8};
+
+/// Turns on the pixels `on` selects.
+fn dither(pixmap: &mut Pixmap, on: impl Fn(u32, u32) -> bool) {
+    let Some(white) = PremultipliedColorU8::from_rgba(255, 255, 255, 255) else {
+        return;
+    };
+    let width = pixmap.width().max(1);
+    for (i, pixel) in pixmap.pixels_mut().iter_mut().enumerate() {
+        if on(i as u32 % width, i as u32 / width) {
+            *pixel = white;
+        }
+    }
+}
 
 pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
     let mut pixmap = Pixmap::new(width, height)?;
@@ -27,54 +40,11 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
 
         '▐' => draw_rect(&mut pixmap, w / 2.0, 0.0, w / 2.0, h, color),
 
-        '░' => {
-            let dot_size = stroke_width(height) * 0.5;
-            let cols = 4;
-            let rows = 8;
-            let cell_w = w / cols as f32;
-            let cell_h = h / rows as f32;
-
-            for row in 0..rows {
-                for col in 0..cols {
-                    if (row % 2 == 0 && col % 2 == 0) || (row % 2 == 1 && col % 2 == 1) {
-                        let x = col as f32 * cell_w + (cell_w - dot_size) / 2.0;
-                        let y = row as f32 * cell_h + (cell_h - dot_size) / 2.0;
-                        draw_rect(&mut pixmap, x, y, dot_size, dot_size, color);
-                    }
-                }
-            }
-        }
-        '▒' => {
-            let dot_size = stroke_width(height) * 0.5;
-            let cols = 4;
-            let rows = 8;
-            let cell_w = w / cols as f32;
-            let cell_h = h / rows as f32;
-
-            for row in 0..rows {
-                for col in 0..cols {
-                    if (row % 2 == 0 && col % 2 == 0) || (row % 2 == 1 && col % 2 == 1) {
-                        let x = col as f32 * cell_w + (cell_w - dot_size) / 2.0;
-                        let y = row as f32 * cell_h + (cell_h - dot_size) / 2.0;
-                        draw_rect(&mut pixmap, x, y, dot_size, dot_size, color);
-                    }
-                }
-            }
-
-            let small_dot = dot_size * 0.6;
-            for row in 0..rows {
-                for col in 0..cols {
-                    if (row % 2 == 0 && col % 2 == 1) || (row % 2 == 1 && col % 2 == 0) {
-                        let x = col as f32 * cell_w + (cell_w - small_dot) / 2.0;
-                        let y = row as f32 * cell_h + (cell_h - small_dot) / 2.0;
-                        draw_rect(&mut pixmap, x, y, small_dot, small_dot, color);
-                    }
-                }
-            }
-        }
-        '▓' => {
-            draw_rect(&mut pixmap, 0.0, 0.0, w, h, color);
-        }
+        // One-pixel dither with a period of two, so it survives any cell
+        // size and tiles seamlessly across cells of even width and height.
+        '░' => dither(&mut pixmap, |x, y| x % 2 == 0 && y % 2 == 0),
+        '▒' => dither(&mut pixmap, |x, y| (x + y) % 2 == 0),
+        '▓' => dither(&mut pixmap, |x, y| x % 2 == 0 || y % 2 == 1),
 
         '▔' => draw_rect(&mut pixmap, 0.0, 0.0, w, h / 8.0, color),
         '▕' => draw_rect(&mut pixmap, w - w / 8.0, 0.0, w / 8.0, h, color),
@@ -115,4 +85,32 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
     }
 
     Some(pixmap)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shades_dither_a_quarter_half_and_three_quarters() {
+        for (c, on) in [('░', 32), ('▒', 64), ('▓', 96)] {
+            let pixmap = render(c, 8, 16).unwrap();
+            let lit = pixmap.pixels().iter().filter(|p| p.alpha() == 255).count();
+            assert_eq!(lit, on, "{c}");
+            assert!(
+                pixmap.pixels().iter().all(|p| matches!(p.alpha(), 0 | 255)),
+                "{c}"
+            );
+        }
+    }
+
+    #[test]
+    fn shades_tile_across_even_cells() {
+        for c in ['░', '▒', '▓'] {
+            let pixmap = render(c, 8, 16).unwrap();
+            let at = |x: usize, y: usize| pixmap.pixels()[y * 8 + x].alpha();
+            assert!((0..16).all(|y| at(0, y) == at(2, y)), "{c}: columns");
+            assert!((0..8).all(|x| at(x, 0) == at(x, 2)), "{c}: rows");
+        }
+    }
 }

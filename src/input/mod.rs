@@ -467,27 +467,12 @@ fn bounding_box_hit_test(
         }
     };
 
-    // Coordinate system handling for Bevy UI:
-    // - Cursor (input) is in UI coordinates: top-left origin, +Y down, pixels.
-    // - `UiGlobalTransform` (bevy's UI-specific transform - plain
-    //   `GlobalTransform` is NOT among `Node`'s required components and is
-    //   simply absent on pure-UI entities) resolves to the same top-left
-    //   origin, +Y down, pixel space as the cursor, but gives the node's
-    //   CENTER - so it works for ANY anchor mode (left/top, right/bottom,
-    //   percent, ...), unlike reading `Node.left`/`Node.top` directly (which
-    //   silently reads 0 for any axis anchored from the opposite edge).
+    // `UiGlobalTransform` gives the node's center in the cursor's top-left,
+    // +Y-down space for any anchoring (plain `GlobalTransform` is absent on
+    // UI nodes, and `Node.left/top` read 0 for opposite-edge anchors).
     let (node_min_x, node_min_y) = if let Some(t) = ui_transform {
-        // `UiGlobalTransform::translation` is in the same physical-pixel
-        // space as `ComputedNode.size` (bevy's taffy layout runs
-        // entirely in physical pixels) - must be scaled to logical pixels
-        // by the same `inverse_scale_factor` as `width_px`/`height_px`
-        // above, or the computed bounds are wrong by exactly the window's
-        // scale factor. Harmless at scale_factor 1.0 (common on non-Retina
-        // Windows/Linux setups), but on macOS's default Retina
-        // scale_factor of 2.0 this put the node's bounding box at 2x its
-        // real logical position, so clicks always missed - reproduced both
-        // natively and in wasm (wasm on a Retina Mac also reports
-        // `devicePixelRatio` 2).
+        // Physical pixels, like `ComputedNode.size`: scale to logical pixels
+        // or clicks miss by the window's scale factor (2x on Retina).
         let center = t.translation * inverse_scale;
         debug!(
             "UiGlobalTransform center=({:.1}, {:.1}), size=({:.1}x{:.1})",
@@ -1020,7 +1005,8 @@ pub fn mouse_input_system(
     if hit_candidates.len() > 1 {
         debug!(
             "After sorting, selected: Entity {:?} with sort_key={:?}",
-            hit_candidates[0].0, hit_candidates[0].2
+            hit_candidates.first().map(|c| c.0),
+            hit_candidates.first().map(|c| c.2)
         );
     }
 
@@ -1409,7 +1395,9 @@ pub fn terminal_focus_system(
         None => 0,
     };
 
-    let next_entity = terminal_entities[next_index];
+    let Some(&next_entity) = terminal_entities.get(next_index) else {
+        return;
+    };
 
     if focus.focused != Some(next_entity) {
         if let Some(old_focus) = focus.focused {

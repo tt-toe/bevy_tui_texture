@@ -617,6 +617,8 @@ fn draw_glyphs_tab(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
             Constraint::Length(3),
             Constraint::Length(5),
             Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
             Constraint::Min(0),
         ])
         .margin(1)
@@ -685,6 +687,37 @@ fn draw_glyphs_tab(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
         Paragraph::new(powerline_lines).block(Block::bordered().title("Powerline Symbols"));
     frame.render_widget(powerline_para, chunks[4]);
 
+    let modifier_line = Line::from(vec![
+        Span::styled("dim", Style::default().add_modifier(Modifier::DIM)),
+        Span::raw(" "),
+        Span::styled("hidden", Style::default().add_modifier(Modifier::HIDDEN)),
+        Span::raw(" "),
+        Span::styled("underlined", underlined_style()),
+        Span::raw(" "),
+        Span::styled(
+            "crossed",
+            Style::default().add_modifier(Modifier::CROSSED_OUT),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            "reversed",
+            Style::default().add_modifier(Modifier::REVERSED),
+        ),
+    ]);
+    frame.render_widget(
+        Paragraph::new(modifier_line).block(Block::bordered().title("Modifiers")),
+        chunks[5],
+    );
+
+    let mosaic_line = Line::styled(
+        "Sextants 🬀🬁🬂🬃🬄🬅🬆 Octants \u{1CD00}\u{1CD01}\u{1CD02}\u{1CD03} Wedges 🬼🬽🬾🬿 ◢◣◤◥",
+        Style::default().fg(RatatuiColor::Yellow),
+    );
+    frame.render_widget(
+        Paragraph::new(mosaic_line).block(Block::bordered().title("Sextants, Octants, Wedges")),
+        chunks[6],
+    );
+
     let info = Paragraph::new(vec![
         Line::from(""),
         Line::from("All glyphs above are programmatically rendered")
@@ -695,5 +728,12 @@ fn draw_glyphs_tab(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
         Line::from("runtime overhead."),
     ])
     .block(Block::bordered().title("Info"));
-    frame.render_widget(info, chunks[5]);
+    frame.render_widget(info, chunks[7]);
+}
+
+fn underlined_style() -> Style {
+    let style = Style::default().add_modifier(Modifier::UNDERLINED);
+    #[cfg(feature = "underline_color")]
+    let style = style.underline_color(RatatuiColor::Red);
+    style
 }

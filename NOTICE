@@ -3,7 +3,11 @@ The following components are included in this library:
 Ghostty (https://ghostty.org/) - the symbol constraint math in
 src/backend/glyph_constraint/mod.rs is a port of Ghostty's
 src/font/Glyph.zig, and tools/nerd_font_constraints.py is adapted from its
-src/font/nerd_font_codegen.py.
+src/font/nerd_font_codegen.py, and
+src/backend/programmatic_glyphs/box_lines.rs is a port of `linesChar` from its
+src/font/sprite/draw/box.zig, and the wedge table in
+src/backend/programmatic_glyphs/mosaic.rs is a port of the patterns in its
+src/font/sprite/draw/symbols_for_legacy_computing.zig.
 MIT License
 
 Copyright (c) 2024 Mitchell Hashimoto, Ghostty contributors

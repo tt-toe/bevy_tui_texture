@@ -1,6 +1,6 @@
 [package]
 name = "bevy_tui_texture"
-version = "0.4.2"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.97.1"
 authors = ["TTT"]
@@ -19,6 +19,12 @@ default = ["2d", "3d", "keyboard_input", "mouse_input"]
 2d = ["bevy/bevy_ui_render", "bevy/bevy_sprite", "bevy/bevy_sprite_render"]
 # 3D mesh terminals (world-quad spawning, AttachTerminal, raycast input)
 3d = ["bevy/bevy_pbr", "bevy/bevy_picking", "bevy/mesh_picking"]
+# SLOW_BLINK / RAPID_BLINK: blinking rows are redrawn on a timer. Off, both
+# modifiers are ignored and nothing is redrawn without a draw change.
+blink = []
+# Draw underlines in `Cell::underline_color` (ratatui-core's `underline-color`).
+# Opt-in: it grows every ratatui `Cell`, and so the whole app's buffer work.
+underline_color = ["dep:ratatui-core", "ratatui-core/underline-color"]
 keyboard_input = []
 mouse_input = []
 bold_italic_fonts = []
@@ -71,6 +77,9 @@ bevy = { version = "0.20", default-features = false, features = [
     "bevy_core_pipeline",
 ]}
 ratatui = { version = "0.30.2", default-features = false }
+# Only for feature `underline_color`: ratatui's own `underline-color` flag also
+# pulls its optional backends into Cargo.lock.
+ratatui-core = { version = "0.1.2", default-features = false, optional = true }
 # Must match the wgpu version bevy 0.20 is pinned to (currently 30) - bump
 # together. `pub use wgpu;` in lib.rs re-exports this exact version so
 # downstream custom render passes (see `Tui::image_handle` +
@@ -78,11 +87,11 @@ ratatui = { version = "0.30.2", default-features = false }
 # separately pinning their own wgpu dependency.
 wgpu = { version = "30.0", default-features = false, features = ["wgsl", "webgl"] }
 rustybuzz = "0.20.1"
+self_cell = "1.1"
 raqote = { version = "0.8.5", default-features = false }
 tiny-skia = "0.12"
 bytemuck = { version = "1.25", features = ["derive"] }
 bitvec = { version = "1.1", default-features = false, features = ["std"] }
-evictor = { version = "0.7", default-features = false }
 unicode-width = "0.2.2"
 tracing = "0.1.44"
 thiserror = "2.0.21"

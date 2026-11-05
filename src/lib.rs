@@ -2,6 +2,8 @@
 //! displayable on 2D UI nodes, 3D meshes, or existing meshes (e.g. glTF
 //! screens).
 
+#![deny(unsafe_code)]
+
 pub mod backend;
 pub mod bevy_plugin;
 pub(crate) mod colors;
@@ -13,8 +15,9 @@ pub(crate) mod utils;
 pub use ratatui;
 pub use wgpu;
 
-pub use backend::bevy_backend::{BevyTerminalBackend, TerminalBuilder};
+pub use backend::bevy_backend::{BevyTerminalBackend, CursorStyle, TerminalBuilder};
 pub use backend::{Dimensions, Viewport};
+pub use colors::TerminalPalette;
 
 pub use fonts::{Font, Fonts, Shaping, TerminalFontAsset};
 
@@ -54,16 +57,13 @@ pub mod prelude {
     };
 
     pub use crate::{
-        BevyTerminalBackend, Font, Fonts, Shaping, TerminalBuilder, TerminalFontAsset,
+        BevyTerminalBackend, CursorStyle, Font, Fonts, Shaping, TerminalBuilder, TerminalFontAsset,
+        TerminalPalette,
     };
 
-    // Input handling. `KeyCode` is deliberately NOT re-exported here:
-    // `bevy::prelude::*` (glob-imported by every example alongside this
-    // prelude) already exports its own `KeyCode` (the physical-key enum),
-    // and two glob imports of one name are ambiguous at every use site.
-    // Import this crate's `KeyCode` explicitly instead:
-    // `use bevy_tui_texture::input::KeyCode;` - an explicit `use` always
-    // wins over a glob, so it cleanly shadows bevy's.
+    // `KeyCode` is deliberately left out: bevy's prelude exports its own,
+    // and two glob imports of one name are ambiguous. Import
+    // `input::KeyCode` explicitly; an explicit import wins over a glob.
     pub use crate::input::{
         CursorPosition, InputEvent, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent,
         MouseEventKind, TerminalEvent, TerminalFocus, TerminalInput, TerminalInputConfig,
