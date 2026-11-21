@@ -1,9 +1,8 @@
 use super::box_lines::LineMetrics;
 use super::primitives::*;
-use tiny_skia::Pixmap;
 
 /// Right-angle triangles U+25E2..=25E5 (filled) and U+25F8..=25FA, U+25FF (outline).
-pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
+pub fn render(c: char, width: u32, height: u32) -> Option<GlyphCanvas> {
     let (corner_right, corner_bottom, filled) = match c {
         '\u{25E2}' => (true, true, true),
         '\u{25E3}' => (false, true, true),
@@ -15,7 +14,7 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
         '\u{25FF}' => (true, true, false),
         _ => return None,
     };
-    let mut pixmap = Pixmap::new(width, height)?;
+    let mut canvas = GlyphCanvas::new(width, height)?;
     let (w, h) = (width as f32, height as f32);
     let color = default_color();
     let (cx, cy) = (
@@ -23,22 +22,22 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
         if corner_bottom { h } else { 0.0 },
     );
     if filled {
-        draw_triangle(&mut pixmap, cx, cy, w - cx, cy, cx, h - cy, color);
-        return Some(pixmap);
+        draw_triangle(&mut canvas, cx, cy, w - cx, cy, cx, h - cy, color);
+        return Some(canvas);
     }
 
     let light = LineMetrics::new(width, height).light as f32;
     let half = light / 2.0;
     let bar_y = if corner_bottom { h - light } else { 0.0 };
     let bar_x = if corner_right { w - light } else { 0.0 };
-    draw_rect(&mut pixmap, 0.0, bar_y, w, light, color);
-    draw_rect(&mut pixmap, bar_x, 0.0, light, h, color);
+    draw_rect(&mut canvas, 0.0, bar_y, w, light, color);
+    draw_rect(&mut canvas, bar_x, 0.0, light, h, color);
     let along_x = if corner_right { half } else { w - half };
     let along_y = if corner_bottom { h - half } else { half };
     let across_x = if corner_right { w - half } else { half };
     let across_y = if corner_bottom { half } else { h - half };
     draw_line(
-        &mut pixmap,
+        &mut canvas,
         along_x,
         along_y,
         across_x,
@@ -46,15 +45,15 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
         light,
         color,
     );
-    Some(pixmap)
+    Some(canvas)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn covered(p: &Pixmap, x: u32, y: u32) -> bool {
-        p.pixel(x, y).unwrap().alpha() > 0
+    fn covered(p: &GlyphCanvas, x: u32, y: u32) -> bool {
+        p.alpha(x, y) > 0
     }
 
     #[test]

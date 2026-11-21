@@ -1,9 +1,8 @@
 use super::primitives::*;
-use tiny_skia::Pixmap;
 
-pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
+pub fn render(c: char, width: u32, height: u32) -> Option<GlyphCanvas> {
     let pattern = (c as u32).checked_sub(0x2800).filter(|&p| p <= 0xFF)?;
-    let mut pixmap = Pixmap::new(width, height)?;
+    let mut canvas = GlyphCanvas::new(width, height)?;
     let color = default_color();
 
     let (xs, ys, dot) = dot_grid(width as i32, height as i32);
@@ -21,9 +20,11 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
     ];
     for (bit, &(col, row)) in dots.iter().enumerate() {
         if pattern & (1 << bit) != 0 {
-            let (x, y) = (xs[col], ys[row]);
+            let (Some(&x), Some(&y)) = (xs.get(col), ys.get(row)) else {
+                continue;
+            };
             draw_rect(
-                &mut pixmap,
+                &mut canvas,
                 x as f32,
                 y as f32,
                 dot as f32,
@@ -32,7 +33,7 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
             );
         }
     }
-    Some(pixmap)
+    Some(canvas)
 }
 
 /// Square dots on whole pixels with equal gaps, distributing leftover pixels
@@ -92,8 +93,8 @@ fn dot_grid(width: i32, height: i32) -> ([i32; 2], [i32; 4], i32) {
 mod tests {
     use super::*;
 
-    fn coverage(pixmap: &Pixmap) -> Vec<bool> {
-        pixmap.pixels().iter().map(|p| p.alpha() > 0).collect()
+    fn coverage(canvas: &GlyphCanvas) -> Vec<bool> {
+        canvas.data().iter().map(|&a| a > 0).collect()
     }
 
     #[test]
@@ -116,8 +117,8 @@ mod tests {
     #[test]
     fn every_dot_is_drawn_separately() {
         let (w, h) = (8, 16);
-        let pixmap = render('\u{28FF}', w, h).unwrap();
-        let on = coverage(&pixmap);
+        let canvas = render('\u{28FF}', w, h).unwrap();
+        let on = coverage(&canvas);
         let (xs, _, dot) = dot_grid(w as i32, h as i32);
         let filled = on.iter().filter(|&&o| o).count() as i32;
         assert_eq!(filled, 8 * dot * dot);
@@ -127,19 +128,19 @@ mod tests {
 
     #[test]
     fn test_braille_blank() {
-        let pixmap = render('\u{2800}', 32, 32).unwrap();
-        assert!(pixmap.pixels().iter().all(|p| p.alpha() == 0));
+        let canvas = render('\u{2800}', 32, 32).unwrap();
+        assert!(canvas.data().iter().all(|&a| a == 0));
     }
 
     #[test]
     fn test_braille_full() {
-        let pixmap = render('\u{28FF}', 32, 32).unwrap();
-        assert!(pixmap.pixels().iter().any(|p| p.alpha() > 0));
+        let canvas = render('\u{28FF}', 32, 32).unwrap();
+        assert!(canvas.data().iter().any(|&a| a > 0));
     }
 
     #[test]
     fn test_braille_single_dot() {
-        let pixmap = render('\u{2801}', 32, 32).unwrap();
-        assert!(pixmap.pixels().iter().any(|p| p.alpha() > 0));
+        let canvas = render('\u{2801}', 32, 32).unwrap();
+        assert!(canvas.data().iter().any(|&a| a > 0));
     }
 }

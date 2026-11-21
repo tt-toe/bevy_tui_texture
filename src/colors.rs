@@ -10,7 +10,7 @@ pub struct TerminalPalette {
 }
 
 impl Default for TerminalPalette {
-    /// The values earlier versions used: SVG color names for `named`, xterm for `indexed`.
+    /// SVG color names for `named`, xterm for `indexed`.
     fn default() -> Self {
         use named::*;
         Self {
@@ -41,7 +41,9 @@ impl TerminalPalette {
     /// Named colors taken from the xterm table, so `Color::Red` and `Color::Indexed(1)` agree.
     pub fn xterm() -> Self {
         let mut named = [[0; 3]; 16];
-        named.copy_from_slice(&ANSI_TO_RGB[..16]);
+        for (dst, src) in named.iter_mut().zip(ANSI_TO_RGB) {
+            *dst = src;
+        }
         Self {
             named,
             indexed: ANSI_TO_RGB,
@@ -51,7 +53,9 @@ impl TerminalPalette {
     /// Replaces the 16 ANSI colors, both as named colors and as indexes 0..16.
     pub fn with_ansi16(mut self, colors: [[u8; 3]; 16]) -> Self {
         self.named = colors;
-        self.indexed[..16].copy_from_slice(&colors);
+        for (dst, src) in self.indexed.iter_mut().zip(colors) {
+            *dst = src;
+        }
         self
     }
 
@@ -77,7 +81,11 @@ impl TerminalPalette {
             Color::LightCyan => self.named[14],
             Color::White => self.named[15],
             Color::Rgb(r, g, b) => [r, g, b],
-            Color::Indexed(index) => self.indexed[index as usize],
+            Color::Indexed(index) => self
+                .indexed
+                .get(usize::from(index))
+                .copied()
+                .unwrap_or_default(),
         }
     }
 }

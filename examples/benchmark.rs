@@ -109,8 +109,7 @@ fn render_benchmark(
 
             let mode_name = match state.mode {
                 0 => "Mode 1: Scrolling Gradation",
-                1 => "Mode 2: Random Boxes",
-                _ => unreachable!(),
+                _ => "Mode 2: Random Boxes",
             };
 
             let info = format!(
@@ -122,17 +121,14 @@ fn render_benchmark(
                 .style(Style::default().fg(RatatuiColor::Yellow).bold())
                 .block(Block::bordered());
 
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(3), Constraint::Min(0)])
-                .split(area);
+            let [header_area, body] =
+                Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).areas(area);
 
-            frame.render_widget(header, chunks[0]);
+            frame.render_widget(header, header_area);
 
             match state.mode {
-                0 => render_gradient(frame, chunks[1], state.scroll_offset),
-                1 => render_random_boxes(frame, chunks[1], time_ms + state.frame_count),
-                _ => unreachable!(),
+                0 => render_gradient(frame, body, state.scroll_offset),
+                _ => render_random_boxes(frame, body, time_ms + state.frame_count),
             }
         });
 }
@@ -174,8 +170,8 @@ fn render_gradient(frame: &mut ratatui::Frame, area: RatatuiRect, offset: f32) {
 
 fn render_random_boxes(frame: &mut ratatui::Frame, area: RatatuiRect, seed: u32) {
     for i in 0..50 {
-        let x = pseudo_random(seed.wrapping_add(i * 4)) % area.width;
-        let y = pseudo_random(seed.wrapping_add(i * 4 + 1)) % area.height;
+        let x = pseudo_random(seed.wrapping_add(i * 4)) % area.width.max(1);
+        let y = pseudo_random(seed.wrapping_add(i * 4 + 1)) % area.height.max(1);
         let w = (pseudo_random(seed.wrapping_add(i * 4 + 2)) % 20).max(5);
         let h = (pseudo_random(seed.wrapping_add(i * 4 + 3)) % 10).max(3);
 

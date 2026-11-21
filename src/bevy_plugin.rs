@@ -235,14 +235,10 @@ pub fn gpu_flush_system(
         // do must not be mutably dereferenced (nor `Assets<Image>`), which
         // would flag it as changed every single frame.
         if tui.has_pending_resize()
-            && let (Some((cols, rows)), Some(mut dimensions)) =
+            && let (Some(_), Some(mut dimensions)) =
                 (tui.apply_pending_resize(&mut images), dimensions)
         {
-            let size = tui.size_px();
-            dimensions.cols = cols;
-            dimensions.rows = rows;
-            dimensions.char_width_px = size.x / (cols.max(1) as u32);
-            dimensions.char_height_px = size.y / (rows.max(1) as u32);
+            *dimensions = tui.dimensions();
         }
         if tui.needs_flush() {
             tui.flush();
@@ -254,11 +250,12 @@ pub fn gpu_flush_system(
 /// terminal's mesh aspect ratio after a resize.
 #[cfg(feature = "3d")]
 fn resize_world_quad_meshes(
-    mut terminals: Query<
+    terminals: Query<
         (
             &TerminalDimensions,
             &crate::setup::WorldQuadHeight,
-            &mut Mesh3d,
+            &crate::setup::OwnedWorldQuadMesh,
+            &Mesh3d,
         ),
         Changed<TerminalDimensions>,
     >,
@@ -267,14 +264,17 @@ fn resize_world_quad_meshes(
     let Some(mut meshes) = meshes else {
         return;
     };
-    for (dimensions, height, mut mesh3d) in &mut terminals {
+    for (dimensions, height, owned, mesh3d) in &terminals {
+        if mesh3d.0.id() != owned.0 {
+            continue;
+        }
+        let Some(mut mesh) = meshes.get_mut(owned.0) else {
+            continue;
+        };
         let aspect = dimensions.cols as f32 * dimensions.char_width_px as f32
             / (dimensions.rows as f32 * dimensions.char_height_px as f32);
         let half_height = height.0 / 2.0;
-        mesh3d.0 = meshes.add(Plane3d::new(
-            Vec3::Z,
-            Vec2::new(half_height * aspect, half_height),
-        ));
+        *mesh = Plane3d::new(Vec3::Z, Vec2::new(half_height * aspect, half_height)).into();
     }
 }
 
@@ -299,7 +299,7 @@ struct SharedFontGpuStore(HashMap<usize, SharedFontGpuState>);
 /// Render-world resource: glyph rasterizations queued by [`extract_tui_draws`]
 /// for each font, still waiting to be uploaded to that font's shared atlas.
 #[derive(Resource, Default)]
-struct PendingFontUploads(HashMap<usize, Vec<(crate::utils::text_atlas::CacheRect, Vec<u8>)>>);
+struct PendingFontUploads(HashMap<usize, crate::backend::GlyphUploads>);
 
 /// [`PendingFontUploads`] for the color glyph atlas: per font, the atlas's
 /// texture size and its queued rasterizations (premultiplied RGBA8).
@@ -392,7 +392,7 @@ fn render_tui_textures(
     for (key, uploads) in &mut font_uploads.0 {
         if let Some(shared) = font_store.0.get(key) {
             shared.upload_glyphs(&render_queue, uploads);
-            uploads.clear();
+            uploads.items.clear();
         }
     }
     font_uploads
@@ -715,5 +715,65 @@ mod row_padding_tests {
         let padded = vec![9, 9, 9, 9, 0, 0, 0, 0];
         let out = strip_row_padding(&padded, 4, 8, 1);
         assert_eq!(out, vec![9, 9, 9, 9]);
+    }
+}
+
+#[cfg(all(test, feature = "3d"))]
+mod world_quad_tests {
+    use super::*;
+    use crate::setup::{OwnedWorldQuadMesh, WorldQuadHeight};
+    use bevy::camera::primitives::MeshAabb;
+    use bevy::ecs::system::RunSystemOnce;
+
+    fn half_width(world: &World, id: AssetId<Mesh>) -> f32 {
+        let aabb = world
+            .resource::<Assets<Mesh>>()
+            .get(id)
+            .and_then(|mesh| mesh.get_aabb())
+            .expect("mesh with positions");
+        aabb.half_extents.x
+    }
+
+    #[test]
+    fn a_resize_rewrites_only_the_mesh_materialization_made() {
+        let mut world = World::new();
+        let mut meshes = Assets::<Mesh>::default();
+        let quad = || Mesh::from(Plane3d::new(Vec3::Z, Vec2::new(1.0, 1.0)));
+        let owned = meshes.add(quad());
+        let swapped = meshes.add(quad());
+        world.insert_resource(meshes);
+        let dimensions = TerminalDimensions {
+            cols: 40,
+            rows: 10,
+            char_width_px: 8,
+            char_height_px: 16,
+        };
+        world.spawn((
+            dimensions,
+            WorldQuadHeight(2.0),
+            OwnedWorldQuadMesh(owned.id()),
+            Mesh3d(owned.clone()),
+        ));
+        let other = world.resource_mut::<Assets<Mesh>>().add(quad()).id();
+        world.spawn((
+            dimensions,
+            WorldQuadHeight(2.0),
+            OwnedWorldQuadMesh(other),
+            Mesh3d(swapped.clone()),
+        ));
+        world
+            .run_system_once(resize_world_quad_meshes)
+            .expect("system runs");
+
+        let owned_width = half_width(&world, owned.id());
+        assert!(
+            (owned_width - 2.0).abs() < 1e-5,
+            "40*8 / (10*16) = 2, got {owned_width}"
+        );
+        let swapped_width = half_width(&world, swapped.id());
+        assert!(
+            (swapped_width - 1.0).abs() < 1e-5,
+            "the user's mesh is left alone"
+        );
     }
 }

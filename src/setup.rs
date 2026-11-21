@@ -20,10 +20,26 @@ pub struct TerminalTexture {
     pub image_handle: Handle<Image>,
     pub width: u32,
     pub height: u32,
-    cols: u16,
-    rows: u16,
-    char_width_px: u32,
-    char_height_px: u32,
+    dims: TerminalDimensions,
+}
+
+/// The render target a terminal draws into: `width` x `height` RGBA8,
+/// sampled by materials and copyable for readback.
+fn terminal_image(width: u32, height: u32) -> Image {
+    use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
+    let mut image = Image::new_uninit(
+        Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        TextureFormat::Rgba8Unorm,
+        bevy::asset::RenderAssetUsages::RENDER_WORLD,
+    );
+    image.texture_descriptor.usage =
+        TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_SRC;
+    image
 }
 
 impl TerminalTexture {
@@ -37,26 +53,15 @@ impl TerminalTexture {
         initial_fill: [u8; 4],
         images: &mut Assets<Image>,
     ) -> Result<Self, crate::TerminalError> {
-        let char_width_px = fonts.min_width_px();
-        let char_height_px = fonts.height_px();
-        let width = cols as u32 * char_width_px;
-        let height = rows as u32 * char_height_px;
-
-        let mut image = Image::new_uninit(
-            bevy::render::render_resource::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            bevy::render::render_resource::TextureDimension::D2,
-            bevy::render::render_resource::TextureFormat::Rgba8Unorm,
-            bevy::asset::RenderAssetUsages::RENDER_WORLD,
-        );
-        image.texture_descriptor.usage =
-            bevy::render::render_resource::TextureUsages::RENDER_ATTACHMENT
-                | bevy::render::render_resource::TextureUsages::TEXTURE_BINDING
-                | bevy::render::render_resource::TextureUsages::COPY_SRC;
-        let image_handle = images.add(image);
+        let dims = TerminalDimensions {
+            cols,
+            rows,
+            char_width_px: fonts.min_width_px(),
+            char_height_px: fonts.height_px(),
+        };
+        let width = cols as u32 * dims.char_width_px;
+        let height = rows as u32 * dims.char_height_px;
+        let image_handle = images.add(terminal_image(width, height));
 
         let mut backend = TerminalBuilder::new(fonts)
             .with_dimensions(cols, rows)
@@ -75,21 +80,13 @@ impl TerminalTexture {
             image_handle,
             width,
             height,
-            cols,
-            rows,
-            char_width_px,
-            char_height_px,
+            dims,
         })
     }
 
     /// Get the terminal dimensions for entity setup.
     pub fn dimensions(&self) -> TerminalDimensions {
-        TerminalDimensions {
-            cols: self.cols,
-            rows: self.rows,
-            char_width_px: self.char_width_px,
-            char_height_px: self.char_height_px,
-        }
+        self.dims
     }
 
     /// Get the image handle for entity setup.
@@ -99,26 +96,14 @@ impl TerminalTexture {
 
     /// Resize to a new grid size in place.
     fn resize(&mut self, cols: u16, rows: u16, images: &mut Assets<Image>) {
-        self.width = cols as u32 * self.char_width_px;
-        self.height = rows as u32 * self.char_height_px;
-        self.cols = cols;
-        self.rows = rows;
-
-        let mut image = Image::new_uninit(
-            bevy::render::render_resource::Extent3d {
-                width: self.width,
-                height: self.height,
-                depth_or_array_layers: 1,
-            },
-            bevy::render::render_resource::TextureDimension::D2,
-            bevy::render::render_resource::TextureFormat::Rgba8Unorm,
-            bevy::asset::RenderAssetUsages::RENDER_WORLD,
-        );
-        image.texture_descriptor.usage =
-            bevy::render::render_resource::TextureUsages::RENDER_ATTACHMENT
-                | bevy::render::render_resource::TextureUsages::TEXTURE_BINDING
-                | bevy::render::render_resource::TextureUsages::COPY_SRC;
-        if images.insert(&self.image_handle, image).is_err() {
+        self.dims.cols = cols;
+        self.dims.rows = rows;
+        self.width = cols as u32 * self.dims.char_width_px;
+        self.height = rows as u32 * self.dims.char_height_px;
+        if images
+            .insert(&self.image_handle, terminal_image(self.width, self.height))
+            .is_err()
+        {
             tracing::warn!("Tui resize: the destination image handle is no longer valid");
         }
     }
@@ -126,7 +111,7 @@ impl TerminalTexture {
 
 /// Registry mapping click regions to caller-defined `u64` ids, rebuilt on
 /// every [`Tui::draw_with_hits`] call.
-#[derive(Component, Default)]
+#[derive(Default)]
 pub struct HitRegions {
     regions: Vec<(u64, ratatui::layout::Rect)>,
 }
@@ -241,10 +226,13 @@ impl Tui {
 
         backend.force_full_redraw();
 
-        self.texture_state
+        if let Err(err) = self
+            .texture_state
             .terminal
             .resize(ratatui::layout::Rect::new(0, 0, cols, rows))
-            .ok();
+        {
+            tracing::warn!("Tui resize: ratatui terminal resize failed: {err}");
+        }
         // Already extracted a (correctly-sized, geometry-cleared) payload
         // above - `flush`, called right after this by `gpu_flush_system`,
         // must not extract a second one on top of it.
@@ -348,6 +336,11 @@ impl Tui {
         UVec2::new(self.texture_state.width, self.texture_state.height)
     }
 
+    /// Grid and cell size, as the [`TerminalDimensions`] component holds them.
+    pub(crate) fn dimensions(&self) -> TerminalDimensions {
+        self.texture_state.dimensions()
+    }
+
     /// Terminal grid size (columns, rows).
     pub fn grid_size(&self) -> (u16, u16) {
         let d = self.texture_state.dimensions();
@@ -392,9 +385,7 @@ impl Tui {
 
     /// Returns this terminal's font identity key, alongside any glyph
     /// rasterizations still pending upload to that font's shared atlas.
-    pub(crate) fn take_shared_font_uploads(
-        &self,
-    ) -> (usize, Vec<(crate::utils::text_atlas::CacheRect, Vec<u8>)>) {
+    pub(crate) fn take_shared_font_uploads(&self) -> (usize, crate::backend::GlyphUploads) {
         let backend = self.texture_state.terminal.backend();
         (backend.font_key(), backend.take_shared_glyph_uploads())
     }
@@ -520,6 +511,12 @@ pub enum TuiKind {
 #[derive(Component, Clone, Copy)]
 pub(crate) struct WorldQuadHeight(pub(crate) f32);
 
+/// The quad mesh materialization created for a world-quad terminal: a
+/// resize rewrites it in place, and leaves a mesh the user swapped in alone.
+#[cfg(feature = "3d")]
+#[derive(Component, Clone, Copy)]
+pub(crate) struct OwnedWorldQuadMesh(pub(crate) AssetId<Mesh>);
+
 /// Declarative terminal request: spawn this component (plus any `Node` /
 /// `Transform` / marker components you want on the terminal entity), and
 /// the plugin's `materialize_tui_requests` system does the rest - **your
@@ -538,36 +535,28 @@ impl TuiRequest {
     /// [`TerminalConfig`].
     #[cfg(feature = "2d")]
     pub fn ui(cols: u16, rows: u16, fonts: impl Into<TuiFontSource>) -> Self {
-        Self {
-            cols,
-            rows,
-            fonts: fonts.into(),
-            kind: TuiKind::Ui,
-            config: TerminalConfig::default(),
-        }
+        Self::new(cols, rows, fonts.into(), TuiKind::Ui)
     }
 
     /// A world-unit-sized 3D quad terminal (see [`TuiKind::WorldQuad`])
     /// with default [`TerminalConfig`].
     #[cfg(feature = "3d")]
     pub fn world_quad(cols: u16, rows: u16, fonts: impl Into<TuiFontSource>, height: f32) -> Self {
-        Self {
-            cols,
-            rows,
-            fonts: fonts.into(),
-            kind: TuiKind::WorldQuad { height },
-            config: TerminalConfig::default(),
-        }
+        Self::new(cols, rows, fonts.into(), TuiKind::WorldQuad { height })
     }
 
     /// A surface-less terminal (see [`TuiKind::Headless`]) with default
     /// [`TerminalConfig`].
     pub fn headless(cols: u16, rows: u16, fonts: impl Into<TuiFontSource>) -> Self {
+        Self::new(cols, rows, fonts.into(), TuiKind::Headless)
+    }
+
+    fn new(cols: u16, rows: u16, fonts: TuiFontSource, kind: TuiKind) -> Self {
         Self {
             cols,
             rows,
-            fonts: fonts.into(),
-            kind: TuiKind::Headless,
+            fonts,
+            kind,
             config: TerminalConfig::default(),
         }
     }
@@ -692,8 +681,9 @@ pub(crate) fn materialize_tui_requests(
                     cull_mode: None,
                     ..default()
                 });
+                let owned = OwnedWorldQuadMesh(mesh.id());
                 entity_commands
-                    .insert((tui, dimensions, WorldQuadHeight(height)))
+                    .insert((tui, dimensions, WorldQuadHeight(height), owned))
                     .insert_if_new((Mesh3d(mesh), MeshMaterial3d(material), input));
             }
             TuiKind::Headless => {
@@ -707,7 +697,7 @@ pub(crate) fn materialize_tui_requests(
 #[cfg(feature = "3d")]
 #[derive(Clone)]
 struct UntypedMaterialInsert(
-    std::sync::Arc<dyn Fn(Handle<Image>, Entity, &mut World) + Send + Sync>,
+    std::sync::Arc<dyn Fn(Handle<Image>, Entity, Entity, &mut World) + Send + Sync>,
 );
 
 /// How to material a [`AttachTerminal`]-marked mesh.
@@ -730,15 +720,18 @@ impl AttachMaterial {
     pub fn custom<M: Material>(
         factory: impl Fn(Handle<Image>) -> M + Send + Sync + 'static,
     ) -> Self {
-        let cached: Mutex<Option<Handle<M>>> = Mutex::new(None);
+        // Keyed by the image: re-pointing `AttachTerminal::terminal` at another
+        // `Tui` must build a material for that terminal's texture.
+        let cached: Mutex<Option<(AssetId<Image>, Handle<M>)>> = Mutex::new(None);
         AttachMaterial(UntypedMaterialInsert(std::sync::Arc::new(
-            move |image, entity, world| {
+            move |image, entity, terminal, world| {
                 let mut cached = cached.lock().unwrap_or_else(|e| e.into_inner());
                 let handle = match cached.as_ref() {
-                    Some(handle) => handle.clone(),
-                    None => {
+                    Some((id, handle)) if *id == image.id() => handle.clone(),
+                    _ => {
+                        let id = image.id();
                         let handle = world.resource_mut::<Assets<M>>().add(factory(image));
-                        *cached = Some(handle.clone());
+                        *cached = Some((id, handle.clone()));
                         handle
                     }
                 };
@@ -746,6 +739,7 @@ impl AttachMaterial {
                     MeshMaterial3d(handle.clone()),
                     TuiAttached {
                         material: handle.untyped(),
+                        terminal,
                     },
                 ));
             },
@@ -762,6 +756,7 @@ impl AttachMaterial {
 #[derive(Component)]
 pub(crate) struct TuiAttached {
     material: UntypedHandle,
+    terminal: Entity,
 }
 
 /// Insert on a mesh entity (e.g. a glTF primitive) to attach a `Tui` to it.
@@ -786,7 +781,9 @@ pub(crate) fn attach_terminal_system(
     terminals: Query<&Tui>,
 ) {
     for (surface_entity, attach, current_material, attached) in &to_attach {
-        if attached.is_some_and(|a| a.material.id() == current_material.0.id().untyped()) {
+        if attached.is_some_and(|a| {
+            a.terminal == attach.terminal && a.material.id() == current_material.0.id().untyped()
+        }) {
             continue;
         }
 
@@ -795,10 +792,7 @@ pub(crate) fn attach_terminal_system(
         };
 
         let image = tui.image_handle().clone();
-        let (cols, rows) = tui.grid_size();
-        let size = tui.size_px();
-        let char_width_px = size.x / (cols.max(1) as u32);
-        let char_height_px = size.y / (rows.max(1) as u32);
+        let dimensions = tui.dimensions();
         let tui_entity = attach.terminal;
         let insert = attach.material.0.clone();
 
@@ -806,17 +800,12 @@ pub(crate) fn attach_terminal_system(
             .entity(surface_entity)
             .remove::<MeshMaterial3d<StandardMaterial>>();
         commands.queue(move |world: &mut World| {
-            (insert.0)(image, surface_entity, world);
+            (insert.0)(image, surface_entity, tui_entity, world);
         });
         commands.entity(surface_entity).insert((
             TuiSurface { tui: tui_entity },
             TerminalInput::default(),
-            TerminalDimensions {
-                cols,
-                rows,
-                char_width_px,
-                char_height_px,
-            },
+            dimensions,
         ));
     }
 }
@@ -846,15 +835,10 @@ fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod tui_flush_tests {
     use super::*;
-    use crate::fonts::{Font, Fonts};
     use ratatui::style::{Color as RatatuiColor, Style};
     use ratatui::widgets::Block;
 
-    fn test_fonts() -> Arc<Fonts> {
-        let font_data = include_bytes!("../examples/assets/fonts/Mplus1Code-Regular.ttf");
-        let font = Font::new(font_data).expect("failed to load test font");
-        Arc::new(Fonts::new(font, 16))
-    }
+    use crate::test_fonts::mplus_16 as test_fonts;
 
     #[test]
     fn draw_error_logged_only_once() {
@@ -1321,9 +1305,10 @@ mod tui_flush_tests {
     #[cfg(feature = "emoji")]
     mod emoji_gpu {
         use super::*;
+        use crate::fonts::{Font, Fonts};
 
-        const COLRV1: &[u8] = include_bytes!("backend/testdata/noto_colrv1_subset.ttf");
-        const CBDT: &[u8] = include_bytes!("backend/testdata/noto_cbdt_subset.ttf");
+        const COLRV1: &[u8] = crate::test_fonts::COLRV1;
+        const CBDT: &[u8] = crate::test_fonts::CBDT;
         const FIXTURES: [&[u8]; 2] = [COLRV1, CBDT];
 
         const COLS: usize = 6;
@@ -1331,13 +1316,7 @@ mod tui_flush_tests {
         const MAGENTA: RatatuiColor = RatatuiColor::Rgb(255, 0, 255);
 
         fn emoji_fonts(emoji: &'static [u8]) -> Arc<Fonts> {
-            let mut fonts = Fonts::new(
-                Font::new(include_bytes!(
-                    "../examples/assets/fonts/Mplus1Code-Regular.ttf"
-                ))
-                .expect("M+ parses"),
-                16,
-            );
+            let mut fonts = Fonts::new(Font::new(crate::test_fonts::MPLUS).expect("M+ parses"), 16);
             fonts.add_emoji_fonts([Font::new(emoji).expect("emoji fixture parses")]);
             Arc::new(fonts)
         }
@@ -1589,7 +1568,7 @@ mod attach_churn_tests {
         world.init_resource::<Assets<Image>>();
         world.init_resource::<Assets<StandardMaterial>>();
 
-        let font_data = include_bytes!("../examples/assets/fonts/Mplus1Code-Regular.ttf");
+        let font_data = crate::test_fonts::MPLUS;
         let font = Font::new(font_data).expect("failed to load test font");
         let fonts = Arc::new(Fonts::new(font, 16));
         let texture = {
@@ -1643,18 +1622,72 @@ mod attach_churn_tests {
              would have advanced if a spurious remove+insert happened"
         );
     }
+
+    #[test]
+    fn retargeting_an_attach_builds_a_material_for_the_new_terminal() {
+        let mut world = World::new();
+        world.init_resource::<Assets<Image>>();
+        world.init_resource::<Assets<StandardMaterial>>();
+        let font_data = crate::test_fonts::MPLUS;
+        let fonts = Arc::new(Fonts::new(Font::new(font_data).expect("font"), 16));
+        let spawn_tui = |world: &mut World| {
+            let texture = {
+                let mut images = world.resource_mut::<Assets<Image>>();
+                TerminalTexture::create(4, 2, fonts.clone(), false, false, [0; 4], &mut images)
+                    .expect("terminal")
+            };
+            let image = texture.image_handle();
+            (world.spawn(Tui::from_texture_state(texture)).id(), image)
+        };
+        let (first, _) = spawn_tui(&mut world);
+        let (second, second_image) = spawn_tui(&mut world);
+        let placeholder = world
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial::default());
+        let surface = world
+            .spawn((
+                MeshMaterial3d(placeholder),
+                AttachTerminal {
+                    terminal: first,
+                    material: AttachMaterial::standard(AlphaMode::Opaque),
+                },
+            ))
+            .id();
+        world
+            .run_system_once(attach_terminal_system)
+            .expect("claim");
+        world.increment_change_tick();
+
+        world
+            .get_mut::<AttachTerminal>(surface)
+            .expect("attach")
+            .terminal = second;
+        world
+            .run_system_once(attach_terminal_system)
+            .expect("retarget");
+
+        let material = world
+            .get::<MeshMaterial3d<StandardMaterial>>(surface)
+            .expect("material")
+            .0
+            .clone();
+        let texture = world
+            .resource::<Assets<StandardMaterial>>()
+            .get(&material)
+            .and_then(|m| m.base_color_texture.clone());
+        assert_eq!(texture, Some(second_image));
+        assert_eq!(
+            world.get::<TuiSurface>(surface).map(|s| s.tui),
+            Some(second)
+        );
+    }
 }
 
 #[cfg(test)]
 mod resize_tests {
     use super::*;
-    use crate::fonts::{Font, Fonts};
 
-    fn test_fonts() -> Arc<Fonts> {
-        let font_data = include_bytes!("../examples/assets/fonts/Mplus1Code-Regular.ttf");
-        let font = Font::new(font_data).expect("failed to load test font");
-        Arc::new(Fonts::new(font, 16))
-    }
+    use crate::test_fonts::mplus_16 as test_fonts;
 
     #[test]
     fn request_resize_updates_grid_and_keeps_the_same_image_handle() {
@@ -1809,15 +1842,15 @@ mod perf_bench {
     const FRAMES: u32 = 600;
     const TEXT: &[u8] = b"The quick brown fox jumps over the lazy dog. 0123456789 +-*/=<>[]{}() ";
 
-    fn run(name: &str, mut paint: impl FnMut(u32, &mut ratatui::buffer::Buffer)) {
+    /// Runs workload `name` in both shaping modes; `symbol_font` puts a
+    /// symbols-first font stack in front of M+.
+    fn run(
+        name: &str,
+        symbol_font: bool,
+        mut paint: impl FnMut(u32, &mut ratatui::buffer::Buffer),
+    ) {
         for shaping in [crate::fonts::Shaping::Row, crate::fonts::Shaping::Cell] {
-            run_with(name, shaping, false, &mut paint);
-        }
-    }
-
-    fn run_symbols(name: &str, mut paint: impl FnMut(u32, &mut ratatui::buffer::Buffer)) {
-        for shaping in [crate::fonts::Shaping::Row, crate::fonts::Shaping::Cell] {
-            run_with(name, shaping, true, &mut paint);
+            run_with(name, shaping, symbol_font, &mut paint);
         }
     }
 
@@ -1833,10 +1866,9 @@ mod perf_bench {
                 return;
             }
         }
-        let font_data = include_bytes!("../examples/assets/fonts/Mplus1Code-Regular.ttf");
+        let font_data = crate::test_fonts::MPLUS;
         let mut fonts = if symbol_font {
-            let fusion =
-                include_bytes!("../examples/assets/fonts/fusion-pixel-10px-monospaced-ja.ttf");
+            let fusion = crate::test_fonts::FUSION;
             let mut fonts = Fonts::new(Font::new(fusion).expect("font"), 16);
             fonts.add_regular_fonts([Font::new(font_data).expect("font")]);
             fonts
@@ -1887,7 +1919,7 @@ mod perf_bench {
     #[test]
     #[ignore = "benchmark - run explicitly with --ignored --nocapture"]
     fn cpu_hot_path() {
-        run("full_text", |n, buf| {
+        run("full_text", false, |n, buf| {
             for y in 0..ROWS {
                 for x in 0..COLS {
                     let c = (x as u32 * 2 + y as u32 * 5 + n) as u8;
@@ -1899,7 +1931,7 @@ mod perf_bench {
                 }
             }
         });
-        run("styled_text", |n, buf| {
+        run("styled_text", false, |n, buf| {
             use ratatui::style::Modifier;
             const STYLES: [Modifier; 4] = [
                 Modifier::empty(),
@@ -1919,7 +1951,7 @@ mod perf_bench {
                 }
             }
         });
-        run("decorated_text", |n, buf| {
+        run("decorated_text", false, |n, buf| {
             use ratatui::style::Modifier;
             const STYLES: [Modifier; 4] = [
                 Modifier::empty(),
@@ -1939,7 +1971,7 @@ mod perf_bench {
                 }
             }
         });
-        run("unique_text", |n, buf| {
+        run("unique_text", false, |n, buf| {
             let mut state = n.wrapping_mul(2654435761).wrapping_add(12345);
             for y in 0..ROWS {
                 for x in 0..COLS {
@@ -1950,7 +1982,7 @@ mod perf_bench {
                 }
             }
         });
-        run("gradient", |n, buf| {
+        run("gradient", false, |n, buf| {
             for y in 0..ROWS {
                 for x in 0..COLS {
                     let c = (x as u32 * 2 + y as u32 * 5 + n) as u8;
@@ -1960,7 +1992,7 @@ mod perf_bench {
                 }
             }
         });
-        run("colors_only", |n, buf| {
+        run("colors_only", false, |n, buf| {
             for y in 0..ROWS {
                 for x in 0..COLS {
                     let c = (x as u32 * 2 + y as u32 * 5 + n) as u8;
@@ -1970,7 +2002,7 @@ mod perf_bench {
                 }
             }
         });
-        run("one_row", |n, buf| {
+        run("one_row", false, |n, buf| {
             for y in 0..ROWS {
                 for x in 0..COLS {
                     let frame_no = if y == 5 { n } else { 0 };
@@ -1978,7 +2010,7 @@ mod perf_bench {
                 }
             }
         });
-        run_symbols("symbols", |n, buf| {
+        run("symbols", true, |n, buf| {
             for y in 0..ROWS {
                 let i = (y as u32 + n) as usize;
                 let icon = char::from_u32(0xE000 + (i % 14) as u32).unwrap();
@@ -1993,12 +2025,68 @@ mod perf_bench {
                 }
             }
         });
-        run("static", |_, buf| {
+        run("static", false, |_, buf| {
             for y in 0..ROWS {
                 for x in 0..COLS {
                     buf[(x, y)].set_symbol(text_at(0, x, y));
                 }
             }
         });
+        cold_cjk();
+    }
+
+    /// First draw of a fresh terminal full of distinct wide glyphs: every
+    /// glyph misses the atlas, so this times rasterization.
+    fn cold_cjk() {
+        const COLD_COLS: u16 = 80;
+        const COLD_ROWS: u16 = 24;
+        const RUNS: usize = 20;
+        if let Ok(only) = std::env::var("CPU_HOT_PATH") {
+            let (workload, _) = only.split_once(':').unwrap_or((&only, ""));
+            if workload != "cold_cjk" {
+                return;
+            }
+        }
+        let font_data = crate::test_fonts::MPLUS;
+        let font = Font::new(font_data).expect("font");
+        let per_row = COLD_COLS as usize / 2;
+        let chars: Vec<char> = ('\u{3041}'..)
+            .filter(|&c| font.font().glyph_index(c).is_some())
+            .take(per_row * COLD_ROWS as usize)
+            .collect();
+        assert_eq!(chars.len(), per_row * COLD_ROWS as usize);
+
+        let mut times = Vec::with_capacity(RUNS);
+        for _ in 0..RUNS {
+            let fonts = Arc::new(Fonts::new(Font::new(font_data).expect("font"), 16));
+            let mut images = Assets::<Image>::default();
+            let texture = TerminalTexture::create(
+                COLD_COLS,
+                COLD_ROWS,
+                fonts,
+                true,
+                false,
+                [0, 0, 0, 255],
+                &mut images,
+            )
+            .expect("terminal");
+            let mut tui = Tui::from_texture_state(texture);
+            let t0 = Instant::now();
+            tui.draw(|frame| {
+                let buf = frame.buffer_mut();
+                for (i, &c) in chars.iter().enumerate() {
+                    let (x, y) = ((i % per_row) as u16 * 2, (i / per_row) as u16);
+                    buf[(x, y)].set_char(c);
+                }
+            });
+            tui.flush();
+            times.push(t0.elapsed());
+            std::hint::black_box(tui.take_shared_font_uploads());
+        }
+        times.sort();
+        println!(
+            "[cpu_hot_path] cold_cjk     first draw {:>9.1} us (median of {RUNS})",
+            times[RUNS / 2].as_secs_f64() * 1e6
+        );
     }
 }

@@ -150,11 +150,7 @@ fn update_screen_a(
     };
     let elapsed = time.elapsed_secs();
     term.draw(|frame| {
-        let outer = Block::bordered()
-            .title(" Screen A: StandardMaterial ")
-            .border_style(Style::default().fg(TuiColor::LightCyan));
-        let inner = outer.inner(frame.area());
-        frame.render_widget(outer, frame.area());
+        let inner = framed(frame, " Screen A: StandardMaterial ", TuiColor::LightCyan);
         frame.render_widget(
             Paragraph::new(format!(
                 "zero-plumbing draw system\nt {elapsed:>6.1}s  clicks {}",
@@ -178,30 +174,37 @@ fn update_screen_b(
     let elapsed = time.elapsed_secs();
     let ratio = ((elapsed.sin() + 1.0) / 2.0) as f64;
     term.draw(|frame| {
-        let outer = Block::bordered()
-            .title(" Screen B: ExtendedMaterial ")
-            .border_style(Style::default().fg(TuiColor::LightMagenta));
-        let inner = outer.inner(frame.area());
-        frame.render_widget(outer, frame.area());
-        let rows =
+        let inner = framed(frame, " Screen B: ExtendedMaterial ", TuiColor::LightMagenta);
+        let [text, gauge] =
             ratatui::layout::Layout::vertical([Constraint2::Length(2), Constraint2::Min(1)])
-                .split(inner);
+                .areas(inner);
         frame.render_widget(
             Paragraph::new(format!(
                 "any material, zero touching\nclicks {}",
                 clicks.b
             ))
             .style(Style::default().fg(TuiColor::White)),
-            rows[0],
+            text,
         );
         frame.render_widget(
             Gauge::default()
                 .ratio(ratio)
                 .label(format!("{:>3.0}%", ratio * 100.0))
                 .gauge_style(Style::default().fg(TuiColor::LightMagenta)),
-            rows[1],
+            gauge,
         );
     });
+}
+
+/// Draws a titled border in `color` around the whole frame and returns the
+/// area inside it.
+fn framed(frame: &mut ratatui::Frame, title: &str, color: TuiColor) -> ratatui::layout::Rect {
+    let outer = Block::bordered()
+        .title(title)
+        .border_style(Style::default().fg(color));
+    let inner = outer.inner(frame.area());
+    frame.render_widget(outer, frame.area());
+    inner
 }
 
 use ratatui::layout::Constraint as Constraint2;

@@ -134,6 +134,8 @@ pub(crate) struct SharedFontCpuState {
     pub(crate) font_choices: crate::utils::shape_cache::FontChoiceCache,
     /// Shaped single cells - see [`crate::utils::shape_cache::CellShapeCache`].
     pub(crate) cell_shapes: crate::utils::shape_cache::CellShapeCache,
+    /// Rasterizer buffers, reused across glyphs.
+    pub(crate) raster: crate::backend::rasterize::RasterScratch,
     /// Slot index of the color glyph atlas (premultiplied RGBA, its own GPU
     /// texture, created on the first color glyph) - see
     /// [`crate::backend::bevy_backend`]'s `draw_color_glyph`.
@@ -178,6 +180,7 @@ impl SharedFontCpuState {
             pending_cache_updates: Vec::new(),
             font_choices: crate::utils::shape_cache::FontChoiceCache::new(),
             cell_shapes: Default::default(),
+            raster: Default::default(),
             #[cfg(feature = "emoji")]
             color,
             #[cfg(feature = "emoji")]
@@ -423,10 +426,7 @@ impl Fonts {
         self.char_height = height_px;
 
         self.char_width = std::iter::once(&self.last_resort)
-            .chain(self.regular.iter())
-            .chain(self.bold.iter())
-            .chain(self.italic.iter())
-            .chain(self.bold_italic.iter())
+            .chain(self.styled_fonts())
             .map(|font| font.char_width(height_px))
             .min()
             .unwrap_or_default();
@@ -471,41 +471,41 @@ impl Fonts {
 
     /// Add a new collection of fonts for regular styled text.
     pub fn add_regular_fonts(&mut self, fonts: impl IntoIterator<Item = Font>) {
-        self.char_width = self.char_width.min(Self::add_fonts_internal(
-            &mut self.regular,
-            fonts,
-            self.char_height,
-        ));
+        self.add_to_slot(|f| &mut f.regular, fonts);
     }
 
-    /// TODO
     /// Add a new collection of fonts for bold styled text.
     pub fn add_bold_fonts(&mut self, fonts: impl IntoIterator<Item = Font>) {
-        self.char_width = self.char_width.min(Self::add_fonts_internal(
-            &mut self.bold,
-            fonts,
-            self.char_height,
-        ));
+        self.add_to_slot(|f| &mut f.bold, fonts);
     }
 
-    /// TODO
     /// Add a new collection of fonts for italic styled text.
     pub fn add_italic_fonts(&mut self, fonts: impl IntoIterator<Item = Font>) {
-        self.char_width = self.char_width.min(Self::add_fonts_internal(
-            &mut self.italic,
-            fonts,
-            self.char_height,
-        ));
+        self.add_to_slot(|f| &mut f.italic, fonts);
     }
 
-    /// TODO
     /// Add a new collection of fonts for bold italic styled text.
     pub fn add_bold_italic_fonts(&mut self, fonts: impl IntoIterator<Item = Font>) {
-        self.char_width = self.char_width.min(Self::add_fonts_internal(
-            &mut self.bold_italic,
-            fonts,
-            self.char_height,
-        ));
+        self.add_to_slot(|f| &mut f.bold_italic, fonts);
+    }
+
+    /// Appends `fonts` to the style slot `slot` picks, narrowing the cell
+    /// width to the narrowest of them.
+    fn add_to_slot(
+        &mut self,
+        slot: fn(&mut Self) -> &mut Vec<Font>,
+        fonts: impl IntoIterator<Item = Font>,
+    ) {
+        let char_height = self.char_height;
+        let narrowest = Self::add_fonts_internal(slot(self), fonts, char_height);
+        self.char_width = self.char_width.min(narrowest);
+    }
+
+    /// The fonts of every style slot, regular first.
+    fn styled_fonts(&self) -> impl Iterator<Item = &Font> {
+        [&self.regular, &self.bold, &self.italic, &self.bold_italic]
+            .into_iter()
+            .flatten()
     }
 }
 
@@ -530,9 +530,7 @@ impl Fonts {
     /// A text font with `ch`: the style slots and the last resort, never an
     /// emoji font.
     pub(crate) fn text_font_with(&self, ch: char) -> Option<&Font> {
-        [&self.regular, &self.bold, &self.italic, &self.bold_italic]
-            .into_iter()
-            .flatten()
+        self.styled_fonts()
             .chain(std::iter::once(&self.last_resort))
             .find(|font| font.font().glyph_index(ch).is_some())
     }
@@ -629,10 +627,7 @@ impl Fonts {
         if self.last_resort.id() == id {
             return &self.last_resort;
         }
-        let found = [&self.regular, &self.bold, &self.italic, &self.bold_italic]
-            .into_iter()
-            .flatten()
-            .find(|font| font.id() == id);
+        let found = self.styled_fonts().find(|font| font.id() == id);
         // Without this an emoji font's id would silently resolve to the
         // last resort.
         #[cfg(feature = "emoji")]
@@ -764,7 +759,7 @@ mod font_for_cell_tests {
     use ratatui::buffer::Cell;
     use ratatui::style::Modifier;
 
-    const FONT_DATA: &[u8] = include_bytes!("../examples/assets/fonts/Mplus1Code-Regular.ttf");
+    const FONT_DATA: &[u8] = crate::test_fonts::MPLUS;
 
     fn fresh_font() -> Font {
         Font::from_vec(FONT_DATA.to_vec()).expect("failed to load test font")
@@ -892,9 +887,9 @@ mod font_for_cell_tests {
 mod emoji_tests {
     use super::*;
 
-    const MPLUS: &[u8] = include_bytes!("../examples/assets/fonts/Mplus1Code-Regular.ttf");
-    const COLRV1: &[u8] = include_bytes!("backend/testdata/noto_colrv1_subset.ttf");
-    const CBDT: &[u8] = include_bytes!("backend/testdata/noto_cbdt_subset.ttf");
+    const MPLUS: &[u8] = crate::test_fonts::MPLUS;
+    const COLRV1: &[u8] = crate::test_fonts::COLRV1;
+    const CBDT: &[u8] = crate::test_fonts::CBDT;
 
     fn cell(symbol: &str) -> Cell {
         let mut cell = Cell::default();

@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.6.0
+
+### Changed
+- **Breaking:** the `input::ray` module is removed; hit-testing uses bevy's
+  `Ray3d`.
+- **Breaking:** `HitRegions` is no longer a `Component`; read it with
+  `Tui::hit_regions()` as before.
+- **Breaking:** `MouseChangeProbes` is gone; `mouse_input_system` takes
+  `MouseInputs`, `UiTerminals` (feature `2d`) and `MeshTerminals` (feature
+  `3d`) instead of one signature per feature combination. A build with
+  `mouse_input` but neither surface now compiles.
+- **Behavior:** `BOLD` and `ITALIC` are faked from the regular font without
+  the `bold_italic_fonts` feature, as documented (they were ignored before).
+  Fake styles never split a shaping run, so styled rows cost about what
+  plain ones do.
+- **Behavior:** outline glyphs are rasterized with zeno instead of raqote:
+  regular text at 1x with exact-area antialiasing, fake bold through a
+  coverage curve. Edges differ slightly; a first screen of new glyphs
+  rasterizes about 2.7x faster.
+- **Behavior:** COLR glyphs (color with `emoji`, silhouettes without) are
+  painted by the crate's own compositor at 1x: sweep gradients follow the
+  COLRv1 angle units (they were read as degrees), and all 28 composite modes
+  use the W3C formulas. PNG strikes are decoded with the `png` crate.
+  `raqote` and `tiny-skia` are no longer dependencies.
+- Procedural glyphs are drawn on a byte canvas: rectangles are
+  pixel-identical to before, diagonals, arcs and triangles nearly so.
+- `programmatic_aa` feature: antialiased diagonal, round and triangular
+  procedural glyphs.
+- New glyphs bound for adjacent atlas slots are uploaded with one
+  `write_texture` per run of slots instead of one per glyph.
+- A world-quad terminal's mesh is rewritten in place on resize instead of
+  being replaced, and a mesh the app swapped in is left alone.
+- Re-pointing `AttachTerminal::terminal` at another `Tui` attaches a material
+  for that terminal's texture.
+- The cursor position follows the primary window, or the window holding the
+  cursor when there is none; a failed ratatui resize is logged.
+
 ## 0.5.0
 
 ### Added

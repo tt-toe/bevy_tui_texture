@@ -1,5 +1,4 @@
 use super::primitives::*;
-use tiny_skia::Pixmap;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Weight {
@@ -197,10 +196,10 @@ impl LineMetrics {
     }
 }
 
-fn fill(pixmap: &mut Pixmap, x0: u32, y0: u32, x1: u32, y1: u32) {
+fn fill(canvas: &mut GlyphCanvas, x0: u32, y0: u32, x1: u32, y1: u32) {
     if x1 > x0 && y1 > y0 {
         draw_rect(
-            pixmap,
+            canvas,
             x0 as f32,
             y0 as f32,
             (x1 - x0) as f32,
@@ -211,9 +210,9 @@ fn fill(pixmap: &mut Pixmap, x0: u32, y0: u32, x1: u32, y1: u32) {
 }
 
 /// Draws the four arms of `lines`, a port of Ghostty's `linesChar`.
-pub(super) fn draw_lines(pixmap: &mut Pixmap, m: &LineMetrics, lines: Lines) {
+pub(super) fn draw_lines(canvas: &mut GlyphCanvas, m: &LineMetrics, lines: Lines) {
     use Weight::{Double, Heavy, None as No};
-    let (w, h) = (pixmap.width(), pixmap.height());
+    let (w, h) = (canvas.width(), canvas.height());
     let Lines {
         up,
         down,
@@ -276,8 +275,8 @@ pub(super) fn draw_lines(pixmap: &mut Pixmap, m: &LineMetrics, lines: Lines) {
 
     match up {
         Weight::None => {}
-        Weight::Light => fill(pixmap, m.v_light_left, 0, m.v_light_right, up_bottom),
-        Heavy => fill(pixmap, m.v_heavy_left, 0, m.v_heavy_right, up_bottom),
+        Weight::Light => fill(canvas, m.v_light_left, 0, m.v_light_right, up_bottom),
+        Heavy => fill(canvas, m.v_heavy_left, 0, m.v_heavy_right, up_bottom),
         Double => {
             let l = if left == Double {
                 m.h_light_top
@@ -289,14 +288,14 @@ pub(super) fn draw_lines(pixmap: &mut Pixmap, m: &LineMetrics, lines: Lines) {
             } else {
                 up_bottom
             };
-            fill(pixmap, m.v_double_left, 0, m.v_light_left, l);
-            fill(pixmap, m.v_light_right, 0, m.v_double_right, r);
+            fill(canvas, m.v_double_left, 0, m.v_light_left, l);
+            fill(canvas, m.v_light_right, 0, m.v_double_right, r);
         }
     }
     match right {
         Weight::None => {}
-        Weight::Light => fill(pixmap, right_left, m.h_light_top, w, m.h_light_bottom),
-        Heavy => fill(pixmap, right_left, m.h_heavy_top, w, m.h_heavy_bottom),
+        Weight::Light => fill(canvas, right_left, m.h_light_top, w, m.h_light_bottom),
+        Heavy => fill(canvas, right_left, m.h_heavy_top, w, m.h_heavy_bottom),
         Double => {
             let t = if up == Double {
                 m.v_light_right
@@ -308,14 +307,14 @@ pub(super) fn draw_lines(pixmap: &mut Pixmap, m: &LineMetrics, lines: Lines) {
             } else {
                 right_left
             };
-            fill(pixmap, t, m.h_double_top, w, m.h_light_top);
-            fill(pixmap, b, m.h_light_bottom, w, m.h_double_bottom);
+            fill(canvas, t, m.h_double_top, w, m.h_light_top);
+            fill(canvas, b, m.h_light_bottom, w, m.h_double_bottom);
         }
     }
     match down {
         Weight::None => {}
-        Weight::Light => fill(pixmap, m.v_light_left, down_top, m.v_light_right, h),
-        Heavy => fill(pixmap, m.v_heavy_left, down_top, m.v_heavy_right, h),
+        Weight::Light => fill(canvas, m.v_light_left, down_top, m.v_light_right, h),
+        Heavy => fill(canvas, m.v_heavy_left, down_top, m.v_heavy_right, h),
         Double => {
             let l = if left == Double {
                 m.h_light_bottom
@@ -327,14 +326,14 @@ pub(super) fn draw_lines(pixmap: &mut Pixmap, m: &LineMetrics, lines: Lines) {
             } else {
                 down_top
             };
-            fill(pixmap, m.v_double_left, l, m.v_light_left, h);
-            fill(pixmap, m.v_light_right, r, m.v_double_right, h);
+            fill(canvas, m.v_double_left, l, m.v_light_left, h);
+            fill(canvas, m.v_light_right, r, m.v_double_right, h);
         }
     }
     match left {
         Weight::None => {}
-        Weight::Light => fill(pixmap, 0, m.h_light_top, left_right, m.h_light_bottom),
-        Heavy => fill(pixmap, 0, m.h_heavy_top, left_right, m.h_heavy_bottom),
+        Weight::Light => fill(canvas, 0, m.h_light_top, left_right, m.h_light_bottom),
+        Heavy => fill(canvas, 0, m.h_heavy_top, left_right, m.h_heavy_bottom),
         Double => {
             let t = if up == Double {
                 m.v_light_left
@@ -346,33 +345,38 @@ pub(super) fn draw_lines(pixmap: &mut Pixmap, m: &LineMetrics, lines: Lines) {
             } else {
                 left_right
             };
-            fill(pixmap, 0, m.h_double_top, t, m.h_light_top);
-            fill(pixmap, 0, m.h_light_bottom, b, m.h_double_bottom);
+            fill(canvas, 0, m.h_double_top, t, m.h_light_top);
+            fill(canvas, 0, m.h_light_bottom, b, m.h_double_bottom);
         }
     }
 }
 
-/// Draws `count` dashes across the cell, with half a gap at each end.
-pub(super) fn dash_horizontal(pixmap: &mut Pixmap, m: &LineMetrics, count: u32, heavy: bool) {
-    let (top, bottom) = if heavy {
-        (m.h_heavy_top, m.h_heavy_bottom)
-    } else {
-        (m.h_light_top, m.h_light_bottom)
+/// Draws `count` dashes across the cell (`vertical`: down it), with half
+/// a gap at each end.
+pub(super) fn dashes(
+    canvas: &mut GlyphCanvas,
+    m: &LineMetrics,
+    count: u32,
+    heavy: bool,
+    vertical: bool,
+) {
+    let (near, far) = match (vertical, heavy) {
+        (false, false) => (m.h_light_top, m.h_light_bottom),
+        (false, true) => (m.h_heavy_top, m.h_heavy_bottom),
+        (true, false) => (m.v_light_left, m.v_light_right),
+        (true, true) => (m.v_heavy_left, m.v_heavy_right),
     };
-    for (x0, x1) in dash_spans(pixmap.width(), count, m.light) {
-        fill(pixmap, x0, top, x1, bottom);
-    }
-}
-
-/// Draws `count` dashes down the cell, with half a gap at each end.
-pub(super) fn dash_vertical(pixmap: &mut Pixmap, m: &LineMetrics, count: u32, heavy: bool) {
-    let (left, right) = if heavy {
-        (m.v_heavy_left, m.v_heavy_right)
+    let len = if vertical {
+        canvas.height()
     } else {
-        (m.v_light_left, m.v_light_right)
+        canvas.width()
     };
-    for (y0, y1) in dash_spans(pixmap.height(), count, m.light) {
-        fill(pixmap, left, y0, right, y1);
+    for (start, end) in dash_spans(len, count, m.light) {
+        if vertical {
+            fill(canvas, near, start, far, end);
+        } else {
+            fill(canvas, start, near, end, far);
+        }
     }
 }
 

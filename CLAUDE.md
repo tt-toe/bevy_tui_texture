@@ -60,6 +60,10 @@ cargo run --example benchmark_partial   # BENCH_MODE=static|partial redraw costs
 # Pure CPU except the GPU-backed tests, which skip without an adapter.
 # A GPU test must hold gpu_test_lock() and use test_render_plugin()
 # (src/setup.rs); without them Mesa 26's lavapipe segfaults or panics.
+# Test fonts (M+, fusion-pixel, the COLRv1/CBDT emoji subsets) live in
+# src/test_fonts.rs; golden checksums pin glyph output in rasterize.rs and
+# programmatic_glyphs/mod.rs. `write_shape_sheet` (ignored) dumps the
+# non-rectangle procedural glyphs as a PGM for a visual check.
 cargo test
 
 # What CI runs (.github/workflows/ci.yml):
@@ -86,6 +90,10 @@ feature (the lib's own bevy is default-features=false and logs nothing).
   otherwise bold/italic are faked from the regular font
 - `emoji` (opt-in) — color emoji (see "Color glyphs" below; pulls in
   `unicode-properties`). Without it, register a monochrome emoji font instead
+- `programmatic_aa` (opt-in) — antialiased non-rectangle procedural glyphs
+  (`primitives::AA`, src/backend/programmatic_glyphs/primitives.rs);
+  rectangles are always pixel-aligned so box lines meet at cell edges.
+  Off, those shapes are thresholded at half coverage
 - `blink` (opt-in) — `SLOW_BLINK`/`RAPID_BLINK` and cursor blink: `blink_system`
   (src/bevy_plugin.rs, `Time<Real>`) flips the off phase, reshaping only rows
   whose `RowGeometry::blink` changed. Off, every blink item is `#[cfg]`'d out
@@ -182,7 +190,7 @@ row-clear rectangle is a cell instance with `fg` alpha 0.
 A *symbol* (Nerd Fonts icon / Private Use Area, or an ambiguous-width char
 its font draws wider than a cell) is drawn by `draw_symbol`
 (src/backend/bevy_backend.rs, deliberately `#[inline(never)]` so the text
-path compiles as before): it may take the blank cell after it
+path stays lean): it may take the blank cell after it
 (`glyph_constraint::symbol_span`, Ghostty's rule), rasterized into a
 two-cell atlas slot (`Key::cells`), emitted as one instance over both cells
 or - when their backgrounds differ - one per cell, the blank sampling the
@@ -202,7 +210,7 @@ that doesn't use it pays at most one OR of its cells' modifiers:
   their off phase, and the `Block` cursor are rewritten in a scratch copy of
   the row (`blank_invisible`) before shaping.
 - ratatui calls the cursor ops on every draw; they dirty rows only on change.
-- `TerminalPalette::default()` keeps the old SVG-keyword named colors
+- `TerminalPalette::default()` uses SVG-keyword named colors
   (`DarkGray` brighter than `Gray`); `xterm()` unifies named and indexed.
 - Setting changes reshape via `reshape_dirty_rows` / `restyle_all_rows`
   outside `flush`, possibly before the first draw sized the per-row state.
@@ -288,14 +296,20 @@ benchmark's own paint closures), so confirm with a time profile
 Compare like with like: thin and fat LTO differ by more than most changes
 (`static` is about 68 µs on thin and 115 µs on fat, `full_text` about 280 and
 215). `decorated_text` times underline/strikeout/DIM rows (about 1.35x
-`styled_text`: one overlay instance per decorated cell). For a fair
+`styled_text`: one overlay instance per decorated cell). `cold_cjk` times
+the first draw of 960 never-seen glyphs (rasterization, about 3.7 ms), the
+median of 20 fresh terminals. For a fair
 before/after, build both trees into separate target dirs and alternate the
 two binaries; a single target dir can reuse the other tree's artifact.
 
 ### Other modules
 
 - **src/backend/** — `bevy_backend.rs` (ratatui `Backend` impl),
-  `rasterize.rs` (rustybuzz + raqote), `programmatic_glyphs/`
+  `rasterize.rs` (outlines through zeno: regular at 1x, fake bold at 2x
+  through `BOLD_LUT`; PNG strikes via `png`), src/utils/colr.rs (COLR
+  v0/v1 painter on zeno masks, all 28 composite modes),
+  `programmatic_glyphs/` (a u8 `GlyphCanvas`; rectangles filled exactly,
+  other shapes through zeno)
   (procedural: box-drawing via `box_lines.rs` (4-direction line weights,
   Ghostty `linesChar`), block elements, braille, powerline, `mosaic.rs`
   (sextants/octants inverted from ratatui's `symbols::pixel` tables, plus the
@@ -318,8 +332,9 @@ two binaries; a single target dir can reuse the other tree's artifact.
   maps onto it directly (self-defined, not a crossterm dependency — wasm
   stays intact; see the `crossterm-compat` feature above for real
   conversions on native); focus management with Tab cycling; unified
-  mouse handling that auto-detects 2D UI vs 3D mesh via raycasting
-  (src/input/ray.rs) when both features are on; touch fallback (see
+  mouse handling: one `mouse_input_system` with `UiTerminals` (2D boxes)
+  and `MeshTerminals` (bevy `Ray3d` per camera) as `#[cfg]`'d parameters, a
+  mesh winning over a node on the same entity; touch fallback (see
   Gotchas)
 - **src/backend/glyph_constraint/** — fitting symbols to the grid:
   `GlyphConstraint::constrain` (port of Ghostty's `Glyph.zig` constraint
@@ -592,7 +607,7 @@ open `http://127.0.0.1:8080/web/`); `file://` cannot work. Details in
 bevy dev-dependency dropping `tonemapping_luts`/`zstd_rust` (a ~680KB LUT
 + decoder needed only by the default tonemapper — hence
 `KhronosPbrNeutral`) and native-only `x11`. `#![no_std]` is not
-achievable (bevy, raqote, rustybuzz, ratatui need `std`). Full breakdown
+achievable (bevy, rustybuzz, ratatui need `std`). Full breakdown
 in `examples/web/README.md`.
 
 **Overlay panel collapse**: clicking the overlay's title bar
@@ -604,7 +619,7 @@ automatically, no manual Node bookkeeping.
 
 | bevy | ratatui | wgpu | bevy_tui_texture |
 |------|---------|------|------------------|
-| 0.20 | 0.30.2  | 30   | 0.4, 0.5         |
+| 0.20 | 0.30.2  | 30   | 0.4 – 0.6        |
 
 Rust edition 2024, `rust-version = "1.97.1"` — tracks bevy 0.20's MSRV, not
 this crate's own code (see README.md "MSRV policy").

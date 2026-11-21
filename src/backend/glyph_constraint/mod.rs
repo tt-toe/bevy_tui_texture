@@ -261,7 +261,7 @@ pub(crate) struct CellMetrics {
 /// reading it back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct CellClass {
-    /// 0: not a symbol, drawn as before.
+    /// 0: not a symbol, drawn as text.
     pub(crate) max_cells: u8,
     /// A terminal graphics element (box drawing, blocks, Powerline
     /// separators): a symbol before it doesn't stop the next one from

@@ -45,12 +45,21 @@ struct RowGlyph {
     run: u16,
 }
 
-/// A maximal stretch of a row whose cells all resolve to the same font
-/// (and fake styling), shaped as one rustybuzz run.
+/// The styles a glyph is faked with, rasterizing from a font that lacks them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct FakeStyle {
+    bold: bool,
+    italic: bool,
+}
+
+/// A maximal stretch of a row whose cells all resolve to the same font,
+/// shaped as one rustybuzz run.
 struct FontRun<'f> {
     font: &'f crate::fonts::Font,
-    fake_bold: bool,
-    fake_italic: bool,
+    /// Whether any of its cells is faked bold or italic: fake styling only
+    /// changes rasterization, so it never splits a run; each glyph reads
+    /// its cell's flags from `font_runs`' `styles`.
+    styled: bool,
     /// Whether any of its cells is a symbol (see
     /// [`crate::backend::glyph_constraint`]) - known for free from the
     /// font choice, and false for practically every run of text, which
@@ -66,40 +75,43 @@ struct FontRun<'f> {
     bytes: std::ops::Range<usize>,
 }
 
-/// Splits a row into [`FontRun`]s via [`Fonts::font_for_cell`].
+/// Splits a row into [`FontRun`]s via [`Fonts::font_for_cell`], and
+/// records each cell's fake styles in `styles` (one entry per cell).
 fn font_runs<'f>(
     fonts: &'f Fonts,
     cells: &[Cell],
     choices: &mut crate::utils::shape_cache::FontChoiceCache,
+    styles: &mut Vec<FakeStyle>,
 ) -> Vec<FontRun<'f>> {
     let mut runs: Vec<FontRun<'f>> = Vec::new();
     let mut end = 0;
+    styles.clear();
     for cell in cells {
         let start = end;
         end += cell.symbol().len();
         if start == end {
+            styles.push(FakeStyle::default());
             if let Some(run) = runs.last_mut() {
                 run.bytes.end = end;
             }
             continue;
         }
         let (font, fake_bold, fake_italic, class) = fonts.font_for_cell_cached(cell, choices);
-        let styled = cfg!(feature = "bold_italic_fonts");
-        let (fake_bold, fake_italic) = (styled && fake_bold, styled && fake_italic);
+        styles.push(FakeStyle {
+            bold: fake_bold,
+            italic: fake_italic,
+        });
+        let styled = fake_bold || fake_italic;
         match runs.last_mut() {
-            Some(run)
-                if run.font.id() == font.id()
-                    && run.fake_bold == fake_bold
-                    && run.fake_italic == fake_italic =>
-            {
+            Some(run) if run.font.id() == font.id() => {
                 run.bytes.end = end;
+                run.styled |= styled;
                 run.symbols |= class.is_symbol();
                 run.fallbacks |= class.fallback;
             }
             _ => runs.push(FontRun {
                 font,
-                fake_bold,
-                fake_italic,
+                styled,
                 symbols: class.is_symbol(),
                 fallbacks: class.fallback,
                 #[cfg(feature = "emoji")]
@@ -116,9 +128,8 @@ mod font_run_tests {
     use super::*;
     use crate::fonts::Font;
 
-    const MPLUS: &[u8] = include_bytes!("../../examples/assets/fonts/Mplus1Code-Regular.ttf");
-    const FUSION: &[u8] =
-        include_bytes!("../../examples/assets/fonts/fusion-pixel-10px-monospaced-ja.ttf");
+    const MPLUS: &[u8] = crate::test_fonts::MPLUS;
+    const FUSION: &[u8] = crate::test_fonts::FUSION;
 
     fn cells(symbols: &[&str]) -> Vec<Cell> {
         symbols
@@ -141,7 +152,7 @@ mod font_run_tests {
 
         let row = cells(&["a", "b", "한", "", "c", "d"]);
         let mut choices = crate::utils::shape_cache::FontChoiceCache::new();
-        let runs: Vec<_> = font_runs(&fonts, &row, &mut choices)
+        let runs: Vec<_> = font_runs(&fonts, &row, &mut choices, &mut Vec::new())
             .iter()
             .map(|run| (run.font.id(), run.bytes.clone()))
             .collect();
@@ -152,10 +163,30 @@ mod font_run_tests {
     }
 
     #[test]
+    fn fake_styles_do_not_split_a_run() {
+        use ratatui::style::Modifier;
+        let fonts = Fonts::new(Font::new(MPLUS).expect("M+ parses"), 16);
+        let mut row = cells(&["a", "b", "c", "d"]);
+        row[1].modifier = Modifier::BOLD;
+        row[2].modifier = Modifier::ITALIC;
+        let mut choices = crate::utils::shape_cache::FontChoiceCache::new();
+        let runs = font_runs(&fonts, &row, &mut choices, &mut Vec::new());
+        assert_eq!(runs.len(), 1);
+        assert!(runs[0].styled);
+        let plain = font_runs(&fonts, &cells(&["a", "b"]), &mut choices, &mut Vec::new());
+        assert!(!plain[0].styled);
+    }
+
+    #[test]
     fn a_single_font_row_is_one_run() {
         let fonts = Fonts::new(Font::new(MPLUS).expect("M+ parses"), 16);
         let mut choices = crate::utils::shape_cache::FontChoiceCache::new();
-        let runs = font_runs(&fonts, &cells(&["h", "i", " ", "あ", ""]), &mut choices);
+        let runs = font_runs(
+            &fonts,
+            &cells(&["h", "i", " ", "あ", ""]),
+            &mut choices,
+            &mut Vec::new(),
+        );
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].bytes, 0..6);
     }
@@ -252,6 +283,8 @@ pub struct BevyTerminalBackend {
     covered: Vec<Cover>,
     /// Scratch for `shape_row`: the row's glyphs, in shaping order.
     glyphs: Vec<RowGlyph>,
+    /// Scratch for `shape_row`: each cell's fake styles.
+    cell_styles: Vec<FakeStyle>,
     /// Scratch for `shape_row`: the row with invisible cells blanked.
     visible_row: Vec<Cell>,
     decorations: crate::fonts::DecorationMetrics,
@@ -417,6 +450,7 @@ impl TerminalBuilder {
             row: String::new(),
             rowmap: vec![],
             covered: vec![],
+            cell_styles: vec![],
             glyphs: vec![],
             visible_row: vec![],
             decorations,
@@ -439,24 +473,6 @@ impl TerminalBuilder {
 
 /// Default foreground alpha of `Modifier::DIM` cells.
 pub(crate) const DEFAULT_DIM_ALPHA: u8 = 128;
-
-/// A tiny-skia pixmap's alpha channel - the coverage mask the R8 glyph
-/// atlas stores (tiny-skia pixels are RGBA byte order).
-fn pixmap_coverage(pixmap: &tiny_skia::Pixmap) -> Vec<u8> {
-    pixmap
-        .data()
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|rgba| rgba[3])
-        .collect()
-}
-
-/// Coverage mask of a rasterized glyph: `rasterize_glyph` yields RGBA8
-/// packed little-endian into `u32`s, so alpha is the top byte.
-fn glyph_coverage(image: &[u32]) -> Vec<u8> {
-    image.iter().map(|rgba| (rgba >> 24) as u8).collect()
-}
 
 /// Pixel coordinate as the `u16` a [`CellInstance`] stores.
 fn px_u16(px: u32) -> u16 {
@@ -511,16 +527,16 @@ fn cell_colors(cell: &Cell, palette: &CellPalette) -> ([u8; 4], [u8; 4]) {
     )
 }
 
-/// The styling part of a glyph's atlas key: bold/italic only matter with
-/// real per-style fonts.
-fn key_style(cell: &Cell) -> ratatui::style::Modifier {
-    #[cfg(feature = "bold_italic_fonts")]
-    let style = cell.modifier & (ratatui::style::Modifier::BOLD | ratatui::style::Modifier::ITALIC);
-    #[cfg(not(feature = "bold_italic_fonts"))]
-    let style = {
-        let _ = cell;
-        ratatui::style::Modifier::empty()
-    };
+/// The styling part of a glyph's atlas key: the fake styles it is
+/// rasterized with (a real bold or italic font has its own font id).
+fn fake_style(fake: FakeStyle) -> Modifier {
+    let mut style = Modifier::empty();
+    if fake.bold {
+        style |= Modifier::BOLD;
+    }
+    if fake.italic {
+        style |= Modifier::ITALIC;
+    }
     style
 }
 
@@ -587,47 +603,32 @@ fn draw_symbol(
     let spreads = span == 2 && ch.width() == Some(1);
     let width_px = span * cell_width_px;
 
-    let key = Key {
-        style: key_style(cell),
-        glyph: glyph.glyph_id,
-        font: font.id(),
-        cells: span as u8,
-    };
-    let cached = shared.cached.get(&key, width_px, cell_height_px);
-    if !cached.cached() {
-        let face = font.font();
-        let mut info = rustybuzz::GlyphInfo::default();
-        info.glyph_id = glyph.glyph_id;
-        let (rect, image) = rasterize_glyph(
-            cached,
-            face,
-            &info,
-            false,
-            false,
-            cell_height_px as f32 / face.height() as f32,
-            Placement::Constrained {
-                constraint: GlyphConstraint::for_symbol(ch),
-                metrics: row.fonts.cell_metrics(),
-                cells: span,
-            },
-        );
-        shared
-            .pending_cache_updates
-            .push((rect, glyph_coverage(&image)));
-    }
+    let metrics = row.fonts.cell_metrics();
+    let cached = outline_slot(
+        shared,
+        font,
+        glyph.glyph_id,
+        span,
+        (cell_width_px, cell_height_px),
+        FakeStyle::default(),
+        |_| Placement::Constrained {
+            constraint: GlyphConstraint::for_symbol(ch),
+            metrics,
+            cells: span,
+        },
+    );
 
     let (fg, bg) = cell_colors(cell, row.palette);
     let x_px = x as u32 * cell_width_px;
-    let instance = |x_px: u32, width_px: u32, u: u32, bg: [u8; 4]| CellInstance {
-        rect: [
-            px_u16(x_px),
-            px_u16(row.y as u32 * cell_height_px),
-            px_u16(width_px),
-            px_u16(cell_height_px),
-        ],
-        uv: [px_u16(u), px_u16(cached.y)],
-        fg,
-        bg,
+    let y_px = row.y as u32 * cell_height_px;
+    let instance = |x_px: u32, width_px: u32, u: u32, bg: [u8; 4]| {
+        instance(
+            (x_px, y_px),
+            (width_px, cell_height_px),
+            [px_u16(u), px_u16(cached.y)],
+            fg,
+            bg,
+        )
     };
     set_cover(covered, x, Cover::Glyph);
     if !spreads {
@@ -658,6 +659,68 @@ fn set_cover(covered: &mut [Cover], x: usize, cover: Cover) {
     if let Some(slot) = covered.get_mut(x) {
         *slot = cover;
     }
+}
+
+/// An instance covering `size` pixels at `pos`, sampling the atlas at `uv`.
+fn instance(
+    (x, y): (u32, u32),
+    (width, height): (u32, u32),
+    uv: [u16; 2],
+    fg: [u8; 4],
+    bg: [u8; 4],
+) -> CellInstance {
+    CellInstance {
+        rect: [px_u16(x), px_u16(y), px_u16(width), px_u16(height)],
+        uv,
+        fg,
+        bg,
+    }
+}
+
+/// A bar of solid `fg` over `[x, y, width, height]`, sampling the `'█'`
+/// slot `solid` - underlines, strikeouts and cursor outlines.
+fn bar([x, y, width, height]: [u32; 4], solid: [u16; 2], fg: [u8; 4]) -> CellInstance {
+    instance((x, y), (width, height), solid, fg, [0; 4])
+}
+
+/// The atlas slot of outline glyph `glyph` of `font` spread over `cells`
+/// cells of `cell` pixels, rasterized on a miss with `fake` styles and the
+/// placement `placement` builds from the font-units-to-pixels scale.
+fn outline_slot<'a>(
+    shared: &mut crate::fonts::SharedFontCpuState,
+    font: &crate::fonts::Font,
+    glyph: u32,
+    cells: u32,
+    cell: (u32, u32),
+    fake: FakeStyle,
+    placement: impl FnOnce(f32) -> Placement<'a>,
+) -> crate::utils::text_atlas::CacheRect {
+    let (width, height) = (cells * cell.0, cell.1);
+    let key = Key {
+        style: fake_style(fake),
+        glyph,
+        font: font.id(),
+        cells: cells as u8,
+    };
+    let cached = shared.cached.get(&key, width, height);
+    if !cached.cached() {
+        let face = font.font();
+        let advance_scale = height as f32 / face.height() as f32;
+        let mut info = rustybuzz::GlyphInfo::default();
+        info.glyph_id = glyph;
+        let (rect, image) = rasterize_glyph(
+            cached,
+            face,
+            &info,
+            fake.italic,
+            fake.bold,
+            advance_scale,
+            placement(advance_scale),
+            &mut shared.raster,
+        );
+        shared.pending_cache_updates.push((rect, image));
+    }
+    *cached
 }
 
 /// Whether `c` is a combining mark to draw over a color glyph.
@@ -729,17 +792,13 @@ fn draw_color_glyph(
     let (fg, bg) = cell_colors(cell, row.palette);
     let x_px = x as u32 * cell_width_px;
     let y_px = row.y as u32 * cell_height_px;
-    out.colors.push(CellInstance {
-        rect: [
-            px_u16(x_px),
-            px_u16(y_px),
-            px_u16(width_px),
-            px_u16(cell_height_px),
-        ],
-        uv: [px_u16(cached.x), px_u16(cached.y)],
-        fg: [0; 4],
+    out.colors.push(instance(
+        (x_px, y_px),
+        (width_px, cell_height_px),
+        [px_u16(cached.x), px_u16(cached.y)],
+        [0; 4],
         bg,
-    });
+    ));
     set_cover(covered, x, Cover::Color);
 
     for mark in cell
@@ -755,48 +814,52 @@ fn draw_color_glyph(
         let Some(mark_id) = mark_face.glyph_index(mark) else {
             continue;
         };
-        let key = Key {
-            style: Modifier::empty(),
-            glyph: mark_id.0 as u32,
-            font: mark_font.id(),
-            cells: 1,
-        };
-        let cached = shared.cached.get(&key, cell_width_px, cell_height_px);
-        if !cached.cached() {
-            let mut info = rustybuzz::GlyphInfo::default();
-            info.glyph_id = mark_id.0 as u32;
-            let (rect, image) = rasterize_glyph(
-                cached,
-                mark_face,
-                &info,
-                false,
-                false,
-                cell_height_px as f32 / mark_face.height() as f32,
-                Placement::Natural {
-                    bearing_offset_x: 0.0,
-                    fit_x: 1.0,
-                },
-            );
-            shared
-                .pending_cache_updates
-                .push((rect, glyph_coverage(&image)));
-        }
-        out.overlays.push(CellInstance {
-            rect: [
-                px_u16(x_px + cells.saturating_sub(1) * cell_width_px / 2),
-                px_u16(y_px),
-                px_u16(cell_width_px),
-                px_u16(cell_height_px),
-            ],
-            uv: [px_u16(cached.x), px_u16(cached.y)],
+        let cached = outline_slot(
+            shared,
+            mark_font,
+            u32::from(mark_id.0),
+            1,
+            (cell_width_px, cell_height_px),
+            FakeStyle::default(),
+            |_| Placement::Natural {
+                bearing_offset_x: 0.0,
+                fit_x: 1.0,
+            },
+        );
+        out.overlays.push(instance(
+            (x_px + cells.saturating_sub(1) * cell_width_px / 2, y_px),
+            (cell_width_px, cell_height_px),
+            [px_u16(cached.x), px_u16(cached.y)],
             fg,
             bg,
-        });
+        ));
     }
     true
 }
 
 impl BevyTerminalBackend {
+    /// The drawable area after the viewport inset, in cells and in pixels.
+    fn viewport_size(&self) -> (ratatui::layout::Size, ratatui::layout::Size) {
+        let (inset_width, inset_height) = match self.viewport {
+            Viewport::Full => (0, 0),
+            Viewport::Shrink { width, height } => (width, height),
+        };
+        let (cell_width, cell_height) = (self.fonts.min_width_px(), self.fonts.height_px());
+        let width = (u32::from(self.cols) * cell_width).saturating_sub(inset_width);
+        let height = (u32::from(self.rows) * cell_height).saturating_sub(inset_height);
+        let to_u16 = |v: u32| v.min(u32::from(u16::MAX)) as u16;
+        (
+            ratatui::layout::Size {
+                width: to_u16(width / cell_width.max(1)),
+                height: to_u16(height / cell_height.max(1)),
+            },
+            ratatui::layout::Size {
+                width: to_u16(width),
+                height: to_u16(height),
+            },
+        )
+    }
+
     /// Whether the most recent `draw()` call's ratatui buffer diff touched
     /// at least one cell.
     pub(crate) fn cells_changed_last_draw(&self) -> bool {
@@ -849,7 +912,7 @@ impl BevyTerminalBackend {
                 }
             };
 
-            let bitmap = pixmap_coverage(&pixmap);
+            let bitmap = pixmap.into_coverage();
 
             let key = Key {
                 style: Modifier::empty(),
@@ -1004,11 +1067,12 @@ impl BevyTerminalBackend {
     /// Drains this backend's font's SHARED pending glyph rasterizations -
     /// queued via `Fonts::with_shared_cpu_state` by potentially ANY
     /// terminal sharing this font, not just this one.
-    pub(crate) fn take_shared_glyph_uploads(
-        &self,
-    ) -> Vec<(crate::utils::text_atlas::CacheRect, Vec<u8>)> {
+    pub(crate) fn take_shared_glyph_uploads(&self) -> crate::backend::GlyphUploads {
         self.fonts
-            .with_shared_cpu_state(|shared| std::mem::take(&mut shared.pending_cache_updates))
+            .with_shared_cpu_state(|shared| crate::backend::GlyphUploads {
+                slot_width: shared.cached.entry_width(),
+                items: std::mem::take(&mut shared.pending_cache_updates),
+            })
     }
 
     /// [`Self::take_shared_glyph_uploads`] for the color atlas: its size,
@@ -1257,7 +1321,12 @@ impl BevyTerminalBackend {
         self.covered.clear();
         self.covered.resize(row_cells.len(), Cover::Free);
 
-        let runs = font_runs(&self.fonts, row_cells, &mut shared.font_choices);
+        let runs = font_runs(
+            &self.fonts,
+            row_cells,
+            &mut shared.font_choices,
+            &mut self.cell_styles,
+        );
 
         let mut glyphs = std::mem::take(&mut self.glyphs);
         glyphs.clear();
@@ -1366,8 +1435,11 @@ impl BevyTerminalBackend {
                 continue;
             }
 
-            let (cell_font, cell_fake_bold, cell_fake_italic) =
-                (run.font, run.fake_bold, run.fake_italic);
+            let cell_font = run.font;
+            let cell_fake = match self.cell_styles.get(cell_idx) {
+                Some(&style) if run.styled => style,
+                _ => FakeStyle::default(),
+            };
 
             use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
             let symbol = cell.symbol();
@@ -1382,28 +1454,15 @@ impl BevyTerminalBackend {
             use crate::backend::programmatic_glyphs::is_programmatic_glyph;
             let is_programmatic = is_programmatic_glyph(ch) || fallback;
 
-            let style = key_style(cell);
-
-            let key = if is_programmatic {
-                Key {
-                    style,
+            let cached = if is_programmatic {
+                let key = Key {
+                    style: Modifier::empty(),
                     glyph: ch as u32,
                     font: last_resort_id,
                     cells: ch_width as u8,
-                }
-            } else {
-                Key {
-                    style,
-                    glyph: glyph.glyph_id,
-                    font: cell_font.id(),
-                    cells: ch_width as u8,
-                }
-            };
-
-            let cached = shared.cached.get(&key, glyph_width_px, cell_height_px);
-
-            if !cached.cached() {
-                if is_programmatic {
+                };
+                let cached = shared.cached.get(&key, glyph_width_px, cell_height_px);
+                if !cached.cached() {
                     queue_programmatic_glyph(
                         ch,
                         *cached,
@@ -1411,51 +1470,37 @@ impl BevyTerminalBackend {
                         cell_height_px,
                         &mut shared.pending_cache_updates,
                     );
-                } else {
-                    let metrics = cell_font.font();
-                    let advance_scale = cell_height_px as f32 / metrics.height() as f32;
-                    let fit_x = fit_to_cells(
-                        glyph.x_advance as f32 * advance_scale,
-                        glyph_width_px as f32,
-                    );
-
-                    let bearing_offset_x = glyph.x_offset as f32 * advance_scale * fit_x;
-
-                    let mut info = rustybuzz::GlyphInfo::default();
-                    info.glyph_id = glyph.glyph_id;
-
-                    let (rect, image) = rasterize_glyph(
-                        cached,
-                        metrics,
-                        &info,
-                        cell_fake_italic,
-                        cell_fake_bold,
-                        advance_scale,
-                        Placement::Natural {
-                            bearing_offset_x,
-                            fit_x,
-                        },
-                    );
-
-                    shared
-                        .pending_cache_updates
-                        .push((rect, glyph_coverage(&image)));
                 }
-            }
+                *cached
+            } else {
+                outline_slot(
+                    shared,
+                    cell_font,
+                    glyph.glyph_id,
+                    ch_width,
+                    (cell_width_px, cell_height_px),
+                    cell_fake,
+                    |advance_scale| {
+                        let fit_x = fit_to_cells(
+                            glyph.x_advance as f32 * advance_scale,
+                            glyph_width_px as f32,
+                        );
+                        Placement::Natural {
+                            bearing_offset_x: glyph.x_offset as f32 * advance_scale * fit_x,
+                            fit_x,
+                        }
+                    },
+                )
+            };
 
             let (fg, bg) = cell_colors(cell, &self.palette);
-
-            let instance = CellInstance {
-                rect: [
-                    px_u16(cell_idx as u32 * cell_width_px),
-                    px_u16(y as u32 * cell_height_px),
-                    px_u16(glyph_width_px),
-                    px_u16(cell_height_px),
-                ],
-                uv: [px_u16(cached.x), px_u16(cached.y)],
+            let instance = instance(
+                (cell_idx as u32 * cell_width_px, y as u32 * cell_height_px),
+                (glyph_width_px, cell_height_px),
+                [px_u16(cached.x), px_u16(cached.y)],
                 fg,
                 bg,
-            };
+            );
             if cover == Cover::Free {
                 set_cover(&mut self.covered, cell_idx, Cover::Glyph);
                 out.cells.push(instance);
@@ -1542,14 +1587,8 @@ impl BevyTerminalBackend {
         };
         let solid = solid_slot(&self.fonts, shared);
         let fg = cell_colors(cell, &self.palette).0;
-        for &[bx, by, bw, bh] in bars {
-            out.overlays.push(CellInstance {
-                rect: [px_u16(bx), px_u16(by), px_u16(bw), px_u16(bh)],
-                uv: solid,
-                fg,
-                bg: [0; 4],
-            });
-        }
+        out.overlays
+            .extend(bars.iter().map(|&rect| bar(rect, solid, fg)));
     }
 
     /// Emits one overlay bar per cell for each underlined or crossed-out cell of `row_cells`.
@@ -1608,19 +1647,18 @@ impl BevyTerminalBackend {
                 } else {
                     fg
                 };
-                for i in 0..cells {
-                    out.overlays.push(CellInstance {
-                        rect: [
-                            px_u16((x + i) as u32 * cell_width_px),
-                            px_u16(y as u32 * cell_height_px + top),
-                            px_u16(cell_width_px),
-                            px_u16(thickness),
+                out.overlays.extend((0..cells).map(|i| {
+                    bar(
+                        [
+                            (x + i) as u32 * cell_width_px,
+                            y as u32 * cell_height_px + top,
+                            cell_width_px,
+                            thickness,
                         ],
-                        uv: solid,
+                        solid,
                         fg,
-                        bg: [0; 4],
-                    });
-                }
+                    )
+                }));
             }
         }
     }
@@ -1666,7 +1704,7 @@ fn queue_programmatic_glyph(
         crate::backend::programmatic_glyphs::fallback_symbols::render(ch, width, height)
     });
     if let Some(pixmap) = pixmap {
-        pending.push((rect, pixmap_coverage(&pixmap)));
+        pending.push((rect, pixmap.into_coverage()));
     } else {
         tracing::warn!(
             "Failed to render programmatic glyph '{}' (U+{:04X})",
@@ -1790,44 +1828,14 @@ impl ratatui::backend::Backend for BevyTerminalBackend {
     }
 
     fn size(&self) -> std::io::Result<ratatui::layout::Size> {
-        let (inset_width, inset_height) = match self.viewport {
-            Viewport::Full => (0, 0),
-            Viewport::Shrink { width, height } => (width, height),
-        };
-
-        let pixel_width = self.cols as u32 * self.fonts.min_width_px();
-        let pixel_height = self.rows as u32 * self.fonts.height_px();
-
-        let width = pixel_width.saturating_sub(inset_width);
-        let height = pixel_height.saturating_sub(inset_height);
-
-        Ok(ratatui::layout::Size {
-            width: (width / self.fonts.min_width_px().max(1)) as u16,
-            height: (height / self.fonts.height_px().max(1)) as u16,
-        })
+        Ok(self.viewport_size().0)
     }
 
     fn window_size(&mut self) -> std::io::Result<ratatui::backend::WindowSize> {
-        let (inset_width, inset_height) = match self.viewport {
-            Viewport::Full => (0, 0),
-            Viewport::Shrink { width, height } => (width, height),
-        };
-
-        let pixel_width = self.cols as u32 * self.fonts.min_width_px();
-        let pixel_height = self.rows as u32 * self.fonts.height_px();
-
-        let width = pixel_width.saturating_sub(inset_width);
-        let height = pixel_height.saturating_sub(inset_height);
-
+        let (columns_rows, pixels) = self.viewport_size();
         Ok(ratatui::backend::WindowSize {
-            columns_rows: ratatui::layout::Size {
-                width: (width / self.fonts.min_width_px().max(1)) as u16,
-                height: (height / self.fonts.height_px().max(1)) as u16,
-            },
-            pixels: ratatui::layout::Size {
-                width: width as u16,
-                height: height as u16,
-            },
+            columns_rows,
+            pixels,
         })
     }
 
@@ -1858,10 +1866,128 @@ mod tests {
     use ratatui::buffer::Cell;
     use ratatui::style::{Color, Modifier};
 
-    fn test_fonts() -> Arc<Fonts> {
-        let font_data = include_bytes!("../../examples/assets/fonts/Mplus1Code-Regular.ttf");
-        let font = Font::new(font_data).expect("failed to load test font");
-        Arc::new(Fonts::new(font, 16))
+    use crate::test_fonts::mplus_16 as test_fonts;
+
+    /// The atlas slot origin and coverage of each cell of `cells`, drawn as
+    /// one row on a fresh backend.
+    fn drawn_masks(fonts: Arc<Fonts>, cells: &[(&str, Modifier)]) -> Vec<([u16; 2], Vec<u8>)> {
+        let mut backend = TerminalBuilder::new(fonts)
+            .with_dimensions(cells.len() as u16, 1)
+            .build();
+        let row: Vec<Cell> = cells
+            .iter()
+            .map(|&(symbol, modifier)| {
+                let mut cell = Cell::default();
+                cell.set_symbol(symbol);
+                cell.modifier = modifier;
+                cell
+            })
+            .collect();
+        RatatuiBackend::draw(
+            &mut backend,
+            row.iter()
+                .enumerate()
+                .map(|(x, cell)| (x as u16, 0u16, cell)),
+        )
+        .expect("draw failed");
+        RatatuiBackend::flush(&mut backend).expect("flush failed");
+        let payload = backend.take_draw_payload();
+        let uploads = backend.take_shared_glyph_uploads().items;
+        payload
+            .cells()
+            .iter()
+            .map(|instance| {
+                let mask = uploads
+                    .iter()
+                    .rev()
+                    .find(|(rect, _)| [rect.x as u16, rect.y as u16] == instance.uv)
+                    .map(|(_, mask)| mask.clone())
+                    .unwrap_or_default();
+                (instance.uv, mask)
+            })
+            .collect()
+    }
+
+    fn ink(mask: &[u8]) -> u64 {
+        mask.iter().map(|&a| u64::from(a)).sum()
+    }
+
+    #[test]
+    fn bold_and_italic_are_faked_from_the_regular_font() {
+        let masks = drawn_masks(
+            test_fonts(),
+            &[
+                ("a", Modifier::empty()),
+                ("a", Modifier::BOLD),
+                ("a", Modifier::ITALIC),
+            ],
+        );
+        let [
+            (regular_slot, regular),
+            (bold_slot, bold),
+            (italic_slot, italic),
+        ] = &masks[..]
+        else {
+            panic!("three cells, got {}", masks.len());
+        };
+        assert_ne!(regular_slot, bold_slot, "bold has its own atlas key");
+        assert_ne!(regular_slot, italic_slot, "italic has its own atlas key");
+        assert!(ink(bold) > ink(regular), "bold adds ink");
+        assert_ne!(italic, regular, "italic is slanted");
+    }
+
+    #[test]
+    fn a_bold_box_glyph_reuses_the_unstyled_slot() {
+        let masks = drawn_masks(
+            test_fonts(),
+            &[("─", Modifier::empty()), ("─", Modifier::BOLD)],
+        );
+        assert_eq!(masks.len(), 2);
+        assert_eq!(
+            masks[0].0, masks[1].0,
+            "procedural glyphs ignore fake styles"
+        );
+    }
+
+    #[cfg(feature = "bold_italic_fonts")]
+    #[test]
+    fn a_real_bold_font_is_not_faked() {
+        let font_data = crate::test_fonts::MPLUS;
+        let bold = crate::test_fonts::FUSION;
+        let mut fonts = Fonts::new(Font::new(font_data).expect("font"), 16);
+        fonts.add_bold_fonts([Font::new(bold).expect("font")]);
+        let fonts = Arc::new(fonts);
+        drawn_masks(fonts.clone(), &[("a", Modifier::BOLD)]);
+        fonts.with_shared_cpu_state(|shared| {
+            let key = crate::utils::text_atlas::Key {
+                style: Modifier::empty(),
+                glyph: u32::from(
+                    Font::new(bold)
+                        .expect("font")
+                        .font()
+                        .glyph_index('a')
+                        .expect("glyph")
+                        .0,
+                ),
+                font: fonts
+                    .font_for_cell_cached(
+                        &{
+                            let mut cell = Cell::default();
+                            cell.set_symbol("a");
+                            cell.modifier = Modifier::BOLD;
+                            cell
+                        },
+                        &mut shared.font_choices,
+                    )
+                    .0
+                    .id(),
+                cells: 1,
+            };
+            assert!(
+                shared.cached.get(&key, 8, 16).cached(),
+                "keyed without a fake style"
+            );
+        });
     }
 
     #[test]
@@ -2506,7 +2632,7 @@ mod tests {
 
     #[test]
     fn decoration_metrics_stay_inside_cell() {
-        let font_data = include_bytes!("../../examples/assets/fonts/Mplus1Code-Regular.ttf");
+        let font_data = crate::test_fonts::MPLUS;
         for size in [6, 8, 10, 13, 16, 24, 33, 48] {
             let fonts = Fonts::new(Font::new(font_data).expect("font"), size);
             let d = fonts.decoration_metrics();
@@ -2844,9 +2970,8 @@ mod shaping_mode_tests {
     use crate::fonts::{Font, Shaping};
     use ratatui::style::{Modifier, Style};
 
-    const MPLUS: &[u8] = include_bytes!("../../examples/assets/fonts/Mplus1Code-Regular.ttf");
-    const FUSION: &[u8] =
-        include_bytes!("../../examples/assets/fonts/fusion-pixel-10px-monospaced-ja.ttf");
+    const MPLUS: &[u8] = crate::test_fonts::MPLUS;
+    const FUSION: &[u8] = crate::test_fonts::FUSION;
     const ATLAS: usize = crate::backend::CACHE_WIDTH as usize;
 
     fn coverage(shaping: Shaping) -> Vec<u8> {
@@ -2883,7 +3008,7 @@ mod shaping_mode_tests {
 
         let payload = terminal.backend_mut().take_draw_payload();
         let mut atlas = vec![0u8; ATLAS * ATLAS];
-        for (rect, bytes) in terminal.backend_mut().take_shared_glyph_uploads() {
+        for (rect, bytes) in terminal.backend_mut().take_shared_glyph_uploads().items {
             let width = rect.width as usize;
             for (row, line) in bytes.chunks_exact(width).enumerate() {
                 let start = (rect.y as usize + row) * ATLAS + rect.x as usize;
@@ -2919,9 +3044,8 @@ mod symbol_tests {
     use crate::fonts::Font;
     use ratatui::style::{Color, Style};
 
-    const MPLUS: &[u8] = include_bytes!("../../examples/assets/fonts/Mplus1Code-Regular.ttf");
-    const FUSION: &[u8] =
-        include_bytes!("../../examples/assets/fonts/fusion-pixel-10px-monospaced-ja.ttf");
+    const MPLUS: &[u8] = crate::test_fonts::MPLUS;
+    const FUSION: &[u8] = crate::test_fonts::FUSION;
     const ATLAS: usize = crate::backend::CACHE_WIDTH as usize;
     const ICON: &str = "\u{E000}";
 
@@ -2954,7 +3078,7 @@ mod symbol_tests {
             .expect("draw");
         let payload = terminal.backend_mut().take_draw_payload();
         let mut atlas = vec![0u8; ATLAS * ATLAS];
-        for (rect, bytes) in terminal.backend_mut().take_shared_glyph_uploads() {
+        for (rect, bytes) in terminal.backend_mut().take_shared_glyph_uploads().items {
             let width = rect.width as usize;
             for (row, line) in bytes.chunks_exact(width).enumerate() {
                 let start = (rect.y as usize + row) * ATLAS + rect.x as usize;
@@ -3123,9 +3247,9 @@ mod emoji_tests {
     use ratatui::backend::Backend as RatatuiBackend;
     use ratatui::style::Color;
 
-    const MPLUS: &[u8] = include_bytes!("../../examples/assets/fonts/Mplus1Code-Regular.ttf");
-    const COLRV1: &[u8] = include_bytes!("testdata/noto_colrv1_subset.ttf");
-    const CBDT: &[u8] = include_bytes!("testdata/noto_cbdt_subset.ttf");
+    const MPLUS: &[u8] = crate::test_fonts::MPLUS;
+    const COLRV1: &[u8] = crate::test_fonts::COLRV1;
+    const CBDT: &[u8] = crate::test_fonts::CBDT;
     const FIXTURES: [&[u8]; 2] = [COLRV1, CBDT];
 
     fn fonts(emoji: &'static [u8]) -> Arc<Fonts> {
@@ -3334,7 +3458,11 @@ mod emoji_tests {
             );
             let (_, first) = backend.take_shared_color_uploads();
             assert!(!first.is_empty());
-            assert_eq!(backend.take_shared_glyph_uploads().len(), 3, "a, b, mark");
+            assert_eq!(
+                backend.take_shared_glyph_uploads().items.len(),
+                3,
+                "a, b, mark"
+            );
             let _ = backend.take_draw_payload();
 
             backend

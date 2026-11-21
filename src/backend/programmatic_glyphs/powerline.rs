@@ -1,8 +1,7 @@
 use super::primitives::*;
-use tiny_skia::Pixmap;
 
-pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
-    let mut pixmap = Pixmap::new(width, height)?;
+pub fn render(c: char, width: u32, height: u32) -> Option<GlyphCanvas> {
+    let mut canvas = GlyphCanvas::new(width, height)?;
     let w = width as f32;
     let h = height as f32;
     let color = default_color();
@@ -10,18 +9,18 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
 
     match c {
         '\u{E0B0}' => {
-            draw_triangle(&mut pixmap, 0.0, 0.0, 0.0, h, w, h / 2.0, color);
+            draw_triangle(&mut canvas, 0.0, 0.0, 0.0, h, w, h / 2.0, color);
         }
         '\u{E0B1}' => {
-            draw_line(&mut pixmap, 0.0, 0.0, w, h / 2.0, stroke, color);
-            draw_line(&mut pixmap, 0.0, h, w, h / 2.0, stroke, color);
+            draw_line(&mut canvas, 0.0, 0.0, w, h / 2.0, stroke, color);
+            draw_line(&mut canvas, 0.0, h, w, h / 2.0, stroke, color);
         }
         '\u{E0B2}' => {
-            draw_triangle(&mut pixmap, w, 0.0, w, h, 0.0, h / 2.0, color);
+            draw_triangle(&mut canvas, w, 0.0, w, h, 0.0, h / 2.0, color);
         }
         '\u{E0B3}' => {
-            draw_line(&mut pixmap, w, 0.0, 0.0, h / 2.0, stroke, color);
-            draw_line(&mut pixmap, w, h, 0.0, h / 2.0, stroke, color);
+            draw_line(&mut canvas, w, 0.0, 0.0, h / 2.0, stroke, color);
+            draw_line(&mut canvas, w, h, 0.0, h / 2.0, stroke, color);
         }
 
         '\u{E0B4}' => {
@@ -39,7 +38,7 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
                 points.push((x_pos, y_pos));
             }
 
-            draw_polygon(&mut pixmap, &points, color);
+            draw_polygon(&mut canvas, &points, color);
         }
         '\u{E0B5}' => {
             let segments = 30;
@@ -55,11 +54,11 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
                 let x2 = w - (w * (1.0 - norm_y2 * norm_y2).sqrt());
                 let y2 = t2 * h;
 
-                draw_line(&mut pixmap, x1, y1, x2, y2, stroke, color);
+                draw_line(&mut canvas, x1, y1, x2, y2, stroke, color);
             }
 
-            draw_line(&mut pixmap, 0.0, 0.0, w, 0.0, stroke, color);
-            draw_line(&mut pixmap, 0.0, h, w, h, stroke, color);
+            draw_line(&mut canvas, 0.0, 0.0, w, 0.0, stroke, color);
+            draw_line(&mut canvas, 0.0, h, w, h, stroke, color);
         }
         '\u{E0B6}' => {
             let segments = 60;
@@ -76,7 +75,7 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
                 points.push((x_pos, y_pos));
             }
 
-            draw_polygon(&mut pixmap, &points, color);
+            draw_polygon(&mut canvas, &points, color);
         }
         '\u{E0B7}' => {
             let segments = 30;
@@ -92,42 +91,42 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
                 let x2 = w * (1.0 - norm_y2 * norm_y2).sqrt();
                 let y2 = t2 * h;
 
-                draw_line(&mut pixmap, x1, y1, x2, y2, stroke, color);
+                draw_line(&mut canvas, x1, y1, x2, y2, stroke, color);
             }
 
-            draw_line(&mut pixmap, 0.0, 0.0, w, 0.0, stroke, color);
-            draw_line(&mut pixmap, 0.0, h, w, h, stroke, color);
+            draw_line(&mut canvas, 0.0, 0.0, w, 0.0, stroke, color);
+            draw_line(&mut canvas, 0.0, h, w, h, stroke, color);
         }
 
         '\u{E0B8}' => {
-            draw_triangle(&mut pixmap, 0.0, h, w, h, 0.0, 0.0, color);
+            draw_triangle(&mut canvas, 0.0, h, w, h, 0.0, 0.0, color);
         }
         '\u{E0B9}' => {
-            draw_line(&mut pixmap, w, 0.0, 0.0, h, stroke, color);
+            draw_line(&mut canvas, w, 0.0, 0.0, h, stroke, color);
         }
         '\u{E0BA}' => {
-            draw_triangle(&mut pixmap, 0.0, h, w, h, w, 0.0, color);
+            draw_triangle(&mut canvas, 0.0, h, w, h, w, 0.0, color);
         }
         '\u{E0BB}' => {
-            draw_line(&mut pixmap, 0.0, 0.0, w, h, stroke, color);
+            draw_line(&mut canvas, 0.0, 0.0, w, h, stroke, color);
         }
         '\u{E0BC}' => {
-            draw_triangle(&mut pixmap, 0.0, 0.0, w, 0.0, 0.0, h, color);
+            draw_triangle(&mut canvas, 0.0, 0.0, w, 0.0, 0.0, h, color);
         }
         '\u{E0BD}' => {
-            draw_line(&mut pixmap, 0.0, 0.0, w, h, stroke, color);
+            draw_line(&mut canvas, 0.0, 0.0, w, h, stroke, color);
         }
         '\u{E0BE}' => {
-            draw_triangle(&mut pixmap, 0.0, 0.0, w, 0.0, w, h, color);
+            draw_triangle(&mut canvas, 0.0, 0.0, w, 0.0, w, h, color);
         }
         '\u{E0BF}' => {
-            draw_line(&mut pixmap, w, 0.0, 0.0, h, stroke, color);
+            draw_line(&mut canvas, w, 0.0, 0.0, h, stroke, color);
         }
 
         _ => return None,
     }
 
-    Some(pixmap)
+    Some(canvas)
 }
 
 #[cfg(test)]
@@ -136,13 +135,13 @@ mod tests {
 
     #[test]
     fn test_powerline_right_triangle() {
-        let pixmap = render('\u{E0B0}', 32, 32).unwrap();
-        assert!(pixmap.pixels().iter().any(|p| p.alpha() > 0));
+        let canvas = render('\u{E0B0}', 32, 32).unwrap();
+        assert!(canvas.data().iter().any(|&a| a > 0));
     }
 
     #[test]
     fn test_powerline_left_triangle() {
-        let pixmap = render('\u{E0B2}', 32, 32).unwrap();
-        assert!(pixmap.pixels().iter().any(|p| p.alpha() > 0));
+        let canvas = render('\u{E0B2}', 32, 32).unwrap();
+        assert!(canvas.data().iter().any(|&a| a > 0));
     }
 }

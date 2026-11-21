@@ -135,7 +135,7 @@ impl FontChoiceCache {
 mod tests {
     use super::*;
 
-    const MPLUS: &[u8] = include_bytes!("../../examples/assets/fonts/Mplus1Code-Regular.ttf");
+    const MPLUS: &[u8] = crate::test_fonts::MPLUS;
 
     fn glyph(id: u32) -> Vec<ShapedGlyph> {
         vec![ShapedGlyph {

@@ -126,21 +126,18 @@ Example (matching the actual style used in `src/input/mod.rs`):
 
 ```rust
 #[cfg(test)]
-mod pixel_to_cell_tests {
-    use super::super::pixel_to_cell;
+mod cell_at_tests {
+    use super::super::cell_at;
 
     #[test]
     fn origin_maps_to_first_cell() {
-        assert_eq!(pixel_to_cell(0.0, 0.0, 8.0, 16.0, 80, 24), (0, 0));
+        assert_eq!(cell_at(0.0, 0.0, 80, 24), (0, 0));
     }
 
     #[test]
-    fn out_of_bounds_pixels_clamp_instead_of_wrapping_or_panicking() {
-        assert_eq!(
-            pixel_to_cell(-50.0, -50.0, 8.0, 16.0, 80, 24),
-            (0, 0),
-            "negative input must clamp to the first cell"
-        );
+    fn out_of_bounds_positions_clamp_instead_of_wrapping() {
+        assert_eq!(cell_at(-6.25, -3.125, 80, 24), (0, 0));
+        assert_eq!(cell_at(1250.0, 625.0, 80, 24), (79, 23));
     }
 }
 ```
@@ -198,17 +195,18 @@ bevy_tui_texture/
 │   ├── backend/
 │   │   ├── mod.rs          # Backend module entry, GPU pipelines, texture atlas plumbing
 │   │   ├── bevy_backend.rs # BevyTerminalBackend (the ratatui::backend::Backend impl)
-│   │   ├── rasterize.rs    # Glyph rasterization (rustybuzz + raqote), color glyphs
+│   │   ├── rasterize.rs    # Glyph rasterization (zeno), PNG color glyphs
 │   │   ├── glyph_constraint/ # Fitting symbols to the grid (nerd_font.rs is generated)
 │   │   ├── shaders/        # composite.wgsl, composite_color.wgsl (feature `emoji`)
 │   │   ├── testdata/       # Noto Color Emoji subsets for the emoji tests
 │   │   └── programmatic_glyphs/ # Box-drawing, braille, block elements, powerline
 │   ├── input/
 │   │   ├── mod.rs          # Input event handling, focus, hit-testing dispatch
-│   │   ├── ray.rs          # 3D mouse raycasting (feature `3d`)
 │   │   └── crossterm_compat.rs # InputEvent <-> crossterm (feature `crossterm-compat`)
 │   └── utils/
-│       ├── mod.rs          # Shared small utilities (outline geometry, ...)
+│       ├── mod.rs          # Shared small utilities
+│       ├── outline.rs      # Outline collection and point mapping for zeno
+│       ├── colr.rs         # COLR v0/v1 painter
 │       ├── text_atlas.rs   # Glyph atlas slot index (epoch-stamped, clock eviction)
 │       ├── shape_cache.rs  # Per-cell shape cache + font-choice cache
 │       └── plan_cache.rs   # rustybuzz shape-plan cache

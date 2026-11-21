@@ -25,9 +25,8 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-bevy = "0.20"
-font-kit = "0.14"
-bevy_tui_texture = "0.5"
+bevy = "0.20"   # the default features include `default_font`
+bevy_tui_texture = "0.6"
 ```
 
 ### Hello World
@@ -36,11 +35,9 @@ Mirrors `examples/helloworld.rs`:
 
 ```rust
 use bevy::prelude::*;
+use bevy::text::DEFAULT_FONT_DATA;
 use bevy_tui_texture::prelude::*;
 use bevy_tui_texture::Font as TerminalFont;
-use font_kit::family_name::FamilyName;
-use font_kit::properties::Properties;
-use font_kit::source::SystemSource;
 use ratatui::prelude::*;
 use ratatui::style::Color as RatatuiColor;
 use ratatui::widgets::*;
@@ -58,18 +55,10 @@ fn main() {
         .run();
 }
 
-// No render resources anywhere in this signature - spawn a `TuiRequest`
-// and the plugin materializes it next frame.
 fn setup(mut commands: Commands) {
-    let fonts = {
-        let font_data = SystemSource::new()
-            .select_best_match(&[FamilyName::Monospace], &Properties::new())
-            .expect("No monospace font found on this system")
-            .load().expect("Failed to load font").copy_font_data()
-            .expect("Failed to copy font data");
-        Arc::new(Fonts::new(
-            TerminalFont::from_vec(font_data.to_vec()).expect("Failed to parse font"), 16))
-    };
+    // bevy's embedded Fira Mono (bevy feature `default_font`).
+    let Some(font) = TerminalFont::new(DEFAULT_FONT_DATA) else { return };
+    let fonts = Arc::new(Fonts::new(font, 16));
 
     commands.spawn((
         TuiRequest::ui(80, 25, fonts).with_config(TerminalConfig {
@@ -144,7 +133,7 @@ wasm-opt -Oz --strip-debug --strip-producers \
 
 ```toml
 [dependencies.bevy_tui_texture]
-version = "0.5"
+version = "0.6"
 default-features = false
 features = ["3d", "keyboard_input", "mouse_input"]   # e.g. a 3D-only app
 ```
@@ -155,6 +144,7 @@ features = ["3d", "keyboard_input", "mouse_input"]   # e.g. a 3D-only app
 - **`mouse_input`** (default) — mouse events for 2D UI and 3D mesh terminals; touch taps ride the same path (a tap emulates a left-button click at the touch position)
 - **`bold_italic_fonts`** — real bold/italic font slots; without it, bold/italic are faked from the regular font
 - **`emoji`** — color emoji: `Fonts::add_emoji_fonts` takes a color font (COLRv0, COLRv1, CBDT or sbix; not OT-SVG), and emoji, ZWJ sequences, flags, keycaps and skin tones are drawn in their own colors in two cells. No font ships with the crate. The color glyphs get a second atlas and a third pipeline, created when the first one is drawn. Without the feature, register a *monochrome* emoji font (e.g. Noto Emoji) with `add_fonts`: a color font there gives a solid silhouette (COLR) or a blank cell (PNG glyphs). See `examples/emoji.rs`
+- **`programmatic_aa`** — antialias the diagonal, round and triangular procedural glyphs (box-drawing diagonals and rounded corners, powerline separators, wedges, triangles). Rectangles — straight box lines, block elements, braille — stay pixel-sharp either way. Without it those shapes are drawn aliased
 - **`blink`** — `SLOW_BLINK` (500 ms) and `RAPID_BLINK` (200 ms) cells blank out during the off half of their period, and a shown cursor blinks with the slow phase. Only rows with blinking cells are redrawn, only when the phase flips. Without the feature both modifiers are ignored
 - **`underline_color`** — underlines are drawn in `Cell::underline_color` (ratatui-core's `underline-color`) unless it is `Reset`. Opt-in because it grows every ratatui `Cell`; without it underlines use the foreground color
 - **`crossterm-compat`** (native-only) — lossy conversions between `input::InputEvent` and `crossterm::event::Event`, for interop with ratatui-ecosystem widget crates or a bevy_ratatui adapter; not available on wasm32 (crossterm doesn't build there)
@@ -175,7 +165,7 @@ Every ratatui `Modifier` is drawn:
 | `SLOW_BLINK`, `RAPID_BLINK` | `blink` feature; ignored without it |
 
 - **Cursor**: `Frame::set_cursor_position` shows a `CursorStyle`: `Block` (default), `HollowBlock`, `Underline`, `Bar` or `Hidden` (`TerminalConfig::cursor_style`, `Tui::set_cursor_style`).
-- **Palette**: `TerminalPalette` sets the RGB of the 16 named and 256 indexed colors (`TerminalConfig::palette`, `Tui::set_palette`). `default()` keeps earlier versions' colors; `xterm()` makes `Color::Red` and `Color::Indexed(1)` identical.
+- **Palette**: `TerminalPalette` sets the RGB of the 16 named and 256 indexed colors (`TerminalConfig::palette`, `Tui::set_palette`). `default()` uses SVG color names for the named colors; `xterm()` makes `Color::Red` and `Color::Indexed(1)` identical.
 - **Procedural glyphs** line up cell to cell at any size with no font: box drawing (every light/heavy/double combination), block elements, Braille, Powerline, ratatui's sextant and octant markers, wedges and corner triangles. `←↑→↓ ▲►▼◄ ▰▱ • ×` use the font's glyph, or a procedural one when no font has it.
 
 ## Performance
@@ -191,26 +181,6 @@ See `examples/benchmark.rs` and `examples/benchmark_partial.rs` (windowed,
 FPS), and `cargo test --release --lib cpu_hot_path -- --ignored --nocapture`
 (the CPU side alone, no GPU needed).
 
-### 0.3 → 0.4
-
-CPU cost of a dirty frame on a 120×40 terminal (the `cpu_hot_path`
-benchmark above; Apple M1, microseconds per frame, including ratatui's
-own buffer diff of about 70):
-
-| workload                          | 0.3.5 | 0.4.0 | 0.4.2 |
-|-----------------------------------|------:|------:|------:|
-| every cell: scrolling text+colors |  1350 |   290 |   280 |
-| every cell: colors only           |  1190 |   265 |   280 |
-| every cell: block glyph gradient  |  1985 |   385 |   430 |
-| every cell: never-seen text       |  1485 |  1080 |   325 |
-| one row changes                   |   100 |    75 |    75 |
-| nothing changes                   |    74 |    69 |    68 |
-
-The 0.4.2 column uses thin LTO; the numbers vary with the LTO setting.
-
-`examples/benchmark` (full-frame redraw, uncapped, same machine): about
-250 fps → about 390 fps.
-
 ## Requirements
 
 - Rust 1.97.1+ (2024 edition), Bevy 0.20, Ratatui 0.30, a GPU with WGPU support
@@ -225,7 +195,7 @@ separate "N versions behind stable" policy on top.
 
 | `bevy` | `ratatui` | `wgpu` | `bevy_tui_texture` |
 |--------|-----------|--------|--------------------|
-| `0.20` | `0.30`    | `30`   | `0.4`, `0.5`       |
+| `0.20` | `0.30`    | `30`   | `0.4` – `0.6`      |
 | `0.19` | `0.30`    | `29`   | `0.3`              |
 | `0.18` | `0.30`    | `27`   | `0.2`              |
 | `0.17` | `0.29`    | `26`   | `0.1`              |

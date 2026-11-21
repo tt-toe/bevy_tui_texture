@@ -209,25 +209,20 @@ enum CameraMode {
 }
 
 fn checkbox_span(checked: bool) -> Span<'static> {
-    Span::styled(
-        if checked { "[X]" } else { "[ ]" },
-        if checked {
-            Style::default().fg(RatatuiColor::Green).bold()
-        } else {
-            Style::default().fg(RatatuiColor::Gray)
-        },
-    )
+    toggle_span(checked, "[X]", "[ ]")
 }
 
 fn radio_span(selected: bool) -> Span<'static> {
-    Span::styled(
-        if selected { "(o)" } else { "( )" },
-        if selected {
-            Style::default().fg(RatatuiColor::Green).bold()
-        } else {
-            Style::default().fg(RatatuiColor::Gray)
-        },
-    )
+    toggle_span(selected, "(o)", "( )")
+}
+
+/// `on` in bold green when set, `off` in gray otherwise.
+fn toggle_span(set: bool, on: &'static str, off: &'static str) -> Span<'static> {
+    if set {
+        Span::styled(on, Style::default().fg(RatatuiColor::Green).bold())
+    } else {
+        Span::styled(off, Style::default().fg(RatatuiColor::Gray))
+    }
 }
 
 /// Marker for the overlay `Tui` entity.
@@ -362,6 +357,13 @@ struct AppState {
     selected_tab: usize,
     table_state: TableState,
     panel_collapsed: bool,
+}
+
+impl AppState {
+    /// The shaders' `effect_intensity`: full with effects on, none off.
+    fn effect_intensity(&self) -> f32 {
+        if self.effects_enabled { 1.0 } else { 0.0 }
+    }
 }
 
 impl Default for AppState {
@@ -848,8 +850,7 @@ fn update_crt_uniforms(
 ) {
     for material_handle in &object2_query {
         if let Some(mut material) = crt_materials.get_mut(&material_handle.0) {
-            material.extension.uniforms.effect_intensity =
-                if app_state.effects_enabled { 1.0 } else { 0.0 };
+            material.extension.uniforms.effect_intensity = app_state.effect_intensity();
             material.extension.uniforms.time = time.elapsed_secs();
         }
     }
@@ -864,7 +865,7 @@ fn update_blur_uniforms(
 ) {
     for material_handle in &reflection_query {
         if let Some(mut material) = blur_materials.get_mut(&material_handle.0) {
-            material.uniforms.effect_intensity = if app_state.effects_enabled { 1.0 } else { 0.0 };
+            material.uniforms.effect_intensity = app_state.effect_intensity();
             material.uniforms.time = time.elapsed_secs();
         }
     }

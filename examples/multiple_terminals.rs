@@ -300,29 +300,19 @@ fn handle_events(
 /// `Tui`-carrying entity, so each of these five systems only needs its own
 /// marker-filtered query plus whatever gameplay state it renders.
 fn update_interactive(
-    mut screens: Query<&mut Tui, With<InteractiveTerminal>>,
+    screens: Query<&mut Tui, With<InteractiveTerminal>>,
     app_state: Res<AppState>,
 ) {
-    let Ok(mut term) = screens.single_mut() else {
-        return;
-    };
     let selected_item = app_state.selected_item;
-    term.draw(|frame| {
-        let area = frame.area();
+    draw_marked(screens, |frame| {
+        let [title, list_area, help] = Layout::vertical([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(3),
+        ])
+        .areas(frame.area());
 
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Min(0),
-                Constraint::Length(3),
-            ])
-            .split(area);
-
-        let title = Paragraph::new("Interactive Terminal")
-            .style(Style::default().fg(RatatuiColor::Yellow).bold())
-            .block(Block::bordered());
-        frame.render_widget(title, chunks[0]);
+        frame.render_widget(title_bar("Interactive Terminal", RatatuiColor::Yellow), title);
 
         let items: Vec<ListItem> = (0..5)
             .map(|i| ListItem::new(format!("Item {} - Click or use arrows", i)))
@@ -339,23 +329,18 @@ fn update_interactive(
             )
             .highlight_symbol(">> ");
 
-        frame.render_stateful_widget(list, chunks[1], &mut list_state);
+        frame.render_stateful_widget(list, list_area, &mut list_state);
 
-        let help = Paragraph::new(vec![Line::from("↑/↓: Move  Enter: Select  C: Counter")])
+        let hint = Paragraph::new(vec![Line::from("↑/↓: Move  Enter: Select  C: Counter")])
             .style(Style::default().fg(RatatuiColor::DarkGray))
             .block(Block::bordered());
-        frame.render_widget(help, chunks[2]);
+        frame.render_widget(hint, help);
     });
 }
 
-fn update_log(mut screens: Query<&mut Tui, With<LogTerminal>>, app_state: Res<AppState>) {
-    let Ok(mut term) = screens.single_mut() else {
-        return;
-    };
+fn update_log(screens: Query<&mut Tui, With<LogTerminal>>, app_state: Res<AppState>) {
     let log_messages = &app_state.log_messages;
-    term.draw(|frame| {
-        let area = frame.area();
-
+    draw_marked(screens, |frame| {
         let recent_logs: Vec<Line> = log_messages
             .iter()
             .rev()
@@ -376,33 +361,22 @@ fn update_log(mut screens: Query<&mut Tui, With<LogTerminal>>, app_state: Res<Ap
             .block(Block::bordered().title("Log Terminal (Click to test!)"))
             .wrap(Wrap { trim: true });
 
-        frame.render_widget(logs, area);
+        frame.render_widget(logs, frame.area());
     });
 }
 
 fn update_status(
-    mut screens: Query<&mut Tui, With<StatusTerminal>>,
+    screens: Query<&mut Tui, With<StatusTerminal>>,
     app_state: Res<AppState>,
     time: Res<Time>,
 ) {
-    let Ok(mut term) = screens.single_mut() else {
-        return;
-    };
     let counter = app_state.counter;
     let elapsed = time.elapsed_secs();
     let fps = 1.0 / time.delta_secs();
-    term.draw(|frame| {
-        let area = frame.area();
-
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Min(0)])
-            .split(area);
-
-        let title = Paragraph::new("Status Terminal")
-            .style(Style::default().fg(RatatuiColor::Magenta).bold())
-            .block(Block::bordered());
-        frame.render_widget(title, chunks[0]);
+    draw_marked(screens, |frame| {
+        let [title, body] =
+            Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).areas(frame.area());
+        frame.render_widget(title_bar("Status Terminal", RatatuiColor::Magenta), title);
 
         let gauge_value = ((elapsed.sin() + 1.0) * 50.0) as u16;
         let status_line = format!(
@@ -415,83 +389,84 @@ fn update_status(
             .gauge_style(Style::default().fg(RatatuiColor::Cyan))
             .percent(gauge_value.min(100));
 
-        let status = Paragraph::new(status_line);
-
-        let inner_chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Length(3)])
-            .split(chunks[1]);
-
-        frame.render_widget(status, inner_chunks[0]);
-        frame.render_widget(gauge, inner_chunks[1]);
+        let [status_area, gauge_area] =
+            Layout::vertical([Constraint::Length(1), Constraint::Length(3)]).areas(body);
+        frame.render_widget(Paragraph::new(status_line), status_area);
+        frame.render_widget(gauge, gauge_area);
     });
 }
 
-fn update_overlap_back(mut screens: Query<&mut Tui, With<OverlapBackTerminal>>) {
-    let Ok(mut term) = screens.single_mut() else {
-        return;
+fn update_overlap_back(screens: Query<&mut Tui, With<OverlapBackTerminal>>) {
+    draw_marked(screens, |frame| {
+        centered_panel(
+            frame,
+            "BACK",
+            vec![
+                Line::from(""),
+                Line::from("Overlap BACK Terminal")
+                    .style(Style::default().fg(RatatuiColor::Red).bold()),
+                Line::from("ZIndex = 0"),
+                Line::from(""),
+                Line::from("This terminal is BEHIND")
+                    .style(Style::default().fg(RatatuiColor::Yellow)),
+                Line::from("the front terminal."),
+                Line::from(""),
+                Line::from("Click in the overlap area"),
+                Line::from("to test z-ordering!"),
+            ],
+        );
+    });
+}
+
+fn update_overlap_front(screens: Query<&mut Tui, With<OverlapFrontTerminal>>, time: Res<Time>) {
+    let pulse = ((time.elapsed_secs() * 2.0).sin() + 1.0) / 2.0;
+    let color = if pulse > 0.5 {
+        RatatuiColor::Green
+    } else {
+        RatatuiColor::Cyan
     };
-    term.draw(|frame| {
-        let area = frame.area();
-
-        let text = vec![
-            Line::from(""),
-            Line::from("Overlap BACK Terminal")
-                .style(Style::default().fg(RatatuiColor::Red).bold()),
-            Line::from("ZIndex = 0"),
-            Line::from(""),
-            Line::from("This terminal is BEHIND")
-                .style(Style::default().fg(RatatuiColor::Yellow)),
-            Line::from("the front terminal."),
-            Line::from(""),
-            Line::from("Click in the overlap area"),
-            Line::from("to test z-ordering!"),
-        ];
-
-        let para = Paragraph::new(text)
-            .block(Block::bordered().title("BACK"))
-            .alignment(Alignment::Center);
-
-        frame.render_widget(para, area);
+    draw_marked(screens, |frame| {
+        let magenta = Style::default().fg(RatatuiColor::Magenta);
+        centered_panel(
+            frame,
+            "FRONT",
+            vec![
+                Line::from(""),
+                Line::from("Overlap FRONT Terminal").style(Style::default().fg(color).bold()),
+                Line::from("ZIndex = 10"),
+                Line::from(""),
+                Line::from("This terminal is ON TOP")
+                    .style(Style::default().fg(RatatuiColor::Yellow)),
+                Line::from("of the back terminal."),
+                Line::from(""),
+                Line::from("Clicks here should show").style(magenta),
+                Line::from("[FRONT] in the log!").style(magenta),
+            ],
+        );
     });
 }
 
-fn update_overlap_front(
-    mut screens: Query<&mut Tui, With<OverlapFrontTerminal>>,
-    time: Res<Time>,
+/// Draws the one terminal `screens` matches, if it has materialized yet.
+fn draw_marked<M: Component>(
+    mut screens: Query<&mut Tui, With<M>>,
+    paint: impl FnOnce(&mut ratatui::Frame),
 ) {
-    let Ok(mut term) = screens.single_mut() else {
-        return;
-    };
-    let elapsed = time.elapsed_secs();
-    term.draw(|frame| {
-        let area = frame.area();
+    if let Ok(mut term) = screens.single_mut() {
+        term.draw(paint);
+    }
+}
 
-        let pulse = ((elapsed * 2.0).sin() + 1.0) / 2.0;
-        let color = if pulse > 0.5 {
-            RatatuiColor::Green
-        } else {
-            RatatuiColor::Cyan
-        };
+/// A bordered one-line heading in bold `color`.
+fn title_bar(text: &str, color: RatatuiColor) -> Paragraph<'_> {
+    Paragraph::new(text)
+        .style(Style::default().fg(color).bold())
+        .block(Block::bordered())
+}
 
-        let text = vec![
-            Line::from(""),
-            Line::from("Overlap FRONT Terminal").style(Style::default().fg(color).bold()),
-            Line::from("ZIndex = 10"),
-            Line::from(""),
-            Line::from("This terminal is ON TOP")
-                .style(Style::default().fg(RatatuiColor::Yellow)),
-            Line::from("of the back terminal."),
-            Line::from(""),
-            Line::from("Clicks here should show")
-                .style(Style::default().fg(RatatuiColor::Magenta)),
-            Line::from("[FRONT] in the log!").style(Style::default().fg(RatatuiColor::Magenta)),
-        ];
-
-        let para = Paragraph::new(text)
-            .block(Block::bordered().title("FRONT"))
-            .alignment(Alignment::Center);
-
-        frame.render_widget(para, area);
-    });
+/// `lines`, centered, in a bordered panel titled `title` filling the frame.
+fn centered_panel(frame: &mut ratatui::Frame, title: &str, lines: Vec<Line>) {
+    let para = Paragraph::new(lines)
+        .block(Block::bordered().title(title))
+        .alignment(Alignment::Center);
+    frame.render_widget(para, frame.area());
 }

@@ -123,7 +123,7 @@ already done to keep it as small as practical:
   `Camera3d`'s default tonemapper (`TonyMcMapface`) needs those features
   and panics without them. It also skips the native-only `x11` feature.
 - True `#![no_std]` is not on the table: Bevy (and most of this crate's
-  own dependencies — `raqote`, `rustybuzz`, `ratatui`) use `std`
+  own dependencies — `rustybuzz`, `ratatui`) use `std`
   extensively; making the dependency graph `no_std`-compatible would mean
   forking or patching Bevy itself, not a build-flag change.
 

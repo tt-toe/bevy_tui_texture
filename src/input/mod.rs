@@ -15,9 +15,6 @@ use bevy::prelude::*;
 #[cfg(feature = "mouse_input")]
 use tracing::debug;
 
-#[cfg(all(feature = "mouse_input", feature = "3d"))]
-pub mod ray;
-
 #[cfg(all(feature = "crossterm-compat", not(target_arch = "wasm32")))]
 pub mod crossterm_compat;
 
@@ -239,15 +236,17 @@ fn remap_to_tui(entity: Entity, surfaces: &Query<&crate::setup::TuiSurface>) -> 
 /// Update cursor position from window.
 pub fn update_cursor_position_system(
     mut cursor_pos: ResMut<CursorPosition>,
+    primary: Query<&Window, With<bevy::window::PrimaryWindow>>,
     windows: Query<&Window>,
     touches: Res<Touches>,
 ) {
-    if let Ok(window) = windows.single() {
-        cursor_pos.position = window
-            .cursor_position()
-            .or_else(|| touches.first_pressed_position())
-            .or_else(|| touches.iter_just_released().next().map(|t| t.position()));
-    }
+    let cursor = match primary.single() {
+        Ok(window) => window.cursor_position(),
+        Err(_) => windows.iter().find_map(Window::cursor_position),
+    };
+    cursor_pos.position = cursor
+        .or_else(|| touches.first_pressed_position())
+        .or_else(|| touches.iter_just_released().next().map(|t| t.position()));
 }
 
 /// Keyboard input capture system.
@@ -297,18 +296,6 @@ pub fn keyboard_input_system(
     }
 }
 
-/// Terminal type detected from components.
-#[cfg(all(feature = "mouse_input", feature = "2d", feature = "3d"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TerminalType {
-    /// 3D mesh terminal (has Mesh2d or Mesh3d component)
-    Mesh3D,
-    /// 2D UI terminal (has Node component)
-    UI2D,
-    /// Unknown terminal type (has neither mesh nor node)
-    Unknown,
-}
-
 /// Result of a successful hit test.
 #[cfg(feature = "mouse_input")]
 #[derive(Debug, Clone, Copy)]
@@ -324,20 +311,24 @@ struct HitTestResult {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum SortKey {
     /// Z-index for 2D UI terminals (higher = on top)
+    #[cfg(feature = "2d")]
     ZIndex(i32),
     /// 3D mesh terminal hit: camera priority (0 = topmost-rendered camera,
     /// i.e. highest `Camera::order`), then ray distance (lower = closer).
+    #[cfg(feature = "3d")]
     Distance {
         camera_priority: usize,
         distance: f32,
     },
 }
 
-#[cfg(feature = "mouse_input")]
+#[cfg(all(feature = "mouse_input", any(feature = "2d", feature = "3d")))]
 impl PartialOrd for SortKey {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         match (self, other) {
+            #[cfg(feature = "2d")]
             (SortKey::ZIndex(a), SortKey::ZIndex(b)) => b.partial_cmp(a),
+            #[cfg(feature = "3d")]
             (
                 SortKey::Distance {
                     camera_priority: ca,
@@ -351,32 +342,61 @@ impl PartialOrd for SortKey {
                 std::cmp::Ordering::Equal => da.partial_cmp(db),
                 ord => Some(ord),
             },
+            #[cfg(all(feature = "2d", feature = "3d"))]
             (SortKey::ZIndex(_), SortKey::Distance { .. }) => Some(std::cmp::Ordering::Less),
+            #[cfg(all(feature = "2d", feature = "3d"))]
             (SortKey::Distance { .. }, SortKey::ZIndex(_)) => Some(std::cmp::Ordering::Greater),
         }
     }
 }
 
-/// Bundles the unified system's three change-detection probe queries
-/// into a single `SystemParam`.
-#[cfg(all(feature = "mouse_input", feature = "2d", feature = "3d"))]
+/// A terminal under the cursor: the surface entity, the cell, and how it
+/// ranks against other hits.
+#[cfg(feature = "mouse_input")]
+type Hit = (Entity, HitTestResult, SortKey);
+
+/// Mouse, keyboard-modifier, touch and wheel input read by
+/// [`mouse_input_system`].
+#[cfg(feature = "mouse_input")]
 #[derive(bevy::ecs::system::SystemParam)]
-pub struct MouseChangeProbes<'w, 's> {
-    camera: Query<
+pub struct MouseInputs<'w, 's> {
+    buttons: Res<'w, ButtonInput<MouseButton>>,
+    keyboard: Res<'w, ButtonInput<BevyKeyCode>>,
+    touches: Res<'w, Touches>,
+    wheel: MessageReader<'w, 's, MouseWheel>,
+    cursor: Res<'w, CursorPosition>,
+    config: Res<'w, TerminalInputConfig>,
+}
+
+/// Entities that make a mesh terminal rather than a UI one.
+#[cfg(all(feature = "mouse_input", feature = "3d"))]
+type HasMesh = Or<(With<Mesh3d>, With<Mesh2d>)>;
+
+/// UI terminals: nodes, minus any that also carry a mesh (a mesh wins).
+#[cfg(all(feature = "mouse_input", feature = "2d", feature = "3d"))]
+type UiOnly = (With<bevy::ui::Node>, Without<Mesh3d>, Without<Mesh2d>);
+#[cfg(all(feature = "mouse_input", feature = "2d", not(feature = "3d")))]
+type UiOnly = With<bevy::ui::Node>;
+
+/// 2D UI terminals and what can move them under a still cursor.
+#[cfg(all(feature = "mouse_input", feature = "2d"))]
+#[derive(bevy::ecs::system::SystemParam)]
+pub struct UiTerminals<'w, 's> {
+    terminals: Query<
         'w,
         's,
-        (),
         (
-            With<Camera>,
-            Or<(
-                Changed<GlobalTransform>,
-                Changed<Projection>,
-                Changed<Camera>,
-            )>,
+            Entity,
+            &'static TerminalInput,
+            Option<&'static bevy::ui::Node>,
+            Option<&'static bevy::ui::ComputedNode>,
+            Option<&'static bevy::ui::UiGlobalTransform>,
+            Option<&'static crate::bevy_plugin::TerminalDimensions>,
+            Option<&'static bevy::ui::ZIndex>,
         ),
+        UiOnly,
     >,
-    terminal_3d: Query<'w, 's, (), (With<TerminalInput>, Changed<GlobalTransform>)>,
-    terminal_ui: Query<
+    changed: Query<
         'w,
         's,
         (),
@@ -390,57 +410,139 @@ pub struct MouseChangeProbes<'w, 's> {
     >,
 }
 
-#[cfg(all(feature = "mouse_input", feature = "2d", feature = "3d"))]
-impl MouseChangeProbes<'_, '_> {
-    fn any_changed(&self) -> bool {
-        !self.camera.is_empty() || !self.terminal_3d.is_empty() || !self.terminal_ui.is_empty()
-    }
-}
-
-/// Detect terminal type from components.
-#[cfg(all(feature = "mouse_input", feature = "2d", feature = "3d"))]
-fn detect_terminal_type(
-    mesh2d: Option<&Mesh2d>,
-    mesh3d: Option<&Mesh3d>,
-    node: Option<&bevy::ui::Node>,
-) -> TerminalType {
-    if mesh3d.is_some() || mesh2d.is_some() {
-        return TerminalType::Mesh3D;
-    }
-
-    if node.is_some() {
-        TerminalType::UI2D
-    } else {
-        TerminalType::Unknown
-    }
-}
-
-/// Convert a pixel position local to a terminal's rendered area (origin at
-/// the terminal's top-left, `+Y` down) to a clamped grid cell.
 #[cfg(all(feature = "mouse_input", feature = "2d"))]
-fn pixel_to_cell(
-    local_x: f32,
-    local_y: f32,
-    char_width: f32,
-    char_height: f32,
-    cols: u16,
-    rows: u16,
-) -> (u16, u16) {
-    let max_col = cols.saturating_sub(1) as f32;
-    let max_row = rows.saturating_sub(1) as f32;
-    let col = (local_x.max(0.0) / char_width).min(max_col) as u16;
-    let row = (local_y.max(0.0) / char_height).min(max_row) as u16;
-    (col, row)
+impl UiTerminals<'_, '_> {
+    fn any_changed(&self) -> bool {
+        !self.changed.is_empty()
+    }
+
+    /// Screen-space bounding-box hits, ranked by `ZIndex`.
+    fn hit_test(&self, cursor_pos: Vec2, hits: &mut Vec<Hit>) {
+        for (entity, input, node, computed, ui_transform, dimensions, z_index) in &self.terminals {
+            if !input.mouse {
+                continue;
+            }
+            if let Some(hit) =
+                bounding_box_hit_test(cursor_pos, ui_transform, node, computed, dimensions)
+            {
+                let z = z_index.map(|z| z.0).unwrap_or(0);
+                hits.push((entity, hit, SortKey::ZIndex(z)));
+            }
+        }
+    }
 }
 
-/// Convert a mesh UV coordinate to a clamped grid cell.
+/// 3D mesh terminals, the cameras that see them, and what can move them
+/// under a still cursor.
 #[cfg(all(feature = "mouse_input", feature = "3d"))]
-fn uv_to_cell(uv_x: f32, uv_y: f32, cols: u16, rows: u16) -> (u16, u16) {
+#[derive(bevy::ecs::system::SystemParam)]
+pub struct MeshTerminals<'w, 's> {
+    cameras: Query<'w, 's, (&'static Camera, &'static GlobalTransform)>,
+    meshes: Res<'w, Assets<bevy::mesh::Mesh>>,
+    terminals: Query<
+        'w,
+        's,
+        (
+            Entity,
+            &'static TerminalInput,
+            Option<&'static GlobalTransform>,
+            Option<&'static Mesh2d>,
+            Option<&'static Mesh3d>,
+            Option<&'static crate::bevy_plugin::TerminalDimensions>,
+            Option<&'static bevy::camera::visibility::ViewVisibility>,
+            Option<&'static bevy::camera::primitives::Aabb>,
+        ),
+        HasMesh,
+    >,
+    camera_changed: Query<
+        'w,
+        's,
+        (),
+        (
+            With<Camera>,
+            Or<(
+                Changed<GlobalTransform>,
+                Changed<Projection>,
+                Changed<Camera>,
+            )>,
+        ),
+    >,
+    terminal_changed: Query<'w, 's, (), (With<TerminalInput>, Changed<GlobalTransform>)>,
+}
+
+#[cfg(all(feature = "mouse_input", feature = "3d"))]
+impl MeshTerminals<'_, '_> {
+    fn any_changed(&self) -> bool {
+        !self.camera_changed.is_empty() || !self.terminal_changed.is_empty()
+    }
+
+    /// Ray hits from every active camera under the cursor (highest
+    /// `Camera::order` first), ranked by camera, then distance.
+    fn hit_test(&self, cursor_pos: Vec2, hits: &mut Vec<Hit>) {
+        let mut cameras: Vec<(&Camera, &GlobalTransform)> = self
+            .cameras
+            .iter()
+            .filter(|(camera, _)| camera.is_active)
+            .collect();
+        cameras.sort_by_key(|(camera, _)| std::cmp::Reverse(camera.order));
+        let world_rays: Vec<bevy::prelude::Ray3d> = cameras
+            .iter()
+            .filter_map(|(camera, camera_transform)| {
+                let viewport = camera.logical_viewport_rect()?;
+                if !viewport.contains(cursor_pos) {
+                    return None;
+                }
+                camera
+                    .viewport_to_world(camera_transform, cursor_pos - viewport.min)
+                    .ok()
+            })
+            .collect();
+
+        for (entity, input, transform, mesh2d, mesh3d, dimensions, view_visibility, aabb) in
+            &self.terminals
+        {
+            if !input.mouse {
+                continue;
+            }
+            let mesh_handle = mesh3d.map(|m| &m.0).or_else(|| mesh2d.map(|m| &m.0));
+            let Some(transform) = transform else {
+                continue;
+            };
+            if view_visibility.is_some_and(|v| !v.get()) {
+                continue;
+            }
+            for (camera_priority, ray) in world_rays.iter().enumerate() {
+                if !ray_intersects_aabb(ray, transform, aabb) {
+                    continue;
+                }
+                if let Some((hit, distance)) = mesh_handle.and_then(|handle| {
+                    ray_cast_hit_test_inner(ray, transform, handle, &self.meshes, dimensions)
+                }) {
+                    hits.push((
+                        entity,
+                        hit,
+                        SortKey::Distance {
+                            camera_priority,
+                            distance,
+                        },
+                    ));
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// The grid cell at a position measured in cells (`col`, `row` may be
+/// fractional or out of range), clamped into the grid.
+#[cfg(all(feature = "mouse_input", any(feature = "2d", feature = "3d")))]
+fn cell_at(col: f32, row: f32, cols: u16, rows: u16) -> (u16, u16) {
     let max_col = cols.saturating_sub(1) as f32;
     let max_row = rows.saturating_sub(1) as f32;
-    let col = (uv_x.max(0.0) * cols as f32).min(max_col) as u16;
-    let row = (uv_y.max(0.0) * rows as f32).min(max_row) as u16;
-    (col, row)
+    (
+        col.max(0.0).min(max_col) as u16,
+        row.max(0.0).min(max_row) as u16,
+    )
 }
 
 /// Perform 2D UI bounding box hit test.
@@ -541,11 +643,9 @@ fn bounding_box_hit_test(
         char_height
     );
 
-    let (col, row) = pixel_to_cell(
-        local_x,
-        local_y,
-        char_width,
-        char_height,
+    let (col, row) = cell_at(
+        local_x / char_width,
+        local_y / char_height,
         cols as u16,
         rows as u16,
     );
@@ -561,7 +661,7 @@ fn bounding_box_hit_test(
 /// precise test in `ray_cast_hit_test_inner`.
 #[cfg(all(feature = "mouse_input", feature = "3d"))]
 fn ray_intersects_aabb(
-    world_ray: &crate::input::ray::Ray,
+    world_ray: &bevy::prelude::Ray3d,
     mesh_transform: &bevy::transform::components::GlobalTransform,
     aabb: Option<&bevy::camera::primitives::Aabb>,
 ) -> bool {
@@ -574,7 +674,7 @@ fn ray_intersects_aabb(
 
     let world_to_local = mesh_transform.affine().inverse();
     let local_origin = world_to_local.transform_point3(world_ray.origin);
-    let local_direction = world_to_local.transform_vector3(world_ray.direction);
+    let local_direction = world_to_local.transform_vector3(*world_ray.direction);
     let Ok(local_direction) = Dir3A::try_from(Vec3A::from(local_direction)) else {
         return true;
     };
@@ -587,7 +687,7 @@ fn ray_intersects_aabb(
 /// Perform 3D ray-mesh hit test.
 #[cfg(all(feature = "mouse_input", feature = "3d"))]
 fn ray_cast_hit_test_inner(
-    world_ray: &crate::input::ray::Ray,
+    world_ray: &bevy::prelude::Ray3d,
     mesh_transform: &bevy::transform::components::GlobalTransform,
     mesh_handle: &bevy::asset::Handle<bevy::mesh::Mesh>,
     meshes: &bevy::asset::Assets<bevy::mesh::Mesh>,
@@ -599,10 +699,7 @@ fn ray_cast_hit_test_inner(
 
     let mesh = meshes.get(mesh_handle)?;
 
-    let ray3d = Ray3d::new(
-        world_ray.origin,
-        bevy::math::Dir3::new_unchecked(world_ray.direction),
-    );
+    let ray3d = *world_ray;
     let mesh_transform_affine = mesh_transform.affine();
 
     let VertexAttributeValues::Float32x3(positions) = mesh.attribute(Mesh::ATTRIBUTE_POSITION)?
@@ -620,27 +717,30 @@ fn ray_cast_hit_test_inner(
         _ => None,
     };
 
-    let indices_vec: Option<Vec<usize>> = mesh.indices().map(|idx| idx.iter().collect());
-    let hit = if let Some(ref indices) = indices_vec {
-        ray_mesh_intersection(
+    let hit_with = |indices: Option<&[u32]>, wide: Option<&[u16]>| match wide {
+        Some(indices) => ray_mesh_intersection(
             ray3d,
             &mesh_transform_affine,
             positions.as_slice(),
             vertex_normals,
-            Some(indices.as_slice()),
+            Some(indices),
             uvs,
             Backfaces::Cull,
-        )
-    } else {
-        ray_mesh_intersection(
+        ),
+        None => ray_mesh_intersection(
             ray3d,
             &mesh_transform_affine,
             positions.as_slice(),
             vertex_normals,
-            None::<&[u32]>,
+            indices,
             uvs,
             Backfaces::Cull,
-        )
+        ),
+    };
+    let hit = match mesh.indices() {
+        Some(bevy::mesh::Indices::U16(indices)) => hit_with(None, Some(indices.as_slice())),
+        Some(bevy::mesh::Indices::U32(indices)) => hit_with(Some(indices.as_slice()), None),
+        None => hit_with(None, None),
     }?;
 
     let uv = hit.uv?;
@@ -651,7 +751,7 @@ fn ray_cast_hit_test_inner(
         (80, 24)
     };
 
-    let (col, row) = uv_to_cell(uv.x, uv.y, cols, rows);
+    let (col, row) = cell_at(uv.x * f32::from(cols), uv.y * f32::from(rows), cols, rows);
 
     debug!(
         "3D Hit Test: uv=({:.3},{:.3}) distance={:.1} cols={} rows={} -> grid=({},{})",
@@ -693,6 +793,25 @@ fn scroll_kind(x: f32, y: f32) -> Option<MouseEventKind> {
     }
 }
 
+/// A mouse event of `kind` at a cell, for `target`.
+#[cfg(feature = "mouse_input")]
+fn mouse_event(
+    target: Entity,
+    kind: MouseEventKind,
+    (column, row): (u16, u16),
+    modifiers: KeyModifiers,
+) -> TerminalEvent {
+    TerminalEvent {
+        target,
+        input: InputEvent::Mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers,
+        }),
+    }
+}
+
 #[cfg(feature = "mouse_input")]
 #[allow(clippy::too_many_arguments)]
 fn emit_mouse_move(
@@ -711,15 +830,12 @@ fn emit_mouse_move(
         buttons.pressed(MouseButton::Right),
         buttons.pressed(MouseButton::Middle),
     );
-    events.write(TerminalEvent {
-        target: remap_to_tui(surface_entity, surfaces),
-        input: InputEvent::Mouse(MouseEvent {
-            kind,
-            column: col,
-            row,
-            modifiers,
-        }),
-    });
+    events.write(mouse_event(
+        remap_to_tui(surface_entity, surfaces),
+        kind,
+        (col, row),
+        modifiers,
+    ));
 }
 
 /// `old_focus`/`new_focus` are surface entities (what `TerminalFocus` stores,
@@ -781,27 +897,21 @@ fn emit_button_events(
                 events,
             );
 
-            events.write(TerminalEvent {
+            events.write(mouse_event(
                 target,
-                input: InputEvent::Mouse(MouseEvent {
-                    kind: MouseEventKind::Down(button),
-                    column: col,
-                    row,
-                    modifiers,
-                }),
-            });
+                MouseEventKind::Down(button),
+                (col, row),
+                modifiers,
+            ));
         }
 
         if buttons.just_released(button) || (touch && touches.any_just_released()) {
-            events.write(TerminalEvent {
+            events.write(mouse_event(
                 target,
-                input: InputEvent::Mouse(MouseEvent {
-                    kind: MouseEventKind::Up(button),
-                    column: col,
-                    row,
-                    modifiers,
-                }),
-            });
+                MouseEventKind::Up(button),
+                (col, row),
+                modifiers,
+            ));
         }
     }
 }
@@ -821,67 +931,49 @@ fn emit_scroll_events(
         let Some(kind) = scroll_kind(wheel.x, wheel.y) else {
             continue;
         };
-        events.write(TerminalEvent {
-            target,
-            input: InputEvent::Mouse(MouseEvent {
-                kind,
-                column: col,
-                row,
-                modifiers,
-            }),
-        });
+        events.write(mouse_event(target, kind, (col, row), modifiers));
     }
 }
 
-/// Unified mouse input system with automatic 2D/3D detection.
-#[cfg(all(feature = "mouse_input", feature = "2d", feature = "3d"))]
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+/// What [`mouse_input_system`] remembers between frames.
+#[cfg(feature = "mouse_input")]
+#[derive(Default)]
+pub struct MouseState {
+    last_cursor_pos: Option<Vec2>,
+    last_hovered: Option<(Entity, u16, u16)>,
+}
+
+/// Mouse input: hit-tests 2D UI terminals (screen-space boxes) and 3D mesh
+/// terminals (camera rays), whichever features are on, and sends the
+/// topmost hit its move, button, focus and scroll events.
+#[cfg(feature = "mouse_input")]
 pub fn mouse_input_system(
-    buttons: Res<ButtonInput<MouseButton>>,
-    keyboard: Res<ButtonInput<BevyKeyCode>>,
-    touches: Res<Touches>,
-    mut wheel: MessageReader<MouseWheel>,
-    cursor: Res<CursorPosition>,
-    config: Res<TerminalInputConfig>,
+    mut inputs: MouseInputs,
     mut focus: ResMut<TerminalFocus>,
-    _windows: Query<&bevy::window::Window>,
-    camera_query: Query<(&Camera, &GlobalTransform)>,
-    meshes: Res<Assets<bevy::mesh::Mesh>>,
-    terminals: Query<(
-        Entity,
-        &TerminalInput,
-        // `GlobalTransform` is required for 3D mesh ray-casting but is NOT
-        // among `Node`'s required components - pure-UI entities don't have
-        // it, hence Option here (see `UiGlobalTransform` below for those).
-        Option<&GlobalTransform>,
-        Option<&Mesh2d>,
-        Option<&Mesh3d>,
-        Option<&bevy::ui::Node>,
-        Option<&bevy::ui::ComputedNode>,
-        Option<&bevy::ui::UiGlobalTransform>,
-        Option<&crate::bevy_plugin::TerminalDimensions>,
-        Option<&bevy::ui::ZIndex>,
-        Option<&bevy::camera::visibility::ViewVisibility>,
-        Option<&bevy::camera::primitives::Aabb>,
-    )>,
+    #[cfg(feature = "2d")] ui: UiTerminals,
+    #[cfg(feature = "3d")] meshes: MeshTerminals,
     surfaces: Query<&crate::setup::TuiSurface>,
     mut events: MessageWriter<TerminalEvent>,
-    // Change-detection gate: anything that can move a
-    // cursor→cell mapping without the cursor pixel position itself
-    // changing. Bundled into one `SystemParam` - see `MouseChangeProbes`.
-    change_probes: MouseChangeProbes,
-    mut last_cursor_pos: Local<Option<Vec2>>,
-    mut last_hovered: Local<Option<(Entity, u16, u16)>>,
+    mut state: Local<MouseState>,
 ) {
-    let wheel_messages: Vec<MouseWheel> = wheel.read().copied().collect();
+    let MouseState {
+        last_cursor_pos,
+        last_hovered,
+    } = &mut *state;
+    let wheel_messages: Vec<MouseWheel> = inputs.wheel.read().copied().collect();
+    let MouseInputs {
+        buttons,
+        keyboard,
+        touches,
+        cursor,
+        config,
+        ..
+    } = inputs;
 
-    let cursor_pos = match cursor.position {
-        Some(pos) => pos,
-        None => {
-            *last_cursor_pos = None;
-            *last_hovered = None;
-            return;
-        }
+    let Some(cursor_pos) = cursor.position else {
+        *last_cursor_pos = None;
+        *last_hovered = None;
+        return;
     };
 
     let cursor_moved = *last_cursor_pos != Some(cursor_pos);
@@ -889,456 +981,76 @@ pub fn mouse_input_system(
         || buttons.get_just_released().len() > 0
         || touches.any_just_pressed()
         || touches.any_just_released();
-    let scene_changed = change_probes.any_changed();
-
+    #[cfg_attr(not(any(feature = "2d", feature = "3d")), allow(unused_mut))]
+    let mut scene_changed = false;
+    #[cfg(feature = "2d")]
+    {
+        scene_changed |= ui.any_changed();
+    }
+    #[cfg(feature = "3d")]
+    {
+        scene_changed |= meshes.any_changed();
+    }
     if !cursor_moved && !button_transition && !scene_changed && wheel_messages.is_empty() {
         return;
     }
     *last_cursor_pos = Some(cursor_pos);
     let modifiers = read_modifiers(&keyboard);
 
-    let mut cameras: Vec<(&Camera, &GlobalTransform)> = camera_query
-        .iter()
-        .filter(|(camera, _)| camera.is_active)
-        .collect();
-    cameras.sort_by_key(|(camera, _)| std::cmp::Reverse(camera.order));
-    let world_rays: Vec<crate::input::ray::Ray> = cameras
-        .iter()
-        .filter_map(|(camera, camera_transform)| {
-            let viewport = camera.logical_viewport_rect()?;
-            if !viewport.contains(cursor_pos) {
-                return None;
-            }
-            let ray3d = camera
-                .viewport_to_world(camera_transform, cursor_pos - viewport.min)
-                .ok()?;
-            Some(crate::input::ray::Ray::new(ray3d.origin, *ray3d.direction))
-        })
-        .collect();
+    #[cfg_attr(not(any(feature = "2d", feature = "3d")), allow(unused_mut))]
+    let mut hit_candidates: Vec<Hit> = Vec::new();
+    #[cfg(feature = "3d")]
+    meshes.hit_test(cursor_pos, &mut hit_candidates);
+    #[cfg(feature = "2d")]
+    ui.hit_test(cursor_pos, &mut hit_candidates);
 
-    let mut hit_candidates: Vec<(Entity, HitTestResult, SortKey)> = Vec::new();
+    if hit_candidates.len() > 1 {
+        debug!(
+            "Multiple terminals hit at cursor ({:.1}, {:.1}): {:?}",
+            cursor_pos.x, cursor_pos.y, hit_candidates
+        );
+    }
+    #[cfg(any(feature = "2d", feature = "3d"))]
+    hit_candidates.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
 
-    for (
+    let Some(&(entity, hit_result, _)) = hit_candidates.first() else {
+        *last_hovered = None;
+        return;
+    };
+    let hovered = (entity, hit_result.col, hit_result.row);
+    if *last_hovered != Some(hovered) {
+        emit_mouse_move(
+            entity,
+            hit_result.col,
+            hit_result.row,
+            &buttons,
+            &touches,
+            modifiers,
+            &surfaces,
+            &mut events,
+        );
+        *last_hovered = Some(hovered);
+    }
+    emit_button_events(
         entity,
-        input,
-        transform,
-        mesh2d,
-        mesh3d,
-        node,
-        computed,
-        ui_transform,
-        dimensions,
-        z_index,
-        view_visibility,
-        aabb,
-    ) in terminals.iter()
-    {
-        if !input.mouse {
-            continue;
-        }
-
-        let terminal_type = detect_terminal_type(mesh2d, mesh3d, node);
-
-        match terminal_type {
-            TerminalType::Mesh3D => {
-                let mesh_handle = mesh3d.map(|m| &m.0).or_else(|| mesh2d.map(|m| &m.0));
-                let Some(transform) = transform else {
-                    continue;
-                };
-
-                if view_visibility.is_some_and(|v| !v.get()) {
-                    continue;
-                }
-
-                for (camera_priority, ray) in world_rays.iter().enumerate() {
-                    if !ray_intersects_aabb(ray, transform, aabb) {
-                        continue;
-                    }
-
-                    if let Some((hit_result, distance)) = mesh_handle.and_then(|handle| {
-                        ray_cast_hit_test_inner(ray, transform, handle, &meshes, dimensions)
-                    }) {
-                        hit_candidates.push((
-                            entity,
-                            hit_result,
-                            SortKey::Distance {
-                                camera_priority,
-                                distance,
-                            },
-                        ));
-                        break;
-                    }
-                }
-            }
-            TerminalType::UI2D => {
-                if let Some(hit_result) =
-                    bounding_box_hit_test(cursor_pos, ui_transform, node, computed, dimensions)
-                {
-                    let z = z_index.map(|z| z.0).unwrap_or(0);
-                    hit_candidates.push((entity, hit_result, SortKey::ZIndex(z)));
-                }
-            }
-            TerminalType::Unknown => {}
-        }
-    }
-
-    if hit_candidates.is_empty() {
-        *last_hovered = None;
-        return;
-    }
-
-    if hit_candidates.len() > 1 {
-        debug!(
-            "Multiple terminals hit at cursor ({:.1}, {:.1}):",
-            cursor_pos.x, cursor_pos.y
-        );
-        for (entity, result, sort_key) in &hit_candidates {
-            debug!(
-                "  Entity {:?}: col={}, row={}, sort_key={:?}",
-                entity, result.col, result.row, sort_key
-            );
-        }
-    }
-
-    hit_candidates.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
-
-    if hit_candidates.len() > 1 {
-        debug!(
-            "After sorting, selected: Entity {:?} with sort_key={:?}",
-            hit_candidates.first().map(|c| c.0),
-            hit_candidates.first().map(|c| c.2)
-        );
-    }
-
-    if let Some((entity, hit_result, _sort_key)) = hit_candidates.first() {
-        let hovered = (*entity, hit_result.col, hit_result.row);
-        if *last_hovered != Some(hovered) {
-            emit_mouse_move(
-                *entity,
-                hit_result.col,
-                hit_result.row,
-                &buttons,
-                &touches,
-                modifiers,
-                &surfaces,
-                &mut events,
-            );
-            *last_hovered = Some(hovered);
-        }
-        emit_button_events(
-            *entity,
-            hit_result.col,
-            hit_result.row,
-            &buttons,
-            &touches,
-            modifiers,
-            &mut focus,
-            &config,
-            &surfaces,
-            &mut events,
-        );
-        emit_scroll_events(
-            remap_to_tui(*entity, &surfaces),
-            hit_result.col,
-            hit_result.row,
-            &wheel_messages,
-            modifiers,
-            &mut events,
-        );
-    }
-}
-
-/// Mouse input for 2D UI terminals only (`3d` feature disabled - no mesh
-/// terminals can exist, so there is nothing to auto-detect).
-#[cfg(all(feature = "mouse_input", feature = "2d", not(feature = "3d")))]
-#[allow(clippy::type_complexity)]
-pub fn mouse_input_system(
-    buttons: Res<ButtonInput<MouseButton>>,
-    keyboard: Res<ButtonInput<BevyKeyCode>>,
-    touches: Res<Touches>,
-    mut wheel: MessageReader<MouseWheel>,
-    cursor: Res<CursorPosition>,
-    config: Res<TerminalInputConfig>,
-    mut focus: ResMut<TerminalFocus>,
-    terminals: Query<(
-        Entity,
-        &TerminalInput,
-        Option<&bevy::ui::Node>,
-        Option<&bevy::ui::ComputedNode>,
-        Option<&bevy::ui::UiGlobalTransform>,
-        Option<&crate::bevy_plugin::TerminalDimensions>,
-        Option<&bevy::ui::ZIndex>,
-    )>,
-    surfaces: Query<&crate::setup::TuiSurface>,
-    mut events: MessageWriter<TerminalEvent>,
-    // Change-detection gate - no camera/3D probe
-    // needed here: `bounding_box_hit_test` is pure screen-space, it never
-    // reads a camera.
-    terminal_ui_changed: Query<
-        (),
-        (
-            With<TerminalInput>,
-            Or<(
-                Changed<bevy::ui::ComputedNode>,
-                Changed<bevy::ui::UiGlobalTransform>,
-            )>,
-        ),
-    >,
-    mut last_cursor_pos: Local<Option<Vec2>>,
-    mut last_hovered: Local<Option<(Entity, u16, u16)>>,
-) {
-    let wheel_messages: Vec<MouseWheel> = wheel.read().copied().collect();
-
-    let cursor_pos = match cursor.position {
-        Some(pos) => pos,
-        None => {
-            *last_cursor_pos = None;
-            *last_hovered = None;
-            return;
-        }
-    };
-
-    let cursor_moved = *last_cursor_pos != Some(cursor_pos);
-    let button_transition = buttons.get_just_pressed().len() > 0
-        || buttons.get_just_released().len() > 0
-        || touches.any_just_pressed()
-        || touches.any_just_released();
-    if !cursor_moved
-        && !button_transition
-        && terminal_ui_changed.is_empty()
-        && wheel_messages.is_empty()
-    {
-        return;
-    }
-    *last_cursor_pos = Some(cursor_pos);
-    let modifiers = read_modifiers(&keyboard);
-
-    let mut hit_candidates: Vec<(Entity, HitTestResult, SortKey)> = Vec::new();
-
-    for (entity, input, node, computed, ui_transform, dimensions, z_index) in terminals.iter() {
-        if !input.mouse {
-            continue;
-        }
-
-        if let Some(hit_result) =
-            bounding_box_hit_test(cursor_pos, ui_transform, node, computed, dimensions)
-        {
-            let z = z_index.map(|z| z.0).unwrap_or(0);
-            hit_candidates.push((entity, hit_result, SortKey::ZIndex(z)));
-        }
-    }
-
-    if hit_candidates.is_empty() {
-        *last_hovered = None;
-        return;
-    }
-
-    hit_candidates.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
-
-    if let Some((entity, hit_result, _sort_key)) = hit_candidates.first() {
-        let hovered = (*entity, hit_result.col, hit_result.row);
-        if *last_hovered != Some(hovered) {
-            emit_mouse_move(
-                *entity,
-                hit_result.col,
-                hit_result.row,
-                &buttons,
-                &touches,
-                modifiers,
-                &surfaces,
-                &mut events,
-            );
-            *last_hovered = Some(hovered);
-        }
-        emit_button_events(
-            *entity,
-            hit_result.col,
-            hit_result.row,
-            &buttons,
-            &touches,
-            modifiers,
-            &mut focus,
-            &config,
-            &surfaces,
-            &mut events,
-        );
-        emit_scroll_events(
-            remap_to_tui(*entity, &surfaces),
-            hit_result.col,
-            hit_result.row,
-            &wheel_messages,
-            modifiers,
-            &mut events,
-        );
-    }
-}
-
-/// Mouse input for 3D mesh terminals only (`2d` feature disabled - no UI
-/// terminals can exist, so there is nothing to auto-detect).
-#[cfg(all(feature = "mouse_input", feature = "3d", not(feature = "2d")))]
-#[allow(clippy::type_complexity)]
-pub fn mouse_input_system(
-    buttons: Res<ButtonInput<MouseButton>>,
-    keyboard: Res<ButtonInput<BevyKeyCode>>,
-    touches: Res<Touches>,
-    mut wheel: MessageReader<MouseWheel>,
-    cursor: Res<CursorPosition>,
-    config: Res<TerminalInputConfig>,
-    mut focus: ResMut<TerminalFocus>,
-    camera_query: Query<(&Camera, &GlobalTransform)>,
-    meshes: Res<Assets<bevy::mesh::Mesh>>,
-    terminals: Query<(
-        Entity,
-        &TerminalInput,
-        Option<&GlobalTransform>,
-        Option<&Mesh2d>,
-        Option<&Mesh3d>,
-        Option<&crate::bevy_plugin::TerminalDimensions>,
-        Option<&bevy::camera::visibility::ViewVisibility>,
-        Option<&bevy::camera::primitives::Aabb>,
-    )>,
-    surfaces: Query<&crate::setup::TuiSurface>,
-    mut events: MessageWriter<TerminalEvent>,
-    camera_change_probe: Query<
-        (),
-        (
-            With<Camera>,
-            Or<(
-                Changed<GlobalTransform>,
-                Changed<Projection>,
-                Changed<Camera>,
-            )>,
-        ),
-    >,
-    terminal_3d_changed: Query<(), (With<TerminalInput>, Changed<GlobalTransform>)>,
-    mut last_cursor_pos: Local<Option<Vec2>>,
-    mut last_hovered: Local<Option<(Entity, u16, u16)>>,
-) {
-    let wheel_messages: Vec<MouseWheel> = wheel.read().copied().collect();
-
-    let cursor_pos = match cursor.position {
-        Some(pos) => pos,
-        None => {
-            *last_cursor_pos = None;
-            *last_hovered = None;
-            return;
-        }
-    };
-
-    let cursor_moved = *last_cursor_pos != Some(cursor_pos);
-    let button_transition = buttons.get_just_pressed().len() > 0
-        || buttons.get_just_released().len() > 0
-        || touches.any_just_pressed()
-        || touches.any_just_released();
-    let scene_changed = !camera_change_probe.is_empty() || !terminal_3d_changed.is_empty();
-    if !cursor_moved && !button_transition && !scene_changed && wheel_messages.is_empty() {
-        return;
-    }
-    *last_cursor_pos = Some(cursor_pos);
-    let modifiers = read_modifiers(&keyboard);
-
-    // See the unified system's doc comment for the multi-camera rationale -
-    // identical here, just without any 2D UI terminals to also consider.
-    let mut cameras: Vec<(&Camera, &GlobalTransform)> = camera_query
-        .iter()
-        .filter(|(camera, _)| camera.is_active)
-        .collect();
-    cameras.sort_by_key(|(camera, _)| std::cmp::Reverse(camera.order));
-    let world_rays: Vec<crate::input::ray::Ray> = cameras
-        .iter()
-        .filter_map(|(camera, camera_transform)| {
-            let viewport = camera.logical_viewport_rect()?;
-            if !viewport.contains(cursor_pos) {
-                return None;
-            }
-            let ray3d = camera
-                .viewport_to_world(camera_transform, cursor_pos - viewport.min)
-                .ok()?;
-            Some(crate::input::ray::Ray::new(ray3d.origin, *ray3d.direction))
-        })
-        .collect();
-
-    let mut hit_candidates: Vec<(Entity, HitTestResult, SortKey)> = Vec::new();
-
-    for (entity, input, transform, mesh2d, mesh3d, dimensions, view_visibility, aabb) in
-        terminals.iter()
-    {
-        if !input.mouse {
-            continue;
-        }
-        let mesh_handle = mesh3d.map(|m| &m.0).or_else(|| mesh2d.map(|m| &m.0));
-        let Some(transform) = transform else {
-            continue;
-        };
-
-        if view_visibility.is_some_and(|v| !v.get()) {
-            continue;
-        }
-
-        for (camera_priority, ray) in world_rays.iter().enumerate() {
-            if !ray_intersects_aabb(ray, transform, aabb) {
-                continue;
-            }
-
-            if let Some((hit_result, distance)) = mesh_handle.and_then(|handle| {
-                ray_cast_hit_test_inner(ray, transform, handle, &meshes, dimensions)
-            }) {
-                hit_candidates.push((
-                    entity,
-                    hit_result,
-                    SortKey::Distance {
-                        camera_priority,
-                        distance,
-                    },
-                ));
-                break;
-            }
-        }
-    }
-
-    if hit_candidates.is_empty() {
-        *last_hovered = None;
-        return;
-    }
-
-    hit_candidates.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
-
-    if let Some((entity, hit_result, _sort_key)) = hit_candidates.first() {
-        let hovered = (*entity, hit_result.col, hit_result.row);
-        if *last_hovered != Some(hovered) {
-            emit_mouse_move(
-                *entity,
-                hit_result.col,
-                hit_result.row,
-                &buttons,
-                &touches,
-                modifiers,
-                &surfaces,
-                &mut events,
-            );
-            *last_hovered = Some(hovered);
-        }
-        emit_button_events(
-            *entity,
-            hit_result.col,
-            hit_result.row,
-            &buttons,
-            &touches,
-            modifiers,
-            &mut focus,
-            &config,
-            &surfaces,
-            &mut events,
-        );
-        emit_scroll_events(
-            remap_to_tui(*entity, &surfaces),
-            hit_result.col,
-            hit_result.row,
-            &wheel_messages,
-            modifiers,
-            &mut events,
-        );
-    }
+        hit_result.col,
+        hit_result.row,
+        &buttons,
+        &touches,
+        modifiers,
+        &mut focus,
+        &config,
+        &surfaces,
+        &mut events,
+    );
+    emit_scroll_events(
+        remap_to_tui(entity, &surfaces),
+        hit_result.col,
+        hit_result.row,
+        &wheel_messages,
+        modifiers,
+        &mut events,
+    );
 }
 
 /// Window resize event system.
@@ -1570,74 +1282,82 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "mouse_input", feature = "2d"))]
-    mod pixel_to_cell_tests {
-        use super::super::pixel_to_cell;
+    #[cfg(all(feature = "mouse_input", any(feature = "2d", feature = "3d")))]
+    mod cell_at_tests {
+        use super::super::cell_at;
 
         #[test]
         fn origin_maps_to_first_cell() {
-            assert_eq!(pixel_to_cell(0.0, 0.0, 8.0, 16.0, 80, 24), (0, 0));
+            assert_eq!(cell_at(0.0, 0.0, 80, 24), (0, 0));
         }
 
         #[test]
-        fn exactly_on_a_cell_boundary_rounds_down_into_the_next_cell() {
-            assert_eq!(pixel_to_cell(8.0, 16.0, 8.0, 16.0, 80, 24), (1, 1));
-            assert_eq!(pixel_to_cell(7.9, 15.9, 8.0, 16.0, 80, 24), (0, 0));
+        fn a_cell_boundary_belongs_to_the_next_cell() {
+            assert_eq!(cell_at(1.0, 1.0, 80, 24), (1, 1));
+            assert_eq!(cell_at(0.99, 0.99, 80, 24), (0, 0));
         }
 
         #[test]
-        fn last_column_and_row_clamp_correctly() {
-            assert_eq!(pixel_to_cell(640.0, 384.0, 8.0, 16.0, 80, 24), (79, 23));
-            assert_eq!(pixel_to_cell(635.0, 380.0, 8.0, 16.0, 80, 24), (79, 23));
+        fn the_far_edge_clamps_to_the_last_cell_not_one_past_it() {
+            assert_eq!(cell_at(80.0, 24.0, 80, 24), (79, 23));
+            assert_eq!(cell_at(80.01, 24.01, 80, 24), (79, 23));
         }
 
         #[test]
-        fn out_of_bounds_pixels_clamp_instead_of_wrapping_or_panicking() {
-            assert_eq!(
-                pixel_to_cell(-50.0, -50.0, 8.0, 16.0, 80, 24),
-                (0, 0),
-                "negative input must clamp to the first cell"
-            );
-            assert_eq!(
-                pixel_to_cell(10_000.0, 10_000.0, 8.0, 16.0, 80, 24),
-                (79, 23),
-                "far-out-of-bounds input must clamp to the last cell"
-            );
+        fn out_of_bounds_positions_clamp_instead_of_wrapping() {
+            assert_eq!(cell_at(-6.25, -3.125, 80, 24), (0, 0));
+            assert_eq!(cell_at(1250.0, 625.0, 80, 24), (79, 23));
+            assert_eq!(cell_at(f32::NAN, f32::INFINITY, 80, 24), (0, 23));
         }
 
         #[test]
         fn single_cell_terminal_always_resolves_to_zero() {
-            assert_eq!(pixel_to_cell(500.0, 500.0, 8.0, 16.0, 1, 1), (0, 0));
-        }
-    }
-
-    #[cfg(all(feature = "mouse_input", feature = "3d"))]
-    mod uv_to_cell_tests {
-        use super::super::uv_to_cell;
-
-        #[test]
-        fn origin_maps_to_first_cell() {
-            assert_eq!(uv_to_cell(0.0, 0.0, 80, 24), (0, 0));
-        }
-
-        #[test]
-        fn uv_one_clamps_to_the_last_cell_not_one_past_it() {
-            assert_eq!(uv_to_cell(1.0, 1.0, 80, 24), (79, 23));
-        }
-
-        #[test]
-        fn slightly_past_one_still_clamps_to_the_last_cell() {
-            assert_eq!(uv_to_cell(1.0001, 1.0001, 80, 24), (79, 23));
-        }
-
-        #[test]
-        fn negative_uv_clamps_to_the_first_cell() {
-            assert_eq!(uv_to_cell(-0.0001, -0.0001, 80, 24), (0, 0));
+            assert_eq!(cell_at(62.5, 31.25, 1, 1), (0, 0));
         }
 
         #[test]
         fn midpoint_maps_to_the_middle_of_the_grid() {
-            assert_eq!(uv_to_cell(0.5, 0.5, 80, 24), (40, 12));
+            assert_eq!(cell_at(40.0, 12.0, 80, 24), (40, 12));
         }
+    }
+}
+
+#[cfg(test)]
+mod cursor_position_tests {
+    use super::*;
+    use bevy::ecs::system::RunSystemOnce;
+
+    fn world_with(windows: &[Option<Vec2>]) -> World {
+        let mut world = World::new();
+        world.init_resource::<CursorPosition>();
+        world.init_resource::<Touches>();
+        for &cursor in windows {
+            let mut window = Window::default();
+            window.set_cursor_position(cursor);
+            world.spawn(window);
+        }
+        world
+    }
+
+    #[test]
+    fn without_a_primary_window_the_window_holding_the_cursor_is_used() {
+        let mut world = world_with(&[None, Some(Vec2::new(3.0, 4.0))]);
+        world
+            .run_system_once(update_cursor_position_system)
+            .expect("system runs");
+        assert_eq!(
+            world.resource::<CursorPosition>().position,
+            Some(Vec2::new(3.0, 4.0))
+        );
+    }
+
+    #[test]
+    fn with_no_window_the_position_is_cleared() {
+        let mut world = world_with(&[]);
+        world.resource_mut::<CursorPosition>().position = Some(Vec2::ONE);
+        world
+            .run_system_once(update_cursor_position_system)
+            .expect("system runs");
+        assert_eq!(world.resource::<CursorPosition>().position, None);
     }
 }

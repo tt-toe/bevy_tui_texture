@@ -1,11 +1,9 @@
-use bitvec::order::Lsb0;
-use bitvec::slice::BitSlice;
-use raqote::{DrawOptions, DrawTarget, SolidSource, Transform};
-use rustybuzz::ttf_parser::{GlyphId, RasterGlyphImage, RasterImageFormat, RgbaColor};
+use rustybuzz::ttf_parser::{GlyphId, RasterGlyphImage, RasterImageFormat};
 
 use crate::backend::glyph_constraint::{CellMetrics, GlyphConstraint, GlyphRect};
+use crate::utils::colr::{self, Affine, ColorPainter};
+use crate::utils::outline::{OutlineSink, map_points};
 use crate::utils::text_atlas::{CacheRect, Entry};
-use crate::utils::{Outline, Painter};
 
 const LUT_1: [u8; 2] = [0, 255];
 const LUT_2: [u8; 4] = [0, 255 / 3, 2 * (255 / 3), 255];
@@ -28,63 +26,61 @@ const LUT_4: [u8; 16] = [
     255,
 ];
 
-// Fake Bold Rendering
-//
-// Fake bold is achieved by rendering the glyph path multiple times at slight
-// horizontal offsets. This creates a thickened appearance that simulates
-// bold weight without requiring a dedicated bold font.
+/// Fake bold coverage: `1 - (1 - a)^9`, what nine stacked fills of the
+/// same edge add up to.
+const BOLD_LUT: [u8; 256] = {
+    let mut lut = [0u8; 256];
+    let d: u128 = 255u128.pow(8);
+    let mut a = 0;
+    while a < 256 {
+        let n = (255 - a as u128).pow(9);
+        lut[a] = (255 - (n + d / 2) / d) as u8;
+        a += 1;
+    }
+    lut
+};
 
-/// Default stroke thickness as a fraction of the em-square when the font
-/// does not provide underline metrics.
-const DEFAULT_STROKE_THICKNESS_RATIO: f32 = 1.0 / 32.0;
-
-/// Minimum bold offset in pixels to ensure visibility even at small sizes.
-const MIN_BOLD_OFFSET_PX: f32 = 0.3;
-
-/// Font weight value for normal (regular) weight fonts.
-const FONT_WEIGHT_NORMAL: f32 = 400.0;
-
-/// Font weight delta between normal and bold (700 - 400 = 300).
-const FONT_WEIGHT_BOLD_DELTA: f32 = 300.0;
-
-/// Maximum weight factor to prevent excessive bolding for extra-bold fonts.
-const MAX_WEIGHT_FACTOR: f32 = 2.0;
-
-/// Horizontal offset ratios for fake bold rendering.
-const BOLD_OFFSET_RATIOS: [f32; 8] = [1.0, 0.5, -0.5, 1.5, 0.25, -0.25, 0.75, -0.75];
-
-/// Calculate the base bold offset based on font metrics.
-fn calculate_bold_offset(metrics: &rustybuzz::Face, render_scale: f32) -> f32 {
-    let font_weight = metrics.weight().to_number() as f32;
-    let units_per_em = metrics.units_per_em() as f32;
-
-    let weight_factor =
-        ((font_weight - FONT_WEIGHT_NORMAL) / FONT_WEIGHT_BOLD_DELTA).clamp(0.0, MAX_WEIGHT_FACTOR);
-
-    // Get font-specific stroke thickness from underline metrics if available,
-    // otherwise use a reasonable default based on em-square size
-    let stroke_thickness = metrics
-        .underline_metrics()
-        .map(|m| m.thickness as f32)
-        .unwrap_or(units_per_em * DEFAULT_STROKE_THICKNESS_RATIO);
-
-    let scale_to_pixels = render_scale / 2.0;
-    let base_offset = stroke_thickness * scale_to_pixels * weight_factor / units_per_em;
-
-    base_offset.max(MIN_BOLD_OFFSET_PX)
+/// Buffers reused across glyph rasterizations of one `Fonts`.
+#[derive(Default)]
+pub(crate) struct RasterScratch {
+    zeno: zeno::Scratch,
+    path: Vec<zeno::Command>,
+    canvas: Vec<u8>,
 }
 
-/// Apply fake bold effect by rendering the path at multiple horizontal offsets.
-fn apply_fake_bold(target: &mut DrawTarget<&mut [u32]>, path: &raqote::Path, base_offset: f32) {
-    let white = raqote::Source::Solid(SolidSource::from_unpremultiplied_argb(255, 255, 255, 255));
-    let draw_options = DrawOptions::default();
+/// Font units -> canvas pixels: `X = sx*x + skew*y + tx`, `Y = ty - sy*y`,
+/// all multiplied by `scale`.
+#[derive(Clone, Copy)]
+struct PointMap {
+    sx: f32,
+    skew: f32,
+    tx: f32,
+    sy: f32,
+    ty: f32,
+    scale: f32,
+}
 
-    for ratio in BOLD_OFFSET_RATIOS {
-        let offset = base_offset * ratio;
-        let bold_transform = Transform::new(1.0, 0.0, 0.0, 1.0, offset, 0.0);
-        let transformed_path = path.clone().transform(&bold_transform);
-        target.fill(&transformed_path, &white, &draw_options);
+impl PointMap {
+    fn apply(&self, p: zeno::Vector) -> zeno::Vector {
+        zeno::Vector::new(
+            (self.sx * p.x + self.skew * p.y + self.tx) * self.scale,
+            (self.ty - self.sy * p.y) * self.scale,
+        )
     }
+}
+
+/// Coverage of `path` on a zeroed `width` x `height` canvas.
+fn fill_mask(
+    path: &[zeno::Command],
+    scratch: &mut zeno::Scratch,
+    width: usize,
+    height: usize,
+    out: &mut [u8],
+) {
+    zeno::Mask::with_scratch(path, scratch)
+        .style(zeno::Fill::NonZero)
+        .size(width as u32, height as u32)
+        .render_into(out, None);
 }
 
 /// Where a glyph lands in its atlas slot.
@@ -166,6 +162,7 @@ impl CanvasTransform {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn rasterize_glyph(
     cached: Entry,
     metrics: &rustybuzz::Face,
@@ -174,7 +171,8 @@ pub(super) fn rasterize_glyph(
     fake_bold: bool,
     advance_scale: f32,
     placement: Placement,
-) -> (CacheRect, Vec<u32>) {
+    scratch: &mut RasterScratch,
+) -> (CacheRect, Vec<u8>) {
     let natural = matches!(placement, Placement::Natural { .. });
     let CanvasTransform { sx, sy, tx, ty } = CanvasTransform::new(
         metrics,
@@ -184,142 +182,90 @@ pub(super) fn rasterize_glyph(
         placement,
     );
 
-    let skew = if fake_italic {
-        Transform::new(
-            /* scale x */ 1.0,
-            /* skew x */ 0.0,
-            /* skew y */ -0.25,
-            /* scale y */ 1.0,
-            /* translate x */ -0.25 * cached.width as f32,
-            /* translate y */ 0.0,
-        )
-    } else {
-        Transform::default()
-    };
-
-    let mut image = vec![0u32; cached.width as usize * 2 * cached.height as usize * 2];
-    let mut target = DrawTarget::from_backing(
-        cached.width as i32 * 2,
-        cached.height as i32 * 2,
-        &mut image[..],
-    );
-
-    let mut painter = Painter::new(
-        metrics,
-        &mut target,
-        Transform::scale(sx / sy, 1.0).then(&skew),
-        sy,
-        ty,
-        tx,
-    );
-    if metrics
-        .paint_color_glyph(
-            GlyphId(info.glyph_id as _),
-            0,
-            RgbaColor::new(255, 255, 255, 255),
-            &mut painter,
-        )
-        .is_some()
-    {
-        let mut final_image = DrawTarget::new(cached.width as i32, cached.height as i32);
-        final_image.draw_image_with_size_at(
-            cached.width as f32,
-            cached.height as f32,
-            0.,
-            0.,
-            &raqote::Image {
-                width: cached.width as i32 * 2,
-                height: cached.height as i32 * 2,
-                data: &image,
-            },
-            &DrawOptions {
-                blend_mode: raqote::BlendMode::Src,
-                antialias: raqote::AntialiasMode::None,
-                ..Default::default()
-            },
-        );
-
-        let mut final_image = final_image.into_vec();
-        for argb in final_image.iter_mut() {
-            let [a, r, g, b] = argb.to_be_bytes();
-            *argb = u32::from_le_bytes([r, g, b, a]);
+    let glyph_id = GlyphId(info.glyph_id as _);
+    let (w, h) = (cached.width as usize, cached.height as usize);
+    let italic = if fake_italic { 0.25 } else { 0.0 };
+    if metrics.is_color_glyph(glyph_id) {
+        let base = Affine::new(sx, 0.0, italic * sy, -sy, tx - italic * w as f32, ty)
+            .then(&Affine::scale(0.5, 0.5));
+        if let Some(pixels) = ColorPainter::new(metrics, w, h, base).paint_glyph(glyph_id) {
+            return (*cached, colr::to_alpha(&pixels));
         }
-
-        return (*cached, final_image);
     }
 
-    if let Some(value) = metrics
-        .glyph_raster_image(GlyphId(info.glyph_id as _), u16::MAX)
-        .and_then(|raster| extract_color_image(&mut image, raster, cached, advance_scale))
+    if let Some(mask) = metrics
+        .glyph_raster_image(glyph_id, u16::MAX)
+        .filter(|raster| raster.format == RasterImageFormat::BitmapPremulBgra32)
+        .and_then(|raster| bitmap_coverage(raster, cached, advance_scale))
     {
-        return value;
+        return (*cached, mask);
     }
 
-    let mut render = Outline::default();
-    if let Some(bounds) = metrics.outline_glyph(GlyphId(info.glyph_id as _), &mut render) {
-        let path = render.finish();
-
+    scratch.path.clear();
+    if let Some(bounds) = metrics.outline_glyph(glyph_id, &mut OutlineSink(&mut scratch.path)) {
         let x_off = if natural && bounds.x_max < 0 {
             -bounds.x_min as f32
         } else {
             0.
         };
-        let x_off = x_off * sx + tx;
-
-        let mut target = DrawTarget::from_backing(
-            cached.width as i32 * 2,
-            cached.height as i32 * 2,
-            &mut image[..],
-        );
-        target.set_transform(
-            &Transform::scale(sx, -sy)
-                .then(&skew)
-                .then_translate((x_off, ty).into()),
-        );
-
-        target.fill(
-            &path,
-            &raqote::Source::Solid(SolidSource::from_unpremultiplied_argb(255, 255, 255, 255)),
-            &DrawOptions::default(),
-        );
-
-        if fake_bold {
-            let bold_offset = calculate_bold_offset(metrics, sy);
-            apply_fake_bold(&mut target, &path, bold_offset);
+        let map = PointMap {
+            sx,
+            skew: italic * sy,
+            tx: x_off * sx + tx - italic * w as f32,
+            sy,
+            ty,
+            scale: if fake_bold { 1.0 } else { 0.5 },
+        };
+        let mut out = vec![0u8; w * h];
+        if !map_points(&mut scratch.path, |p| map.apply(p)) {
+            return (*cached, out);
         }
-
-        let mut final_image = DrawTarget::new(cached.width as i32, cached.height as i32);
-        final_image.draw_image_with_size_at(
-            cached.width as f32,
-            cached.height as f32,
-            0.,
-            0.,
-            &raqote::Image {
-                width: cached.width as i32 * 2,
-                height: cached.height as i32 * 2,
-                data: &image,
-            },
-            &DrawOptions {
-                blend_mode: raqote::BlendMode::Src,
-                antialias: raqote::AntialiasMode::None,
-                ..Default::default()
-            },
+        if !fake_bold {
+            fill_mask(&scratch.path, &mut scratch.zeno, w, h, &mut out);
+            return (*cached, out);
+        }
+        let (cw, ch) = (w * 2, h * 2);
+        scratch.canvas.clear();
+        scratch.canvas.resize(cw * ch, 0);
+        fill_mask(
+            &scratch.path,
+            &mut scratch.zeno,
+            cw,
+            ch,
+            &mut scratch.canvas,
         );
-
-        return (*cached, final_image.into_vec());
+        for (y, row) in out.chunks_exact_mut(w.max(1)).enumerate() {
+            let top = scratch.canvas.get(2 * y * cw..(2 * y + 1) * cw);
+            let bottom = scratch.canvas.get((2 * y + 1) * cw..(2 * y + 2) * cw);
+            let (Some(top), Some(bottom)) = (top, bottom) else {
+                break;
+            };
+            for (x, dst) in row.iter_mut().enumerate() {
+                let sum: u32 = [
+                    top.get(2 * x),
+                    top.get(2 * x + 1),
+                    bottom.get(2 * x),
+                    bottom.get(2 * x + 1),
+                ]
+                .into_iter()
+                .flatten()
+                .filter_map(|&a| BOLD_LUT.get(usize::from(a)))
+                .map(|&a| u32::from(a))
+                .sum();
+                *dst = (sum / 4) as u8;
+            }
+        }
+        return (*cached, out);
     }
 
-    if let Some(value) = metrics
-        .glyph_raster_image(GlyphId(info.glyph_id as _), u16::MAX)
-        .and_then(|raster| extract_bw_image(&mut image, raster, cached, advance_scale))
+    if let Some(mask) = metrics
+        .glyph_raster_image(glyph_id, u16::MAX)
+        .and_then(|raster| bitmap_coverage(raster, cached, advance_scale))
     {
-        return value;
+        return (*cached, mask);
     }
 
-    (
-        *cached,
-        vec![0u32; cached.width as usize * cached.height as usize],
-    )
+    (*cached, vec![0u8; w * h])
 }
 
 /// A color glyph as premultiplied RGBA8 (`width * height * 4` bytes), or
@@ -334,39 +280,18 @@ pub(super) fn rasterize_color_glyph(
 ) -> Option<Vec<u8>> {
     let (w, h) = (width as usize, height as usize);
     if face.is_color_glyph(glyph) {
-        let (canvas_w, canvas_h) = (2 * width, 2 * height);
         let ascender = face.ascender() as f32;
         let line_height = (face.ascender() - face.descender()).max(1) as f32;
         let advance = face
             .glyph_hor_advance(glyph)
             .filter(|&advance| advance > 0)
             .map_or(face.units_per_em() as f32, f32::from);
-        let scale = (canvas_w as f32 / advance).min(canvas_h as f32 / line_height);
-        let x_offset = (canvas_w as f32 - advance * scale) / 2.0;
-        let y_offset = (canvas_h as f32 - line_height * scale) / 2.0 + ascender * scale;
-
-        let mut image = vec![0u32; canvas_w as usize * canvas_h as usize];
-        let mut target = DrawTarget::from_backing(canvas_w as i32, canvas_h as i32, &mut image[..]);
-        let mut painter = Painter::new(
-            face,
-            &mut target,
-            Transform::identity(),
-            scale,
-            y_offset,
-            x_offset,
-        );
-        if face
-            .paint_color_glyph(glyph, 0, RgbaColor::new(255, 255, 255, 255), &mut painter)
-            .is_some()
-        {
-            let rgba: Vec<u8> = image
-                .iter()
-                .flat_map(|argb| {
-                    let [a, r, g, b] = argb.to_be_bytes();
-                    [r, g, b, a]
-                })
-                .collect();
-            return Some(box_down(&rgba, canvas_w as usize, canvas_h as usize, w, h));
+        let scale = (width as f32 / advance).min(height as f32 / line_height);
+        let x_offset = (width as f32 - advance * scale) / 2.0;
+        let y_offset = (height as f32 - line_height * scale) / 2.0 + ascender * scale;
+        let base = Affine::new(scale, 0.0, 0.0, -scale, x_offset, y_offset);
+        if let Some(pixels) = ColorPainter::new(face, w, h, base).paint_glyph(glyph) {
+            return Some(colr::to_rgba8(&pixels));
         }
     }
 
@@ -376,11 +301,7 @@ pub(super) fn rasterize_color_glyph(
         return None;
     }
     let (pixels, pw, ph) = match raster.format {
-        RasterImageFormat::PNG => {
-            let pixmap = tiny_skia::Pixmap::decode_png(raster.data).ok()?;
-            let (pw, ph) = (pixmap.width() as usize, pixmap.height() as usize);
-            (pixmap.take(), pw, ph)
-        }
+        RasterImageFormat::PNG => decode_png(raster.data)?,
         RasterImageFormat::BitmapPremulBgra32 => {
             let (pw, ph) = (raster.width as usize, raster.height as usize);
             let bgra = raster.data.get(..pw * ph * 4)?;
@@ -451,160 +372,144 @@ fn raster_is_empty(raster: &RasterGlyphImage) -> bool {
     raster.width == 0 || raster.height == 0
 }
 
-fn extract_color_image(
-    image: &mut Vec<u32>,
-    raster: RasterGlyphImage,
-    cached: Entry,
-    scale: f32,
-) -> Option<(CacheRect, Vec<u32>)> {
+/// An embedded bitmap (BGRA, grayscale or monochrome) as coverage,
+/// stretched over the slot (see [`resample_alpha`]).
+fn bitmap_coverage(raster: RasterGlyphImage, cached: Entry, scale: f32) -> Option<Vec<u8>> {
     if raster_is_empty(&raster) {
         return None;
     }
+    let (sw, sh) = (raster.width as usize, raster.height as usize);
+    let mut alpha = vec![0u8; sw * sh];
     match raster.format {
-        RasterImageFormat::PNG => {
-            return None;
-        }
         RasterImageFormat::BitmapPremulBgra32 => {
-            image.resize(raster.width as usize * raster.height as usize, 0);
-            for (y, row) in raster.data.chunks(raster.width as usize * 4).enumerate() {
-                for (x, &[b, g, r, a]) in row.as_chunks::<4>().0.iter().enumerate() {
-                    if let Some(dst) = image.get_mut(y * raster.width as usize + x) {
-                        *dst = u32::from_be_bytes([a, r, g, b]);
-                    }
-                }
+            for (dst, &[_, _, _, a]) in alpha.iter_mut().zip(raster.data.as_chunks::<4>().0) {
+                *dst = a;
             }
         }
-        _ => return None,
-    }
-
-    let mut final_image = DrawTarget::new(cached.width as i32, cached.height as i32);
-    final_image.draw_image_with_size_at(
-        cached.width as f32,
-        cached.height as f32,
-        raster.x as f32 * scale,
-        raster.y as f32 * scale,
-        &raqote::Image {
-            width: raster.width as i32,
-            height: raster.height as i32,
-            data: &*image,
-        },
-        &DrawOptions {
-            blend_mode: raqote::BlendMode::Src,
-            antialias: raqote::AntialiasMode::None,
-            ..Default::default()
-        },
-    );
-
-    let mut final_image = final_image.into_vec();
-    for argb in final_image.iter_mut() {
-        let [a, r, g, b] = argb.to_be_bytes();
-        *argb = u32::from_le_bytes([r, g, b, a]);
-    }
-
-    Some((*cached, final_image))
-}
-
-fn extract_bw_image(
-    image: &mut Vec<u32>,
-    raster: RasterGlyphImage,
-    cached: Entry,
-    scale: f32,
-) -> Option<(CacheRect, Vec<u32>)> {
-    if raster_is_empty(&raster) {
-        return None;
-    }
-    image.resize(raster.width as usize * raster.height as usize, 0);
-
-    match raster.format {
-        RasterImageFormat::BitmapMono => {
-            from_gray_unpacked::<1, 2>(image, raster, LUT_1);
-        }
-        RasterImageFormat::BitmapMonoPacked => {
-            from_gray_packed::<1, 2>(image, raster, LUT_1);
-        }
-        RasterImageFormat::BitmapGray2 => {
-            from_gray_unpacked::<2, 4>(image, raster, LUT_2);
-        }
-        RasterImageFormat::BitmapGray2Packed => {
-            from_gray_packed::<2, 4>(image, raster, LUT_2);
-        }
-        RasterImageFormat::BitmapGray4 => {
-            from_gray_unpacked::<4, 16>(image, raster, LUT_4);
-        }
-        RasterImageFormat::BitmapGray4Packed => {
-            from_gray_packed::<4, 16>(image, raster, LUT_4);
-        }
+        RasterImageFormat::BitmapMono => unpack_rows::<1, 2>(&mut alpha, raster, LUT_1),
+        RasterImageFormat::BitmapMonoPacked => unpack_gray(raster.data, &LUT_1, 1, &mut alpha),
+        RasterImageFormat::BitmapGray2 => unpack_rows::<2, 4>(&mut alpha, raster, LUT_2),
+        RasterImageFormat::BitmapGray2Packed => unpack_gray(raster.data, &LUT_2, 2, &mut alpha),
+        RasterImageFormat::BitmapGray4 => unpack_rows::<4, 16>(&mut alpha, raster, LUT_4),
+        RasterImageFormat::BitmapGray4Packed => unpack_gray(raster.data, &LUT_4, 4, &mut alpha),
         RasterImageFormat::BitmapGray8 => {
-            for (byte, dst) in raster.data.iter().zip(image.iter_mut()) {
-                *dst = u32::from_be_bytes([*byte, 255, 255, 255]);
+            for (dst, &byte) in alpha.iter_mut().zip(raster.data) {
+                *dst = byte;
             }
         }
         _ => return None,
     }
-
-    let mut final_image = DrawTarget::new(cached.width as i32, cached.height as i32);
-    final_image.draw_image_with_size_at(
-        cached.width as f32,
-        cached.height as f32,
-        raster.x as f32 * scale,
-        raster.y as f32 * scale,
-        &raqote::Image {
-            width: raster.width as i32,
-            height: raster.height as i32,
-            data: &*image,
-        },
-        &DrawOptions {
-            blend_mode: raqote::BlendMode::Src,
-            antialias: raqote::AntialiasMode::None,
-            ..Default::default()
-        },
-    );
-
-    let mut final_image = final_image.into_vec();
-    for argb in final_image.iter_mut() {
-        let [a, r, g, b] = argb.to_be_bytes();
-        *argb = u32::from_le_bytes([r, g, b, a]);
-    }
-
-    Some((*cached, final_image))
+    Some(resample_alpha(&alpha, (sw, sh), cached, raster, scale))
 }
 
-fn from_gray_unpacked<const BITS: usize, const ENTRIES: usize>(
-    image: &mut [u32],
+/// `src` (`sw` x `sh`) stretched bilinearly over the whole slot, shifted by
+/// the bitmap's bearing `(raster.x, raster.y) * scale`; pixels whose center
+/// falls outside the stretched image stay 0.
+fn resample_alpha(
+    src: &[u8],
+    (sw, sh): (usize, usize),
+    cached: Entry,
+    raster: RasterGlyphImage,
+    scale: f32,
+) -> Vec<u8> {
+    let (w, h) = (cached.width as usize, cached.height as usize);
+    let (dx, dy) = (f32::from(raster.x) * scale, f32::from(raster.y) * scale);
+    let mut out = vec![0u8; w * h];
+    if sw == 0 || sh == 0 || w == 0 || h == 0 {
+        return out;
+    }
+    let at = |x: usize, y: usize| f32::from(src.get(y * sw + x).copied().unwrap_or(0));
+    for (i, dst) in out.iter_mut().enumerate() {
+        let (px, py) = ((i % w) as f32 + 0.5 - dx, (i / w) as f32 + 0.5 - dy);
+        if px < 0.0 || py < 0.0 || px >= w as f32 || py >= h as f32 {
+            continue;
+        }
+        let u = (px * sw as f32 / w as f32 - 0.5).clamp(0.0, (sw - 1) as f32);
+        let v = (py * sh as f32 / h as f32 - 0.5).clamp(0.0, (sh - 1) as f32);
+        let (x0, y0) = (u.floor() as usize, v.floor() as usize);
+        let (x1, y1) = ((x0 + 1).min(sw - 1), (y0 + 1).min(sh - 1));
+        let (fx, fy) = (u - x0 as f32, v - y0 as f32);
+        let top = at(x0, y0) * (1.0 - fx) + at(x1, y0) * fx;
+        let bottom = at(x0, y1) * (1.0 - fx) + at(x1, y1) * fx;
+        *dst = (top * (1.0 - fy) + bottom * fy).round() as u8;
+    }
+    out
+}
+
+/// One `bits`-wide gray level per pixel of `dst`, mapped through `steps`.
+fn unpack_gray(data: &[u8], steps: &[u8], width: usize, dst: &mut [u8]) {
+    let width = width.max(1);
+    let total_bits = data.len() * 8;
+    for (pixel, dst) in dst.iter_mut().enumerate() {
+        let first = pixel * width;
+        if first >= total_bits {
+            break;
+        }
+        let mut index = 0usize;
+        for j in 0..width {
+            let bit = first + j;
+            let set = data
+                .get(bit / 8)
+                .is_some_and(|byte| byte >> (bit % 8) & 1 == 1);
+            if set {
+                index |= 1 << width.saturating_sub(j + 1);
+            }
+        }
+        *dst = steps.get(index).copied().unwrap_or(0);
+    }
+}
+
+/// [`unpack_gray`] for bitmaps whose rows start on a byte boundary.
+fn unpack_rows<const BITS: usize, const ENTRIES: usize>(
+    dst: &mut [u8],
     raster: RasterGlyphImage,
     steps: [u8; ENTRIES],
 ) {
+    let row_bytes = usize::from(raster.width) / (8 / BITS).max(1) + 1;
     for (bits, dst) in raster
         .data
-        .chunks((raster.width as usize / (8 / BITS)) + 1)
-        .zip(image.chunks_mut(raster.width as usize))
+        .chunks(row_bytes)
+        .zip(dst.chunks_mut(usize::from(raster.width).max(1)))
     {
-        let bits = BitSlice::<_, Lsb0>::from_slice(bits);
-        for (bits, dst) in bits.chunks(BITS).zip(dst.iter_mut()) {
-            let mut index = 0;
-            for idx in bits.iter_ones() {
-                index |= 1 << (BITS - idx - 1);
-            }
-            let value = steps.get(index as usize).copied().unwrap_or(0);
-            *dst = u32::from_be_bytes([value, 255, 255, 255]);
-        }
+        unpack_gray(bits, &steps, BITS, dst);
     }
 }
 
-fn from_gray_packed<const BITS: usize, const ENTRIES: usize>(
-    image: &mut [u32],
-    raster: RasterGlyphImage,
-    steps: [u8; ENTRIES],
-) {
-    let bits = BitSlice::<_, Lsb0>::from_slice(raster.data);
-    for (bits, dst) in bits.chunks(BITS).zip(image.iter_mut()) {
-        let mut index = 0;
-        for idx in bits.iter_ones() {
-            index |= 1 << (BITS - idx - 1);
-        }
-        let value = steps.get(index as usize).copied().unwrap_or(0);
-        *dst = u32::from_be_bytes([value, 255, 255, 255]);
-    }
+/// A PNG strike as premultiplied RGBA8 and its size.
+#[cfg(feature = "emoji")]
+fn decode_png(data: &[u8]) -> Option<(Vec<u8>, usize, usize)> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(data));
+    decoder.set_transformations(png::Transformations::normalize_to_color8());
+    let mut reader = decoder.read_info().ok()?;
+    let mut buf = vec![0u8; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut buf).ok()?;
+    let (w, h) = (info.width as usize, info.height as usize);
+    let pixels = buf.get(..info.buffer_size())?;
+    let rgba: Vec<[u8; 4]> = match info.color_type {
+        png::ColorType::Rgba => pixels.as_chunks::<4>().0.to_vec(),
+        png::ColorType::Rgb => pixels
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|&[r, g, b]| [r, g, b, 255])
+            .collect(),
+        png::ColorType::GrayscaleAlpha => pixels
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&[l, a]| [l, l, l, a])
+            .collect(),
+        png::ColorType::Grayscale => pixels.iter().map(|&l| [l, l, l, 255]).collect(),
+        png::ColorType::Indexed => return None,
+    };
+    let premultiplied = rgba
+        .iter()
+        .flat_map(|&[r, g, b, a]| {
+            let m = |c: u8| ((u16::from(c) * u16::from(a) + 127) / 255) as u8;
+            [m(r), m(g), m(b), a]
+        })
+        .collect();
+    Some((premultiplied, w, h))
 }
 
 #[cfg(test)]
@@ -643,16 +548,235 @@ mod tests {
         ];
         for format in formats {
             for (width, height) in [(0, 0), (0, 12), (7, 0)] {
-                let mut image = Vec::new();
-                assert!(
-                    extract_bw_image(&mut image, raster(width, height, format), slot, 1.0)
-                        .is_none()
-                );
-                assert!(
-                    extract_color_image(&mut image, raster(width, height, format), slot, 1.0)
-                        .is_none()
-                );
+                assert!(bitmap_coverage(raster(width, height, format), slot, 1.0).is_none());
             }
         }
     }
+
+    use crate::fonts::{Font, Fonts};
+
+    const MPLUS: &[u8] = crate::test_fonts::MPLUS;
+    const FUSION: &[u8] = crate::test_fonts::FUSION;
+    const SAMPLE: &str = "AgWm@0#iéΩあアンぱ漢字鬱東한글";
+
+    struct Sampled {
+        glyph: GlyphId,
+        size: (usize, usize),
+        advance_scale: f32,
+    }
+
+    /// The sample characters the font has, sized as `shape_row` slots them.
+    fn samples(font: &Font, size: u16) -> Vec<Sampled> {
+        let fonts = Fonts::new(font.clone(), size.into());
+        let face = font.font();
+        let (cell_w, cell_h) = (fonts.min_width_px() as usize, fonts.height_px() as usize);
+        let advance_scale = cell_h as f32 / face.height() as f32;
+        let found: Vec<_> = SAMPLE
+            .chars()
+            .filter_map(|c| {
+                let glyph = face.glyph_index(c)?;
+                let cells = if (c as u32) >= 0x1100 { 2 } else { 1 };
+                Some(Sampled {
+                    glyph,
+                    size: (cell_w * cells, cell_h),
+                    advance_scale,
+                })
+            })
+            .collect();
+        assert!(found.len() >= 15, "only {} sample glyphs", found.len());
+        found
+    }
+
+    fn zeno_render(face: &rustybuzz::Face, s: &Sampled, fake_bold: bool) -> Vec<u8> {
+        let slot = Entry::Uncached(CacheRect {
+            x: 0,
+            y: 0,
+            width: s.size.0 as u32,
+            height: s.size.1 as u32,
+        });
+        let mut info = rustybuzz::GlyphInfo::default();
+        info.glyph_id = u32::from(s.glyph.0);
+        let placement = Placement::Natural {
+            bearing_offset_x: 0.0,
+            fit_x: 1.0,
+        };
+        let mut scratch = RasterScratch::default();
+        let (_, mask) = rasterize_glyph(
+            slot,
+            face,
+            &info,
+            false,
+            fake_bold,
+            s.advance_scale,
+            placement,
+            &mut scratch,
+        );
+        mask
+    }
+
+    fn fnv1a(hash: u64, bytes: &[u8]) -> u64 {
+        bytes
+            .iter()
+            .fold(hash, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100000001b3))
+    }
+
+    #[test]
+    fn bold_lut_spans_the_range_monotonically() {
+        assert_eq!(BOLD_LUT[0], 0);
+        assert_eq!(BOLD_LUT[255], 255);
+        assert!(BOLD_LUT.windows(2).all(|w| w[0] <= w[1]));
+    }
+
+    /// Reference points of `scale(sx, -sy).then(skew).then_translate(..)`.
+    #[test]
+    fn point_map_matches_the_reference_transform() {
+        let (sx, sy, tx, ty, x_off, width) = (0.031f32, 0.029f32, 1.5f32, 27.0f32, 0.75f32, 9.0f32);
+        let cases = [
+            (false, (0.0, 0.0), (1.52325, 27.0)),
+            (false, (512.0, -200.0), (17.39525, 32.8)),
+            (false, (-30.0, 880.0), (0.59325, 1.48)),
+            (true, (0.0, 0.0), (-0.72675, 27.0)),
+            (true, (512.0, -200.0), (13.69525, 32.8)),
+            (true, (-30.0, 880.0), (4.72325, 1.48)),
+        ];
+        for (italic, (x, y), (wx, wy)) in cases {
+            let k = if italic { 0.25 } else { 0.0 };
+            let map = PointMap {
+                sx,
+                skew: k * sy,
+                tx: x_off * sx + tx - k * width,
+                sy,
+                ty,
+                scale: 1.0,
+            };
+            let got = map.apply(zeno::Vector::new(x, y));
+            assert!((got.x - wx).abs() < 1e-3, "{italic} x {x},{y}: {}", got.x);
+            assert!((got.y - wy).abs() < 1e-3, "{italic} y {x},{y}: {}", got.y);
+        }
+    }
+
+    #[test]
+    fn golden_masks() {
+        let mut hash = 0xcbf29ce484222325;
+        for data in [MPLUS, FUSION] {
+            let font = Font::new(data).expect("font");
+            for size in [16, 20, 32] {
+                for s in samples(&font, size) {
+                    for bold in [false, true] {
+                        hash = fnv1a(hash, &zeno_render(font.font(), &s, bold));
+                    }
+                }
+            }
+        }
+        assert_eq!(hash, GOLDEN, "{hash:#x}");
+    }
+
+    const COLRV1: &[u8] = crate::test_fonts::COLRV1;
+
+    fn color_glyphs(face: &rustybuzz::Face) -> Vec<GlyphId> {
+        (0..face.number_of_glyphs())
+            .map(GlyphId)
+            .filter(|&g| face.is_color_glyph(g))
+            .collect()
+    }
+
+    #[test]
+    fn golden_colr_silhouettes() {
+        let face = rustybuzz::Face::from_slice(COLRV1, 0).expect("fixture");
+        let glyphs = color_glyphs(&face);
+        assert_eq!(glyphs.len(), 40);
+        let mut hash = 0xcbf29ce484222325;
+        for glyph in glyphs {
+            let slot = Entry::Uncached(CacheRect {
+                x: 0,
+                y: 0,
+                width: 16,
+                height: 16,
+            });
+            let mut info = rustybuzz::GlyphInfo::default();
+            info.glyph_id = u32::from(glyph.0);
+            let (_, mask) = rasterize_glyph(
+                slot,
+                &face,
+                &info,
+                false,
+                false,
+                16.0 / face.height() as f32,
+                Placement::Natural {
+                    bearing_offset_x: 0.0,
+                    fit_x: 1.0,
+                },
+                &mut RasterScratch::default(),
+            );
+            assert!(mask.iter().any(|&a| a > 0), "{glyph:?} is blank");
+            hash = fnv1a(hash, &mask);
+        }
+        assert_eq!(hash, GOLDEN_SILHOUETTES, "{hash:#x}");
+    }
+
+    #[cfg(feature = "emoji")]
+    #[test]
+    fn golden_colr_color_glyphs() {
+        let face = rustybuzz::Face::from_slice(COLRV1, 0).expect("fixture");
+        let mut hash = 0xcbf29ce484222325;
+        for glyph in color_glyphs(&face) {
+            for size in [16, 32] {
+                let rgba = rasterize_color_glyph(&face, glyph, size, size).expect("COLR glyph");
+                hash = fnv1a(hash, &rgba);
+            }
+        }
+        assert_eq!(hash, GOLDEN_COLOR, "{hash:#x}");
+    }
+
+    #[cfg(feature = "emoji")]
+    #[test]
+    fn png_strikes_decode_to_premultiplied_rgba() {
+        let data = crate::test_fonts::CBDT;
+        let face = rustybuzz::Face::from_slice(data, 0).expect("fixture");
+        let mut decoded = 0;
+        for g in 0..face.number_of_glyphs() {
+            let Some(raster) = face.glyph_raster_image(GlyphId(g), u16::MAX) else {
+                continue;
+            };
+            if raster.format != RasterImageFormat::PNG {
+                continue;
+            }
+            let (rgba, w, h) = decode_png(raster.data).expect("png");
+            assert_eq!(rgba.len(), w * h * 4);
+            assert!(
+                rgba.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .all(|p| p[..3].iter().all(|&c| c <= p[3]))
+            );
+            decoded += 1;
+        }
+        assert_eq!(decoded, 40);
+    }
+
+    #[test]
+    fn a_bitmap_at_its_own_size_is_copied_unchanged() {
+        let alpha: Vec<u8> = (0..8 * 16).map(|i| (i * 37 % 256) as u8).collect();
+        let raster = RasterGlyphImage {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 16,
+            pixels_per_em: 16,
+            format: RasterImageFormat::BitmapGray8,
+            data: &alpha,
+        };
+        let slot = Entry::Uncached(CacheRect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 16,
+        });
+        assert_eq!(bitmap_coverage(raster, slot, 1.0), Some(alpha));
+    }
+
+    const GOLDEN_SILHOUETTES: u64 = 0x88f8e39f5413851d;
+    #[cfg(feature = "emoji")]
+    const GOLDEN_COLOR: u64 = 0xa2e3ccec8b1c7b79;
+    const GOLDEN: u64 = 0x9b270c0506332039;
 }

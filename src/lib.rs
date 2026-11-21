@@ -10,6 +10,8 @@ pub(crate) mod colors;
 pub mod fonts;
 pub mod input;
 pub mod setup;
+#[cfg(test)]
+mod test_fonts;
 pub(crate) mod utils;
 
 pub use ratatui;
@@ -30,15 +32,37 @@ pub use setup::{AttachMaterial, AttachTerminal};
 pub use setup::{HitRegions, TerminalConfig, Tui, TuiFontSource, TuiKind, TuiRequest, TuiSurface};
 
 /// Errors that can occur creating or operating a terminal.
-#[derive(thiserror::Error, Debug)]
+#[derive(Debug)]
 pub enum TerminalError {
     /// ratatui's own `Terminal::new()` failed.
-    #[error("ratatui terminal initialization failed: {0}")]
-    Backend(#[from] std::io::Error),
+    Backend(std::io::Error),
 
     /// Font data failed to parse (see [`fonts::Fonts::from_asset`]).
-    #[error("invalid font data: {0}")]
     Font(String),
+}
+
+impl std::fmt::Display for TerminalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Backend(err) => write!(f, "ratatui terminal initialization failed: {err}"),
+            Self::Font(msg) => write!(f, "invalid font data: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for TerminalError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Backend(err) => Some(err),
+            Self::Font(_) => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for TerminalError {
+    fn from(err: std::io::Error) -> Self {
+        Self::Backend(err)
+    }
 }
 
 pub type Result<T> = ::std::result::Result<T, TerminalError>;

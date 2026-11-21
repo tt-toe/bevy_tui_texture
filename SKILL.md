@@ -175,7 +175,7 @@ Styling — every ratatui `Modifier` renders; use plain ratatui `Style`s:
 - The cursor from `frame.set_cursor_position(...)` is drawn as
   `TerminalConfig::cursor_style` (`Block` default, `HollowBlock`,
   `Underline`, `Bar`, `Hidden`).
-- `TerminalConfig::palette`: `TerminalPalette::default()` keeps historic
+- `TerminalConfig::palette`: `TerminalPalette::default()` uses SVG-keyword
   colors (`DarkGray` brighter than `Gray`), `xterm()` is standard,
   `.with_ansi16([...])` themes.
 - Runtime changes (`Tui::set_dim_alpha` / `set_palette` /
@@ -201,9 +201,8 @@ omits it (glob-import collision), so import it explicitly:
 `use bevy_tui_texture::input::KeyCode;`.
 
 - **`(column, row)` on `MouseEvent`** — grid cells, x-then-y.
-- **`MouseEventKind`**: `Down(button)`/`Up(button)` (was
-  `MousePress`/`MouseRelease`), `Moved` (no button held) or `Drag(button)`
-  (button held while moving — was a single `MouseMove` for both),
+- **`MouseEventKind`**: `Down(button)`/`Up(button)`, `Moved` (no button held) or `Drag(button)`
+  (button held while moving),
   `ScrollUp`/`ScrollDown`/`ScrollLeft`/`ScrollRight`.
 - **`KeyEventKind`**: `Press`/`Repeat`/`Release` — filter
   `k.kind != KeyEventKind::Release` for typical "act on keydown" handling.

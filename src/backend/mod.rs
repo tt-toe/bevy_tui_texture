@@ -11,9 +11,107 @@ pub(crate) const CACHE_WIDTH: u32 = 2048;
 /// Height of the glyph cache texture in pixels.
 pub(crate) const CACHE_HEIGHT: u32 = 2048;
 
+use std::borrow::Cow;
 use std::num::NonZeroU32;
 
 use wgpu::*;
+
+use crate::utils::text_atlas::CacheRect;
+
+/// Glyph coverage masks queued for the R8 atlas, with the atlas slot width
+/// that tells which of them sit side by side.
+#[derive(Debug, Default)]
+pub(crate) struct GlyphUploads {
+    pub(crate) slot_width: u32,
+    pub(crate) items: Vec<(CacheRect, Vec<u8>)>,
+}
+
+impl GlyphUploads {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Appends `other`'s masks after this one's, so its later writes win.
+    pub(crate) fn extend(&mut self, other: GlyphUploads) {
+        self.slot_width = other.slot_width;
+        self.items.extend(other.items);
+    }
+}
+
+/// Merges masks of horizontally adjacent atlas slots into one rectangle
+/// each, so a burst of new glyphs costs a few `write_texture` calls instead
+/// of one per glyph. A later mask for the same slot replaces an earlier
+/// one; slots are only merged when contiguous, never across a gap.
+pub(crate) fn batch_uploads(
+    slot_width: u32,
+    items: &[(CacheRect, Vec<u8>)],
+) -> Vec<(CacheRect, Cow<'_, [u8]>)> {
+    let mut seen = bevy::platform::collections::HashSet::new();
+    let mut latest: Vec<&(CacheRect, Vec<u8>)> = Vec::with_capacity(items.len());
+    for item in items.iter().rev() {
+        let (rect, mask) = item;
+        if mask.len() < rect.width as usize * rect.height as usize {
+            tracing::warn!(
+                "glyph atlas: skipping a {}x{} mask of {} bytes",
+                rect.width,
+                rect.height,
+                mask.len()
+            );
+            continue;
+        }
+        if seen.insert((rect.x, rect.y)) {
+            latest.push(item);
+        }
+    }
+    latest.sort_by_key(|(rect, _)| (rect.y, rect.x));
+
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start < latest.len() {
+        let mut end = start + 1;
+        while let (Some((prev, _)), Some((next, _))) = (latest.get(end - 1), latest.get(end)) {
+            if slot_width == 0
+                || next.y != prev.y
+                || next.height != prev.height
+                || prev.x.checked_add(slot_width) != Some(next.x)
+            {
+                break;
+            }
+            end += 1;
+        }
+        let run = latest.get(start..end).unwrap_or_default();
+        match run {
+            [(rect, mask)] => out.push((*rect, Cow::Borrowed(&mask[..]))),
+            [(first, _), ..] => {
+                let width = run.len() as u32 * slot_width;
+                let (row_len, height) = (width as usize, first.height as usize);
+                let mut merged = vec![0u8; row_len * height];
+                for (rect, mask) in run {
+                    let offset = rect.x.saturating_sub(first.x) as usize;
+                    let w = rect.width as usize;
+                    for (y, src) in mask.chunks_exact(w.max(1)).take(height).enumerate() {
+                        let at = y * row_len + offset;
+                        if let Some(dst) = merged.get_mut(at..at + src.len()) {
+                            dst.copy_from_slice(src);
+                        }
+                    }
+                }
+                out.push((
+                    CacheRect {
+                        x: first.x,
+                        y: first.y,
+                        width,
+                        height: first.height,
+                    },
+                    Cow::Owned(merged),
+                ));
+            }
+            [] => {}
+        }
+        start = end;
+    }
+    out
+}
 
 /// The surface dimensions of the backend in pixels.
 pub struct Dimensions {
@@ -489,12 +587,9 @@ impl SharedFontGpuState {
     /// Uploads pending glyph coverage masks (queued via
     /// `Fonts::with_shared_cpu_state`, potentially by several terminals
     /// sharing this font) to the shared atlas texture.
-    pub(crate) fn upload_glyphs(
-        &self,
-        queue: &Queue,
-        uploads: &[(crate::utils::text_atlas::CacheRect, Vec<u8>)],
-    ) {
-        for (cached, mask) in uploads {
+    pub(crate) fn upload_glyphs(&self, queue: &Queue, uploads: &GlyphUploads) {
+        let batches = batch_uploads(uploads.slot_width, &uploads.items);
+        for (cached, mask) in &batches {
             queue.write_texture(
                 TexelCopyTextureInfo {
                     texture: &self.text_cache,
@@ -517,6 +612,13 @@ impl SharedFontGpuState {
                     height: cached.height,
                     depth_or_array_layers: 1,
                 },
+            );
+        }
+        if !batches.is_empty() {
+            tracing::debug!(
+                "glyph atlas: {} write_texture calls for {} glyphs",
+                batches.len(),
+                uploads.items.len()
             );
         }
     }
@@ -712,5 +814,82 @@ impl TerminalGpuState {
             pass.set_vertex_buffer(0, self.instance_buffer.slice(offset..));
             pass.draw(0..4, 0..overlays);
         }
+    }
+}
+
+#[cfg(test)]
+mod batch_upload_tests {
+    use super::*;
+
+    fn rect(x: u32, width: u32) -> CacheRect {
+        CacheRect {
+            x,
+            y: 0,
+            width,
+            height: 2,
+        }
+    }
+
+    #[test]
+    fn adjacent_slots_merge_into_one_zero_padded_write() {
+        let items = vec![
+            (rect(4, 2), vec![3; 4]),
+            (rect(0, 3), vec![1, 2, 3, 4, 5, 6]),
+        ];
+        let out = batch_uploads(4, &items);
+        assert_eq!(out.len(), 1);
+        let (merged, data) = &out[0];
+        assert_eq!(*merged, rect(0, 8));
+        assert_eq!(&data[..], &[1, 2, 3, 0, 3, 3, 0, 0, 4, 5, 6, 0, 3, 3, 0, 0]);
+    }
+
+    #[test]
+    fn a_gap_between_slots_splits_the_write() {
+        let items = vec![(rect(0, 4), vec![1; 8]), (rect(8, 4), vec![2; 8])];
+        let out = batch_uploads(4, &items);
+        assert_eq!(out.len(), 2);
+        assert!(
+            matches!(out[0].1, Cow::Borrowed(_)),
+            "a lone slot is not copied"
+        );
+        assert_eq!(out[1].0, rect(8, 4));
+    }
+
+    #[test]
+    fn the_last_mask_for_a_slot_wins() {
+        let items = vec![(rect(0, 4), vec![1; 8]), (rect(0, 4), vec![9; 8])];
+        let out = batch_uploads(4, &items);
+        assert_eq!(out.len(), 1);
+        assert_eq!(&out[0].1[..], &[9; 8]);
+    }
+
+    #[test]
+    fn rows_and_heights_must_match_to_merge() {
+        let mut lower = rect(4, 4);
+        lower.y = 2;
+        let mut tall = rect(8, 4);
+        tall.height = 3;
+        let items = vec![
+            (rect(0, 4), vec![1; 8]),
+            (lower, vec![2; 8]),
+            (tall, vec![3; 12]),
+        ];
+        assert_eq!(batch_uploads(4, &items).len(), 3);
+    }
+
+    #[test]
+    fn a_zero_width_slot_merges_without_copying() {
+        let items = vec![(rect(0, 0), vec![]), (rect(4, 4), vec![2; 8])];
+        let out = batch_uploads(4, &items);
+        assert_eq!(out.len(), 1);
+        assert_eq!(&out[0].1[4..8], &[2; 4]);
+    }
+
+    #[test]
+    fn a_short_mask_is_skipped() {
+        let items = vec![(rect(0, 4), vec![1; 7]), (rect(4, 4), vec![2; 8])];
+        let out = batch_uploads(4, &items);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, rect(4, 4));
     }
 }

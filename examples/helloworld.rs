@@ -1,9 +1,7 @@
 use bevy::prelude::*;
+use bevy::text::DEFAULT_FONT_DATA;
 use bevy_tui_texture::prelude::*;
 use bevy_tui_texture::Font as TerminalFont;
-use font_kit::family_name::FamilyName;
-use font_kit::properties::Properties;
-use font_kit::source::SystemSource;
 use ratatui::prelude::*;
 use ratatui::style::Color as RatatuiColor;
 use ratatui::widgets::*;
@@ -26,19 +24,11 @@ fn main() {
 /// Declarative spawning: no render resources anywhere in this signature -
 /// spawn a `TuiRequest` and the plugin materializes it next frame.
 fn setup(mut commands: Commands) {
-    let fonts = {
-        let font_data = SystemSource::new()
-            .select_best_match(&[FamilyName::Monospace], &Properties::new())
-            .expect("No monospace font found on this system")
-            .load()
-            .expect("Failed to load font")
-            .copy_font_data()
-            .expect("Failed to copy font data");
-        Arc::new(Fonts::new(
-            TerminalFont::from_vec(font_data.to_vec()).expect("Failed to parse font"),
-            16,
-        ))
+    let Some(font) = TerminalFont::new(DEFAULT_FONT_DATA) else {
+        error!("bevy's default font failed to parse");
+        return;
     };
+    let fonts = Arc::new(Fonts::new(font, 16));
 
     commands.spawn((
         TuiRequest::ui(80, 25, fonts).with_config(TerminalConfig {

@@ -1,5 +1,4 @@
 use super::primitives::*;
-use tiny_skia::Pixmap;
 
 /// Ghostty's `SmoothMosaic` patterns for U+1FB3C..=U+1FB67: four rows of three grid points, `#` marking a polygon corner.
 const WEDGES: [&str; 44] = [
@@ -50,7 +49,7 @@ const WEDGES: [&str; 44] = [
 ];
 
 /// Sextant (2x3) and octant (2x4) cells, by inverting ratatui's own tables, and the wedges.
-pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
+pub fn render(c: char, width: u32, height: u32) -> Option<GlyphCanvas> {
     use ratatui::symbols::pixel::{OCTANTS, SEXTANTS};
     if ('\u{1FB3C}'..='\u{1FB67}').contains(&c) {
         render_wedge(c, width, height)
@@ -64,7 +63,7 @@ pub fn render(c: char, width: u32, height: u32) -> Option<Pixmap> {
 }
 
 /// Polygon through the patterns' corner points, skipping points on a straight edge.
-fn render_wedge(c: char, width: u32, height: u32) -> Option<Pixmap> {
+fn render_wedge(c: char, width: u32, height: u32) -> Option<GlyphCanvas> {
     let index = (c as usize).checked_sub(0x1FB3C)?;
     let pattern: Vec<bool> = WEDGES
         .get(index)?
@@ -93,25 +92,25 @@ fn render_wedge(c: char, width: u32, height: u32) -> Option<Pixmap> {
         .filter(|&&(_, used)| used)
         .map(|&(i, _)| point(i))
         .collect();
-    let mut pixmap = Pixmap::new(width, height)?;
-    draw_polygon(&mut pixmap, &points, default_color());
-    Some(pixmap)
+    let mut canvas = GlyphCanvas::new(width, height)?;
+    draw_polygon(&mut canvas, &points, default_color());
+    Some(canvas)
 }
 
 // Bit i is column i % 2, row i / 2, least significant bit at the top left.
-fn render_mask(mask: usize, rows: usize, width: u32, height: u32) -> Option<Pixmap> {
-    let mut pixmap = Pixmap::new(width, height)?;
+fn render_mask(mask: usize, rows: usize, width: u32, height: u32) -> Option<GlyphCanvas> {
+    let mut canvas = GlyphCanvas::new(width, height)?;
     let (w, h) = (width as f32, height as f32);
     let color = default_color();
     for row in 0..rows {
         for col in 0..2 {
             if mask >> (row * 2 + col) & 1 == 1 {
                 let (x, y) = (col as f32 * w / 2.0, row as f32 * h / rows as f32);
-                draw_rect(&mut pixmap, x, y, w / 2.0, h / rows as f32, color);
+                draw_rect(&mut canvas, x, y, w / 2.0, h / rows as f32, color);
             }
         }
     }
-    Some(pixmap)
+    Some(canvas)
 }
 
 #[cfg(test)]
@@ -157,26 +156,26 @@ mod tests {
     #[test]
     fn every_wedge_renders() {
         for c in '\u{1FB3C}'..='\u{1FB67}' {
-            let pixmap = render(c, 10, 20).unwrap();
-            assert!(pixmap.pixels().iter().any(|p| p.alpha() > 0), "{c:?}");
+            let canvas = render(c, 10, 20).unwrap();
+            assert!(canvas.data().iter().any(|&a| a > 0), "{c:?}");
         }
     }
 
     #[test]
     fn wedge_1fb3c_shape() {
-        let pixmap = render('\u{1FB3C}', 10, 20).unwrap();
-        assert!(pixmap.pixel(0, 19).unwrap().alpha() > 0);
-        assert_eq!(pixmap.pixel(9, 0).unwrap().alpha(), 0);
-        assert_eq!(pixmap.pixel(9, 19).unwrap().alpha(), 0);
-        assert_eq!(pixmap.pixel(0, 0).unwrap().alpha(), 0);
+        let canvas = render('\u{1FB3C}', 10, 20).unwrap();
+        assert!(canvas.alpha(0, 19) > 0);
+        assert_eq!(canvas.alpha(9, 0), 0);
+        assert_eq!(canvas.alpha(9, 19), 0);
+        assert_eq!(canvas.alpha(0, 0), 0);
     }
 
     #[test]
     fn pixel_bits_are_row_major() {
-        let pixmap = render(OCTANTS[3], 10, 20).unwrap();
+        let canvas = render(OCTANTS[3], 10, 20).unwrap();
         for y in 0..20 {
             for x in 0..10 {
-                let filled = pixmap.pixel(x, y).unwrap().alpha() > 0;
+                let filled = canvas.alpha(x, y) > 0;
                 assert_eq!(filled, y < 5, "({x},{y})");
             }
         }

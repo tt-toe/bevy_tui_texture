@@ -8,7 +8,7 @@ mod mosaic;
 mod powerline;
 mod primitives;
 
-use tiny_skia::Pixmap;
+pub(crate) use primitives::GlyphCanvas;
 
 /// Check if a character should be rendered programmatically
 #[inline]
@@ -32,7 +32,7 @@ pub fn is_programmatic_glyph(c: char) -> bool {
 }
 
 /// Render a programmatic glyph to a bitmap
-pub fn render_programmatic_glyph(c: char, width: u32, height: u32) -> Option<Pixmap> {
+pub fn render_programmatic_glyph(c: char, width: u32, height: u32) -> Option<GlyphCanvas> {
     match c {
         '\u{2500}'..='\u{257F}' => box_drawing::render(c, width, height),
         '\u{2580}'..='\u{259F}' => block_elements::render(c, width, height),
@@ -87,15 +87,101 @@ mod tests {
 
     const SIZES: [(u32, u32); 6] = [(7, 14), (8, 16), (10, 20), (11, 23), (16, 33), (9, 19)];
 
-    fn covered(p: &Pixmap, x: u32, y: u32) -> bool {
-        p.pixel(x, y).unwrap().alpha() > 0
+    fn coverage(c: char, w: u32, h: u32) -> Option<Vec<u8>> {
+        render_programmatic_glyph(c, w, h).map(GlyphCanvas::into_coverage)
     }
 
-    fn column(p: &Pixmap, x: u32) -> Vec<bool> {
+    /// Glyphs built from rectangles alone: box lines without the rounded
+    /// corners and diagonals, block elements, braille.
+    fn rect_only() -> impl Iterator<Item = char> {
+        ('\u{2500}'..='\u{257F}')
+            .filter(|c| !('\u{256D}'..='\u{2573}').contains(c))
+            .chain('\u{2580}'..='\u{259F}')
+            .chain('\u{2800}'..='\u{28FF}')
+    }
+
+    /// Pins the rectangle-only glyphs' pixels.
+    #[test]
+    fn rectangle_glyphs_match_their_checksum() {
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for (w, h) in SIZES {
+            for c in rect_only() {
+                let Some(mask) = coverage(c, w, h) else {
+                    continue;
+                };
+                hash = (hash ^ u64::from(c as u32)).wrapping_mul(0x100000001b3);
+                for b in mask {
+                    hash = (hash ^ u64::from(b)).wrapping_mul(0x100000001b3);
+                }
+            }
+        }
+        assert_eq!(hash, RECT_GOLDEN, "{hash:#x}");
+    }
+
+    const RECT_GOLDEN: u64 = 0x9a75042c87215671;
+
+    /// Writes every non-rectangle glyph, tiled at 16x33 with a 2px gap, as
+    /// a PGM to `GLYPH_SHEET` (default: the temp dir), for a visual check.
+    #[test]
+    #[ignore = "writes an image for visual inspection"]
+    fn write_shape_sheet() {
+        let (w, h, gap, per_row) = (16usize, 33usize, 2usize, 16usize);
+        let glyphs: Vec<char> = all_with_shapes().collect();
+        let rows = glyphs.len().div_ceil(per_row);
+        let (sheet_w, sheet_h) = (per_row * (w + gap), rows * (h + gap));
+        let mut sheet = vec![0u8; sheet_w * sheet_h];
+        for (i, &c) in glyphs.iter().enumerate() {
+            let Some(mask) = coverage(c, w as u32, h as u32) else {
+                continue;
+            };
+            let (ox, oy) = ((i % per_row) * (w + gap), (i / per_row) * (h + gap));
+            for (y, line) in mask.chunks_exact(w).enumerate() {
+                let at = (oy + y) * sheet_w + ox;
+                sheet[at..at + w].copy_from_slice(line);
+            }
+        }
+        let path = std::env::var("GLYPH_SHEET").map_or_else(
+            |_| std::env::temp_dir().join("glyph_shapes.pgm"),
+            std::path::PathBuf::from,
+        );
+        let mut out = format!("P5\n{sheet_w} {sheet_h}\n255\n").into_bytes();
+        out.extend_from_slice(&sheet);
+        std::fs::write(&path, out).expect("write sheet");
+        println!("wrote {}", path.display());
+    }
+
+    fn all_with_shapes() -> impl Iterator<Item = char> {
+        ('\u{256D}'..='\u{2573}')
+            .chain('\u{E0B0}'..='\u{E0BF}')
+            .chain('\u{1FB3C}'..='\u{1FB67}')
+            .chain([
+                '\u{25E2}', '\u{25E3}', '\u{25E4}', '\u{25E5}', '\u{25F8}', '\u{25F9}', '\u{25FA}',
+                '\u{25FF}',
+            ])
+    }
+
+    /// Under `programmatic_aa` a shape's faint edge is not ink that has to
+    /// meet the neighboring cell.
+    fn covered(p: &GlyphCanvas, x: u32, y: u32) -> bool {
+        if primitives::AA {
+            p.alpha(x, y) >= 128
+        } else {
+            p.alpha(x, y) > 0
+        }
+    }
+
+    #[test]
+    fn diagonals_are_antialiased_only_with_the_feature() {
+        let mask = coverage('╱', 10, 20).expect("glyph");
+        let partial = mask.iter().any(|&a| a != 0 && a != 255);
+        assert_eq!(partial, primitives::AA);
+    }
+
+    fn column(p: &GlyphCanvas, x: u32) -> Vec<bool> {
         (0..p.height()).map(|y| covered(p, x, y)).collect()
     }
 
-    fn row(p: &Pixmap, y: u32) -> Vec<bool> {
+    fn row(p: &GlyphCanvas, y: u32) -> Vec<bool> {
         (0..p.width()).map(|x| covered(p, x, y)).collect()
     }
 

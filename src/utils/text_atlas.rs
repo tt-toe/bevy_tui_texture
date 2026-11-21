@@ -110,6 +110,11 @@ impl Atlas {
         }
     }
 
+    /// Width of one slot in pixels.
+    pub(crate) fn entry_width(&self) -> u32 {
+        self.entry_width
+    }
+
     /// Current generation counter - see the field doc on [`Atlas::generation`].
     pub(crate) fn generation(&self) -> u64 {
         self.generation
@@ -198,14 +203,7 @@ mod tests {
 
     #[test]
     fn an_atlas_smaller_than_one_entry_still_hands_out_slots() {
-        let fonts = Fonts::new(
-            Font::new(include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/examples/assets/fonts/Mplus1Code-Regular.ttf"
-            )))
-            .expect("font"),
-            32,
-        );
+        let fonts = Fonts::new(Font::new(crate::test_fonts::MPLUS).expect("font"), 32);
         let mut atlas = Atlas::new(&fonts, 1, 1);
         let key = |glyph| Key {
             style: Modifier::empty(),
@@ -221,14 +219,7 @@ mod tests {
 
     #[test]
     fn reuse() {
-        let fonts = Fonts::new(
-            Font::new(include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/examples/assets/fonts/Mplus1Code-Regular.ttf"
-            )))
-            .unwrap(),
-            24,
-        );
+        let fonts = Fonts::new(Font::new(crate::test_fonts::MPLUS).unwrap(), 24);
         let mut atlas = Atlas::new(&fonts, 24, 24);
 
         let char_width = fonts.min_width_px();
@@ -270,14 +261,7 @@ mod tests {
     }
 
     fn small_atlas() -> (Atlas, u32, u32) {
-        let fonts = Fonts::new(
-            Font::new(include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/examples/assets/fonts/Mplus1Code-Regular.ttf"
-            )))
-            .unwrap(),
-            24,
-        );
+        let fonts = Fonts::new(Font::new(crate::test_fonts::MPLUS).unwrap(), 24);
         let (w, h) = (fonts.min_width_px(), fonts.height_px());
         (Atlas::new(&fonts, w * 4, h * 2), w, h)
     }
